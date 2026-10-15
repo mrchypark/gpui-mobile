@@ -1,0 +1,27 @@
+Final source validation — 2026-10-15, KST
+Ely: 7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd
+GPUI/gpui_wgpu: 1a28cff4b409169bac058bca40dfbfeb7621d19b
+wgpu: registry 29.0.4
+
+Command (repository root):
+CARGO_NET_OFFLINE=true sh examples/ely-integration/ios-simulator.sh --no-run
+Rust staticlib: PASS, exit 0, 7.33s
+Native clang link/ad-hoc sign: PASS
+Linker warning: __eh_frame >16MB; exception unwind performance may be affected.
+Simulator install/launch: PASS, dev.gpui.mobile.ely, PID 20634
+2026-10-15 20:01:03 ELY_ADAPTER_SELFCHECK PASS
+2026-10-15 20:01:04 CADisplayLink started for GPUI rendering
+Real MobileEvent::Insets reached model: top=62px, bottom=34px, keyboard_visible=false.
+Screenshot visually inspected: real Ely Button, Input and InfiniteCanvas rendered.
+
+Raw logs preserved outside repository in chat work/ely-integration-evidence/:
+  native-ios-reviewed.log
+  runtime-ios-reviewed.log
+  final-source.sha256
+Screenshot preserved in chat outputs/ely-viewport-final.png.
+
+No physical UI gestures were performed: Mac locked during verification.
+Actual button clicks, drag/pinch, input, scroll and lifecycle recovery are NOT VERIFIED.
+Startup assertions cover coordinate translation, final Ended snapshot, cancellation,
+additional-finger outside canvas, exclusive pinch, routing latch, foreign windows,
+safe-area/keyboard max, and bottom-touching narrow floating keyboard exclusion.
