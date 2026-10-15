@@ -38,3 +38,17 @@ Screenshot outputs/ely-viewport-keyboard-ready.png inspected: reset button,
 input, status and canvas initially visible; previous screenshots preserved.
 No actual UI interaction or keyboard gesture was performed.
 Linker retains prior large __eh_frame compact-unwind warning.
+
+Focus-hook follow-up: baseline7253295 + local src/ios/window.rs, 23:12 KST.
+Build/link/sign PASS in4m15s; codesign verification PASS; PID11799.
+Source manifest ui-focus-fix.source.sha256: all7 hashes verified by builder and parent.
+window.rs SHA256 a24fe548a1e1d896e14f9adb96226996230d4e4039c4464a7bd9328e57062b5b
+Executable SHA256 f92a7178ea3810d5605803f9300a91bfe0f48f1becf90fe07993a55e6e53d961
+Build log SHA256 b886eb3fb3ab9795e6c3da9ad477e4496c60a5d68c806138c53de262aae6ae3e
+Both startup selfchecks PASS. Parent actual unlocked CUA: software-keyboard
+AX e/l/y => exact ely, toggle show/hide, reset1, canvas pan-75,-50 commits2,
+Home/icon resume preserving text+viewport. Keyboard rect(0,566)402x308.
+Screenshots05/06/07 and native-trace-focus-fix.log under outputs/ios-ui-verification.
+Scroll, pinch, hardware exact text, automatic keyboard appearance, blur dismissal,
+floating-keyboard interaction and active-contact cancellation remain unverified.
+See docs/ios-ui-verification.md for precise scope. Build and screen work ended.

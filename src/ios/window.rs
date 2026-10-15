@@ -1995,6 +1995,22 @@ impl PlatformWindow for IosWindow {
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
         // iOS handles IME positioning automatically
     }
+
+    fn text_input_state_changed(&self, change: gpui::TextInputStateChange) {
+        if self.closed.get() {
+            return;
+        }
+        // GPUI takes/restores handlers during painting; only actual focus
+        // transitions should change UIKit's first responder.
+        match change {
+            gpui::TextInputStateChange::FocusGained => {
+                self.show_keyboard_with_type(crate::KeyboardType::Default);
+            }
+            gpui::TextInputStateChange::FocusLost => self.hide_keyboard(),
+            gpui::TextInputStateChange::SelectionChanged
+            | gpui::TextInputStateChange::ContentChanged => {}
+        }
+    }
 }
 
 // ── Fallback atlas ────────────────────────────────────────────────────────────

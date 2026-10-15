@@ -127,11 +127,20 @@ movement/resizing/hiding, manual-scroll preservation, and the nonintersecting
 offscreen-field regression. The new `ely-viewport-keyboard-ready.png` developer
 screenshot confirms the initial button, input, status and canvas remain visible.
 
-The Mac was locked during attempted UI verification. **No actual clicks, drags,
-pinches, text entry or scroll gestures were performed.** Those interactive gates,
-keyboard focus behavior, lifecycle stress/recovery, physical devices and FPS
-remain unverified. Startup assertions are deterministic adapter tests, not
-hardware gesture evidence. No UI lock bypass was attempted.
+Later unlocked UI verification tested the local iOS focus-hook fix on top of
+commit 7253295 (4m15s build/link/sign, PID 11799). Software-keyboard AX clicks
+entered exact `ely`; Simulator toggle show/hide delivered keyboard Insets and
+preserved text. Outside button reset, canvas tap/drag (pan -75,-50, commits 2),
+and Home/icon resume passed with text and viewport preserved. See
+`docs/ios-ui-verification.md` at the repository root for traces, screenshots and
+exact source/build hashes. The parent verified all seven recorded source hashes.
+
+Controls scrolling, pinch zoom, exact hardware text entry, automatic keyboard
+appearance, blur dismissal, floating-keyboard interaction, active-contact
+cancellation, lifecycle stress, physical devices and FPS remain unverified.
+The reset button does not blur the input. Hardware tool typing produced
+Option-like glyphs; exact `ely` came from software-keyboard AX clicks.
+Startup assertions are deterministic tests, separate from actual UI evidence.
 
 Debug builds execute adapter regression assertions before opening the UI. These
 cover origin conversion, complete snapshots, final position, cancellation,
