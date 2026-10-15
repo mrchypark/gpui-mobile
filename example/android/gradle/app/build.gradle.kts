@@ -17,9 +17,29 @@ plugins {
     id("com.android.application")
 }
 
+val bleEnabled = providers.gradleProperty("ble").map(String::toBoolean).getOrElse(false)
+val blePackage = rootProject.file("../../../src/packages/ble")
+val bleJava = layout.buildDirectory.dir("ble")
+val prepareBleJava = tasks.register<Exec>("prepareBleJava") {
+    onlyIf { bleEnabled }
+    commandLine("sh", blePackage.resolve("prepare-android.sh"), bleJava.get().asFile)
+    outputs.dir(bleJava)
+}
+val buildBleRust = tasks.register<Exec>("buildBleRust") {
+    onlyIf { bleEnabled }
+    workingDir(rootProject.file("../.."))
+    commandLine("cargo", "ndk", "-t", "arm64-v8a", "-o",
+        "android/gradle/app/src/main/jniLibs", "build", "--lib", "--features", "ble")
+}
+
+tasks.named("preBuild") {
+    if (bleEnabled) dependsOn(prepareBleJava, buildBleRust)
+}
+
 android {
     namespace = "dev.gpui.mobile.example"
     compileSdk = 34
+    buildFeatures { buildConfig = true }
 
     defaultConfig {
         applicationId = "dev.gpui.mobile.example"
@@ -27,6 +47,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+        buildConfigField("boolean", "BLE_ENABLED", bleEnabled.toString())
 
         // Tell NativeActivity which .so to load.
         // This must match the cdylib / example output name.
@@ -70,6 +91,10 @@ android {
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
+            java.srcDir(blePackage.resolve("java"))
+            if (bleEnabled) {
+                java.srcDir(bleJava.get().dir("btleplug-0.13.5/src/droidplug/java/src/main/java").asFile)
+            }
         }
     }
 

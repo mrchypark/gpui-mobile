@@ -57,6 +57,9 @@ pub mod notifications;
 #[cfg(feature = "location")]
 pub mod location;
 
+#[cfg(feature = "ble")]
+pub mod ble;
+
 #[cfg(feature = "audio")]
 pub mod audio;
 

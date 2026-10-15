@@ -11,6 +11,8 @@ import android.util.Log;
 import android.view.KeyEvent;
 
 import androidx.core.splashscreen.SplashScreen;
+import dev.gpui.mobile.example.BuildConfig;
+import org.gpui.mobile.ble.Ble;
 
 /**
  * Custom Activity extending NativeActivity that integrates with the
@@ -61,6 +63,11 @@ public class GpuiActivity extends NativeActivity {
                 // Library may already be loaded by NativeActivity; that's fine.
                 sNativeLibLoaded = true;
             }
+        }
+
+        // Gradle's BLE mode also builds Rust with --features ble before packaging.
+        if (BuildConfig.BLE_ENABLED) {
+            Ble.initialize();
         }
 
         // Keep the splash screen visible until the native side signals readiness.
