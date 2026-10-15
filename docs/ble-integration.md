@@ -1,9 +1,8 @@
-# BLE integration request (parent-owned changes)
+# BLE integration
 
-BLE worker owns only `src/packages/ble` and BLE documentation/tests. No GPUI,
-wgpu, location, central exports, Cargo manifest, or lockfile changes are made here.
+Enable the opt-in `ble` feature to use `gpui_mobile::packages::ble`. The feature,
+module export, and optional dependencies are already configured in the library:
 
-Required integration:
 
 ```toml
 [features]
@@ -15,8 +14,7 @@ tokio = { version = "1.53.1", features = ["rt", "time"], optional = true }
 ```
 
 Existing `futures = "0.3"` is reused. No UUID dependency addition is needed.
-In `src/packages/mod.rs` add `#[cfg(feature = "ble")] pub mod ble;`.
-Keep BLE opt-in. Application must run BLE futures on a Tokio runtime with time
+Applications must run BLE futures on a Tokio runtime with time
 and I/O enabled (desktop Linux needs I/O). Do not `block_on` the UI thread.
 Android requires its existing jni 0.22 dependency and a Java-side invocation of
 `ble::init_android(&mut jni::Env)` before `Ble::new`. Include the **matching**
@@ -27,13 +25,14 @@ Android wiring is implemented in the example:
 
 - `GpuiActivity` invokes `Ble.initialize()` after loading the native library and
   before `NativeActivity.onCreate`, only when `BuildConfig.BLE_ENABLED` is true.
-- `./gradlew -Pble=true :app:assembleDebug` prepares checksum-verified Java sources
+- From `example/android/gradle`, `./gradlew -Pble=true :app:assembleDebug`
+  prepares checksum-verified Java sources
   from the exact 0.13.5 crate and runs cargo-ndk with `--features ble` before APK
-  packaging. The parent added example feature `ble = ["gpui-mobile/ble"]`.
+  packaging. The example forwards `ble = ["gpui-mobile/ble"]`.
 - Default Gradle builds neither initialize BLE nor require BLE Rust symbols.
 - Required Android declarations and JNI keep rules are included. The app must
   request SCAN/CONNECT at runtime on API 31+, or fine location on API <=30.
-  Existing location permissions remain owned by the location worker.
+  Location permission setup is described in [Location service integration](location-service-integration.md).
 - `src/packages/ble/java` is compiled in both modes; the upstream Java sources
   are included only in BLE mode. No third-party source is vendored into Git.
 
@@ -119,7 +118,7 @@ permission/radio recovers. Native operation timeouts bound waiting, not OS work.
 
 ## Verification (2026-10-15)
 
-All checks used a separate `work/ble-probe` manifest pointing at this module,
+The service checks below used a separate `work/ble-probe` manifest pointing at this module,
 so no GPUI revision or wgpu dependency was altered to make BLE compile.
 
 Completed before the disk-space stop:
@@ -132,11 +131,9 @@ Completed before the disk-space stop:
 - `javac` against Android API 35: passed for all matching upstream Java sources
   plus our `Ble.java` JNI entry point (before Activity integration).
 - `prepare-android.sh`: syntax check and real pinned download/checksum succeeded.
-- BLE Gradle configuration accepted the corrected source paths, then failed at
-  Build-Tools 36 download with **No space left on device**. Activity/whole-APK
-  compilation therefore remains unverified.
-- Independent Android `.so` link stopped while writing dependency archives with
-  **No space left on device**. This is not a link success.
+- Earlier Android link/SDK-download attempts exhausted disk. After freeing space,
+  the final integrated BLE-enabled cdylib compiled and linked, and the complete
+  debug APK assembled successfully. Final evidence and commands follow below.
 
 After those checks, `tests/hardware.rs` was added and not compiled or run due to
 the explicit disk-space stop. It is ignored by default and requires a consenting
@@ -192,5 +189,31 @@ it does not simulate an OS request in flight. The other five tests execute the
 state/error logic. The final result log is retained at
 `../ble-probe/ble-final-tests.log` relative to this repository. Its dedicated
 109 MiB `target-final` directory was removed after successful completion.
-No full Android link or Gradle SDK installation was retried after the disk stop.
 The hardware characteristic environment value must be a hyphenated UUID.
+
+## Final integrated Android package verification
+
+On 2026-10-15, the latest FIFO/RawOnly/text and Android cleanup source compiled and
+linked with BLE as an ARM64 cdylib in 26.07s. The final Gradle build succeeded in
+1m02s (36 tasks), including checksum-verified `prepareBleJava`, Activity/BLE Java
+compilation, and APK packaging. Build-Tools 36 used existing accepted SDK licenses;
+no new license prompt was accepted.
+
+After copying the independently verified BLE-enabled `.so` into
+`example/android/gradle/app/src/main/jniLibs/arm64-v8a/`, run from
+`example/android/gradle` with JDK 21 and the installed Android SDK environment:
+
+```sh
+sh ./gradlew --no-daemon --max-workers=1 -Pble=true :app:assembleDebug -x :app:buildBleRust
+```
+
+Only the redundant Rust task is excluded. `prepareBleJava` still invokes
+`src/packages/ble/prepare-android.sh` and verifies the exact Java archive checksum.
+The APK's native library SHA-256 matches the independently linked `.so`:
+`66e37375997042539427fef79516596bcea8888f8659637dc15a8c62d6f5f565`.
+APK signature verification passed. The preserved APK is
+`outputs/gpui-mobile-example-ble-arm64-debug.apk`, SHA-256
+`f9c08f42579fe64352acdfdc157b0f4db75158aafe064b7b571c99ba1aa4da72`.
+See [compatibility](compatibility.md) for full build commands and evidence paths.
+`adb devices -l` returned no connected targets. No APK installation, Android
+execution, or physical BLE transaction is claimed.

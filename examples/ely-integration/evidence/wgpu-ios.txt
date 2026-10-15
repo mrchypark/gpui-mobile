@@ -1,0 +1,5 @@
+wgpu v29.0.4
+├── gpui-mobile v0.1.0 (/Users/cypark/Documents/Codex/2026-10-15/gpui-mobile-mrchypark/work/gpui-mobile)
+│   └── gpui-mobile-ely-integration v0.1.0 (/Users/cypark/Documents/Codex/2026-10-15/gpui-mobile-mrchypark/work/gpui-mobile/examples/ely-integration)
+└── gpui_wgpu v0.1.0 (https://github.com/zed-industries/zed?rev=1a28cff4b409169bac058bca40dfbfeb7621d19b#1a28cff4)
+    └── gpui-mobile v0.1.0 (/Users/cypark/Documents/Codex/2026-10-15/gpui-mobile-mrchypark/work/gpui-mobile) (*)

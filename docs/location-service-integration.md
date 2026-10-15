@@ -1,19 +1,18 @@
 # Location service integration
 
-Ownership: GPS service files only. GPUI/wgpu pins, root manifests, central exports,
-renderer, and platform lifecycle files are unchanged by this work.
+Use `gpui_mobile::packages::location` for asynchronous one-shot fixes and
+foreground location streams, independently of Ely and the canvas.
 
-## Required parent integration
+## Setup
 
-`location` already exists as a feature and `packages::location` is already exported.
-No Rust dependency is added: streams use the existing `futures = "0.3"`.
+The `location` feature is enabled by default and exports `packages::location`.
+If default features are disabled, enable `location` explicitly. Streams use the
+existing `futures = "0.3"`; no additional Rust runtime dependency is needed.
 
-On iOS compile `src/packages/location/GpuiLocation.m` with ARC for the exact app
-architecture and SDK, and include the resulting object in the final app link.
-Link Foundation, CoreLocation and UIKit. The Objective-C bridge references the
-Rust `gpui_location_event` callback, so the app must enable the `location` feature.
-A build script using `cc` or an explicit Xcode source entry can perform this step;
-the manifest/build owner must choose the integration. The required exported C
+On iOS, the library's `build.rs` compiles `src/packages/location/GpuiLocation.m`
+with ARC through `cc` when `location` is enabled, and emits link directives for
+Foundation, CoreLocation and UIKit. Consumers do not need a separate Xcode source
+entry for the bridge. It calls the Rust `gpui_location_event` callback. Its C
 symbols are `gpui_location_start`, `gpui_location_stop`, `gpui_location_enabled`,
 `gpui_location_is_main_thread`, and `gpui_location_last`.
 
@@ -66,7 +65,7 @@ on a UI thread. GPS does not depend on Ely, the canvas or GPUI event handling.
 
 ## Evidence and limitations
 
-Service-only tests and native compilation results are recorded after validation.
+Service-only tests and native compilation results are recorded below.
 Passing a Rust type check or Objective-C/Java compilation does not demonstrate
 app linkage, permission prompts, GPS quality, background behavior or device fixes.
 Real devices must test approximate/precise grants, denial and Settings recovery,
@@ -77,10 +76,8 @@ accuracy or energy consumption.
 Primary API references: [CoreLocation updates](https://developer.apple.com/documentation/corelocation/cllocationmanager/startupdatinglocation()),
 [Android LocationManager](https://developer.android.com/reference/android/location/LocationManager).
 
-BLE is assigned separately: no BLE implementation or dependency change is part
-of this work. Library reconnaissance found [Bluest](https://github.com/alexmoon/bluest)
-supports iOS but describes Android support as planned; this is not a dependency
-selection or a claim of complete cross-platform BLE support.
+For the separate opt-in BLE API and its platform setup, see
+[BLE integration](ble-integration.md).
 
 ## Verification, 2026-10-15
 
@@ -121,11 +118,10 @@ therefore cannot leave a one-shot or tracking stream waiting forever. Normal
 permission denial in tracking remains recoverable. Explicit Rust `cancel()` ends
 the stream immediately and clears queued events; it does not emit `Ended`.
 
-Disk coordination note: the final existing service harness rerun passed all nine
+The final existing service harness rerun passed all nine
 Rust tests after malformed-event hardening. The new `tests/check.sh` runner passed
 shell syntax validation, but its full clean run and cached retry both hit
 `ENOSPC` during Cargo output (128 MiB and falling on the shared volume). Its
-end-to-end invocation is therefore **not yet verified**. No further Cargo work is
-running from the GPS worker; the parent owns sequencing subsequent builds. The
+end-to-end invocation is therefore **not yet verified**. The
 previous successful target checks and simulator native regression run remain
 separate evidence. Existing simulator artifacts and test diagnostics were kept.
