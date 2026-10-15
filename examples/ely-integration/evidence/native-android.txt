@@ -1,0 +1,19 @@
+2026-10-15: final Ely arm64 Android package PASS.
+Command:
+  JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home CARGO_NET_OFFLINE=true sh examples/ely-integration/android-apk.sh
+Rust 1.97.1, shared example/target, debug=0, incremental=false, jobs=1.
+Only cdylib emitted; real android_main initializes JNI and runs the shared platform with Ely Assets.
+Gradle :app:assembleDebug BUILD SUCCESSFUL (32s).
+APK application ID dev.gpui.mobile.ely; label Ely Integration; arm64-v8a only.
+NativeActivity library gpui_mobile_ely_integration.
+Exported symbols verified: ANativeActivity_onCreate, android_main,
+Java_dev_gpui_mobile_GpuiActivity_nativeIsInitialized.
+apksigner verify PASS: v2 signature, one Android Debug signer.
+No network/BLE permissions; AndroidX merged biometric/fingerprint and internal receiver permissions.
+APK SHA256 d7954fb57bdb62bab127f7521248efe89e16990760fa53eb1cebd2d4f52bef9e
+cdylib SHA256 336ade3dfea83296b98a36387641e517528cad923f816f32b64d14efbac5ccb1
+Final floating-keyboard intersect-only/change-gate assertions compiled, not executed on Android.
+Runtime NOT VERIFIED: elevated adb devices empty; SDK emulator executable absent.
+Same final keyboard assertions subsequently executed on iOS simulator, PID18809,
+21:28 KST: ELY_FLOATING_KEYBOARD_SELFCHECK PASS and ELY_ADAPTER_SELFCHECK PASS.
+This is iOS assertion evidence, not Android runtime evidence.

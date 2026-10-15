@@ -2295,6 +2295,7 @@ dependencies = [
 name = "gpui-mobile-ely-integration"
 version = "0.1.0"
 dependencies = [
+ "android-activity",
  "ely-gpui-component",
  "gpui",
  "gpui-mobile",

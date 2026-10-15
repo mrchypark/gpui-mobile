@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="Ely Integration" android:hasCode="true"
+        android:hardwareAccelerated="true" android:theme="@style/GpuiTheme">
+        <activity android:name="dev.gpui.mobile.GpuiActivity"
+            android:exported="true" android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density"
+            android:theme="@style/GpuiSplashTheme" android:windowSoftInputMode="adjustResize">
+            <meta-data android:name="android.app.lib_name" android:value="gpui_mobile_ely_integration" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
