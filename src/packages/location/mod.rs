@@ -1,17 +1,23 @@
 //! Location services for GPS/network position.
 //!
 //! Provides a cross-platform location API backed by:
-//! - Android: FusedLocationProviderClient / LocationManager via JNI
+//! - Android: LocationManager via JNI (no Google Play Services dependency)
 //! - iOS: CLLocationManager via Objective-C
 //!
 //! Feature-gated behind `location`.
 
 #[cfg(target_os = "android")]
 mod android;
+mod events;
 #[cfg(target_os = "ios")]
 mod ios;
+mod stream;
+pub use stream::{
+    get_current_position_async, watch_position, LocationEvent, LocationPermission,
+    LocationSubscription,
+};
 
-/// GPS position data.
+/// GPS position data. Unknown optional measurements are NaN, not zero.
 #[derive(Debug, Clone, Copy)]
 pub struct Position {
     pub latitude: f64,
@@ -69,7 +75,9 @@ pub fn is_location_service_enabled() -> Result<bool, String> {
     }
 }
 
-/// Get the current position (one-shot).
+/// Get one fresh position on a worker thread (30-second native timeout).
+/// UI callers must use `get_current_position_async`; this compatibility API
+/// rejects main-thread calls rather than blocking native delegate delivery.
 #[allow(unused_variables)]
 pub fn get_current_position(settings: &LocationSettings) -> Result<Position, String> {
     #[cfg(target_os = "ios")]

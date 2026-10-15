@@ -1,196 +1,147 @@
 package dev.gpui.mobile;
 
+import android.Manifest;
 import android.app.Activity;
+import android.app.Application;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
+import java.lang.ref.WeakReference;
+import java.util.HashMap;
 
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
-
-/**
- * Java helper for location services, called from Rust via JNI.
- *
- * <p>Uses {@link LocationManager} (no Google Play Services dependency).
- * All public methods are {@code static}.</p>
- *
- * <p>Position data is returned as a pipe-delimited String:
- * "lat|lon|alt|accuracy|speed|speedAccuracy|heading|headingAccuracy|timestamp"</p>
- */
+/** Foreground-only LocationManager subscriptions. JNI callbacks never block. */
 public final class GpuiLocation {
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final HashMap<Long, Subscription> SUBSCRIPTIONS = new HashMap<>();
+    private static native void nativeEvent(long id, String event);
 
-    private static final String TAG = "GpuiLocation";
-    private static final long TIMEOUT_SECONDS = 30;
-
-    /**
-     * Check whether location services (GPS or network) are enabled on the device.
-     *
-     * @param activity The current Activity.
-     * @return true if at least one location provider is enabled.
-     */
     public static boolean isLocationEnabled(Activity activity) {
-        LocationManager lm = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
-        if (lm == null) return false;
-        boolean gps = false;
-        boolean network = false;
-        try {
-            gps = lm.isProviderEnabled(LocationManager.GPS_PROVIDER);
-        } catch (Exception ignored) {}
-        try {
-            network = lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
-        } catch (Exception ignored) {}
-        return gps || network;
+        LocationManager manager = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
+        return manager != null && (manager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+            || manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER));
     }
-
-    /**
-     * Request a single location update and block until it arrives (or timeout).
-     *
-     * @param activity The current Activity.
-     * @param accuracy Accuracy level: 0=lowest, 1=low, 2=medium, 3=high, 4=best, 5=bestForNavigation.
-     * @return A pipe-delimited string of 9 values, or null if the request failed or timed out.
-     */
-    public static String getCurrentPosition(Activity activity, int accuracy) {
-        LocationManager lm = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
-        if (lm == null) return null;
-
-        String provider = pickProvider(lm, accuracy);
-        if (provider == null) return null;
-
-        final CountDownLatch latch = new CountDownLatch(1);
-        final AtomicReference<Location> locationRef = new AtomicReference<>(null);
-
-        LocationListener listener = new LocationListener() {
-            @Override
-            public void onLocationChanged(Location location) {
-                locationRef.set(location);
-                latch.countDown();
+    public static void start(Activity activity, long id, int accuracy, double distance, boolean once) {
+        MAIN.post(() -> {
+            Subscription previous = SUBSCRIPTIONS.get(id);
+            boolean paused = previous != null && previous.suspended;
+            stopOnMain(id);
+            if (!Double.isFinite(distance) || distance < 0 || distance > Float.MAX_VALUE) {
+                nativeEvent(id, "error|configuration|Invalid distance filter");
+                nativeEvent(id, "end|configuration");
+                return;
             }
-
-            @Override
-            public void onStatusChanged(String provider, int status, Bundle extras) {}
-
-            @Override
-            public void onProviderEnabled(String provider) {}
-
-            @Override
-            public void onProviderDisabled(String provider) {}
-        };
-
-        try {
-            lm.requestSingleUpdate(provider, listener, Looper.getMainLooper());
-        } catch (SecurityException e) {
-            android.util.Log.e(TAG, "Location permission denied", e);
-            return null;
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "requestSingleUpdate failed", e);
-            return null;
-        }
-
-        try {
-            if (!latch.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                lm.removeUpdates(listener);
-                android.util.Log.w(TAG, "getCurrentPosition timed out");
-                return null;
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            lm.removeUpdates(listener);
-            return null;
-        }
-
-        Location loc = locationRef.get();
-        if (loc == null) return null;
-        return locationToString(loc);
+            Subscription subscription = new Subscription(activity, id, accuracy, distance, once);
+            SUBSCRIPTIONS.put(id, subscription);
+            activity.getApplication().registerActivityLifecycleCallbacks(subscription);
+            if (once) MAIN.postDelayed(subscription.timeout, 30_000);
+            if (paused) subscription.suspended = true;
+            else subscription.resume();
+        });
     }
-
-    /**
-     * Get the last known location from available providers.
-     *
-     * @param activity The current Activity.
-     * @return A pipe-delimited string of 9 values, or null if no cached location exists.
-     */
+    public static void stop(long id) { MAIN.post(() -> stopOnMain(id)); }
+    private static void stopOnMain(long id) {
+        Subscription subscription = SUBSCRIPTIONS.remove(id);
+        if (subscription != null) {
+            subscription.active = false;
+            MAIN.removeCallbacks(subscription.timeout);
+            subscription.suspend();
+            subscription.application.unregisterActivityLifecycleCallbacks(subscription);
+        }
+    }
     public static String getLastKnownPosition(Activity activity) {
-        LocationManager lm = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
-        if (lm == null) return null;
-
+        LocationManager manager = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
+        if (manager == null) return null;
+        boolean fine = activity.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        boolean coarse = activity.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        if (!fine && !coarse) throw new SecurityException("Location permission denied");
+        // SecurityException is deliberately propagated through JNI, not reported as an empty cache.
         Location best = null;
-
-        // Try GPS first, then network, then passive — pick the most recent
-        try {
-            Location gps = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-            if (gps != null) best = gps;
-        } catch (SecurityException ignored) {}
-
-        try {
-            Location net = lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);
-            if (net != null) {
-                if (best == null || net.getTime() > best.getTime()) {
-                    best = net;
-                }
-            }
-        } catch (SecurityException ignored) {}
-
-        try {
-            Location passive = lm.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER);
-            if (passive != null) {
-                if (best == null || passive.getTime() > best.getTime()) {
-                    best = passive;
-                }
-            }
-        } catch (SecurityException ignored) {}
-
-        if (best == null) return null;
-        return locationToString(best);
+        for (String provider : manager.getProviders(true)) {
+            if (!fine && !LocationManager.NETWORK_PROVIDER.equals(provider)) continue;
+            Location location = manager.getLastKnownLocation(provider);
+            if (location != null && (best == null || location.getElapsedRealtimeNanos() > best.getElapsedRealtimeNanos())) best = location;
+        }
+        return best == null ? null : serialize(best);
     }
-
-    /**
-     * Convert a Location to a pipe-delimited string:
-     * "lat|lon|alt|accuracy|speed|speedAccuracy|heading|headingAccuracy|timestamp"
-     */
-    private static String locationToString(Location loc) {
-        double lat = loc.getLatitude();
-        double lon = loc.getLongitude();
-        double alt = loc.hasAltitude() ? loc.getAltitude() : 0.0;
-        double acc = loc.hasAccuracy() ? loc.getAccuracy() : 0.0;
-        double spd = loc.hasSpeed() ? loc.getSpeed() : 0.0;
-        double spdAcc = loc.hasSpeedAccuracy() ? loc.getSpeedAccuracyMetersPerSecond() : 0.0;
-        double hdg = loc.hasBearing() ? loc.getBearing() : 0.0;
-        double hdgAcc = loc.hasBearingAccuracy() ? loc.getBearingAccuracyDegrees() : 0.0;
-        double ts = (double) loc.getTime();
-
-        return lat + "|" + lon + "|" + alt + "|" + acc + "|"
-                + spd + "|" + spdAcc + "|" + hdg + "|" + hdgAcc + "|" + ts;
+    private static String serialize(Location p) {
+        return p.getLatitude() + "|" + p.getLongitude() + "|" + (p.hasAltitude() ? p.getAltitude() : Double.NaN)
+            + "|" + (p.hasAccuracy() ? p.getAccuracy() : -1)
+            + "|" + (p.hasSpeed() ? p.getSpeed() : Double.NaN)
+            + "|" + (p.hasSpeedAccuracy() ? p.getSpeedAccuracyMetersPerSecond() : Double.NaN)
+            + "|" + (p.hasBearing() ? p.getBearing() : Double.NaN)
+            + "|" + (p.hasBearingAccuracy() ? p.getBearingAccuracyDegrees() : Double.NaN) + "|" + p.getTime();
     }
-
-    /**
-     * Pick the best provider based on the requested accuracy level.
-     */
-    private static String pickProvider(LocationManager lm, int accuracy) {
-        // For high/best/bestForNavigation, prefer GPS
-        if (accuracy >= 3) {
-            if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                return LocationManager.GPS_PROVIDER;
+    private static final class Subscription implements LocationListener, Application.ActivityLifecycleCallbacks {
+        final WeakReference<Activity> activity;
+        final Application application;
+        final LocationManager manager;
+        final long id;
+        final int accuracy;
+        final float distance;
+        final boolean once;
+        final long requestedAt = SystemClock.elapsedRealtimeNanos();
+        boolean active = true;
+        boolean suspended = false;
+        final Runnable timeout;
+        Subscription(Activity activity, long id, int accuracy, double distance, boolean once) {
+            this.activity = new WeakReference<>(activity);
+            this.application = activity.getApplication();
+            this.manager = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
+            this.id = id; this.accuracy = accuracy; this.distance = (float) distance; this.once = once;
+            timeout = () -> { emit("error|timeout|No fresh location in 30 seconds"); finish("timeout"); };
+        }
+        void emit(String event) { if (active) nativeEvent(id, event); }
+        void finish(String reason) { emit("end|" + reason); stopOnMain(id); }
+        void suspend() {
+            suspended = true;
+            if (manager != null) {
+                try { manager.removeUpdates(this); }
+                catch (SecurityException error) { emit("error|permission_denied|" + error.getMessage()); }
             }
         }
-        // For low/medium or when GPS is unavailable, try network
-        if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-            return LocationManager.NETWORK_PROVIDER;
+        void resume() {
+            if (!active) return;
+            Activity owner = activity.get();
+            if (owner == null) { finish("owner_destroyed"); return; }
+            suspend();
+            suspended = false;
+            boolean fine = owner.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+            boolean coarse = owner.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+            emit("permission|" + (fine ? "precise" : coarse ? "approximate" : "denied"));
+            if (!fine && !coarse) return;
+            if (manager == null) { emit("error|unavailable|LocationManager unavailable"); return; }
+            try {
+                String provider = null;
+                if (accuracy >= 3 && fine && manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) provider = LocationManager.GPS_PROVIDER;
+                else if (manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) provider = LocationManager.NETWORK_PROVIDER;
+                else if (fine && manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) provider = LocationManager.GPS_PROVIDER;
+                if (provider == null) { emit("error|disabled|No enabled location provider; refresh after enabling"); return; }
+                manager.requestLocationUpdates(provider, 1000, distance, this, Looper.getMainLooper());
+            } catch (SecurityException error) {
+                emit("permission|denied"); emit("error|permission_denied|" + error.getMessage());
+            } catch (IllegalArgumentException error) { emit("error|native|" + error.getMessage()); }
         }
-        // Fallback to GPS if network not available
-        if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            return LocationManager.GPS_PROVIDER;
+        @Override public void onLocationChanged(Location location) {
+            if (!active || suspended || (once && location.getElapsedRealtimeNanos() < requestedAt)) return;
+            emit("position|" + serialize(location));
+            if (once) finish("completed");
         }
-        // Last resort: passive
-        if (lm.isProviderEnabled(LocationManager.PASSIVE_PROVIDER)) {
-            return LocationManager.PASSIVE_PROVIDER;
-        }
-        return null;
+        @Override public void onProviderDisabled(String provider) { emit("error|disabled|" + provider); }
+        @Override public void onProviderEnabled(String provider) { if (!suspended) resume(); }
+        @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+        @Override public void onActivityResumed(Activity a) { if (activity.get() == a) resume(); }
+        @Override public void onActivityPaused(Activity a) { if (activity.get() == a) suspend(); }
+        @Override public void onActivityDestroyed(Activity a) { if (activity.get() == a) finish("owner_destroyed"); }
+        @Override public void onActivityCreated(Activity a, Bundle state) {}
+        @Override public void onActivityStarted(Activity a) {}
+        @Override public void onActivityStopped(Activity a) {}
+        @Override public void onActivitySaveInstanceState(Activity a, Bundle state) {}
     }
-
-    // Prevent instantiation.
     private GpuiLocation() {}
 }
