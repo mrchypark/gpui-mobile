@@ -25,22 +25,27 @@ Track `example/Cargo.lock` and `examples/ely-integration/Cargo.lock`; the root l
 |---|---|---|
 | Common dependency identity | PASS | Root/example iOS and BLE-enabled Android example trees contain one GPUI source/revision and one wgpu |
 | GPUI showcase iOS native compile/link/install/run | PASS for the recorded snapshot | iPhone 17 Pro / iOS 26.3, PID 71818 alive at 28 seconds; actual Home rendering visually inspected; `ios-final-build-run.log`, `ios-final-runtime.log`, `ios-gpui-simulator-final.png` |
-| Latest iOS Rc/Weak code + Ely native compile/link/install/run | PASS for startup/rendering | Published Ely `7f6a3f91`; final cross-boundary-contact fix; staticlib build 7.33s; PID 20634; `native-ios-reviewed.log`, `runtime-ios-reviewed.log`, `ely-viewport-final.png` |
-| Ely adapter regression assertions and actual OS insets | PASS | Debug simulator startup emits `ELY_ADAPTER_SELFCHECK PASS`; real safe area top 62 / bottom 34 reaches live model; source identities in `examples/ely-integration/evidence/` |
+| iOS Rc/Weak code + Ely native compile/link/install/run | PASS for recorded startup/rendering | Published Ely `7f6a3f91`; build 3m56s; PID 18809 at 21:28 KST; `ely-integration-evidence/native-ios-keyboard-final.log`, `ely-integration-evidence/runtime-ios-keyboard-final.log`; `outputs/ely-viewport-keyboard-ready.png` shows controls and canvas |
+| Ely adapter and floating-keyboard regression assertions and actual OS insets | PASS | PID 18809 executed `ELY_FLOATING_KEYBOARD_SELFCHECK PASS` and `ELY_ADAPTER_SELFCHECK PASS`; real safe area top 62 / bottom 34 reaches live model; `ely-integration-evidence/runtime-ios-keyboard-final.log`; source identities in `examples/ely-integration/evidence/` |
 | Ely actual click/drag/pinch, keyboard interaction and lifecycle recovery | NOT VERIFIED | Mac locked during UI validation; no UI gestures performed. Simulator developer screenshot confirms rendering only; callback ownership changes are not a full lifecycle stress test |
 | Android root default / BLE-enabled type checks | PASS | `android-final-check.log` (58.30s), `android-final-ble-check.log` (1m04s) |
 | Android example BLE-enabled type check | PASS | `android-example-final-ble-check.log` (1m00s) |
 | Android final BLE-enabled cdylib compile/link | PASS | Latest FIFO/RawOnly/text and Android legacy-flag cleanup; 2026-10-15 20:08 KST, exit 0 in 26.07s; `android-latest-cdylib.log`; source hashes in `android-latest-source-files-final.sha256` |
 | Android ELF inspection | PASS | AArch64 DYN; NativeActivity, Insets, BLE and GPS JNI exports; `android-example-elf.txt` |
 | BLE-enabled Android debug APK | PASS | Gradle assembleDebug, 1m02s, 36 tasks; pinned BLE Java preparation and Activity compile passed; packaged native library hash matches the final cdylib; `android-latest-apk.log` |
-| Android execution | NOT VERIFIED | `adb devices -l` returned no targets; no APK installation or device-run claim |
+| Ely Android cdylib and debug APK | PASS for compile/link/package | `ely-integration-evidence/android-apk-final.log`: native build 26.60s, Gradle assembleDebug 32s with JDK 21; builder verified app identity, ARM64 native library, JNI/NativeActivity exports and v2 debug signature; separate from the BLE example; independent SHA-256 and apksigner v2 signature verification passed |
+| Android execution | NOT VERIFIED | `adb devices -l` returned no targets and the SDK emulator executable is absent; neither APK has an installation or device-run claim |
 | Physical GPS/BLE, full surface recovery, FPS | NOT VERIFIED | Type checks and simulator rendering do not establish these results |
 
 Logs are preserved under the calling task's `work/` directory. User-facing artifacts are under its `outputs/` directory. Final Android artifact: `libgpui_mobile_example-android-arm64.so`, SHA-256 `66e37375997042539427fef79516596bcea8888f8659637dc15a8c62d6f5f565`. The build includes source through `1c7c6b3cd5eae08e0a28d4cb563d9e1f9a4b304f`; file hashes and ELF inspection are recorded in `android-latest-source-files-final.sha256` and `android-latest-verification.txt`. Dynamic exports include `ANativeActivity_onCreate`, `Java_dev_gpui_mobile_GpuiInsets_nativeInsets`, `Java_org_gpui_mobile_ble_Ble_initialize`, and `Java_dev_gpui_mobile_GpuiLocation_nativeEvent`.
 
 Independent service/event tests are detailed in [mobile events](mobile-events.md), [location](location-service-integration.md), and [BLE](ble-integration.md). They do not replace device-service validation.
 
-The final debug APK is `outputs/gpui-mobile-example-ble-arm64-debug.apk` (110 MiB), SHA-256 `f9c08f42579fe64352acdfdc157b0f4db75158aafe064b7b571c99ba1aa4da72`. Package `dev.gpui.mobile.example`, minimum API 26, target/compile API 34. APK signature verification passed. Build-Tools 36 used the SDK's existing accepted license; no new license was accepted interactively. Logs include `android-apk-badging.txt`, `android-apk-signature.txt`, and `android-apk-native.sha256`.
+Independent `aapt` inspection also confirmed the Ely APK's `dev.gpui.mobile.ely` application ID and ARM64 ABI. Its embedded native library SHA-256 `336ade3dfea83296b98a36387641e517528cad923f816f32b64d14efbac5ccb1` matches `outputs/libgpui_mobile_ely_integration.so`. This is artifact verification, not Android execution.
+
+The BLE debug APK is `outputs/gpui-mobile-example-ble-arm64-debug.apk` (110 MiB), SHA-256 `f9c08f42579fe64352acdfdc157b0f4db75158aafe064b7b571c99ba1aa4da72`. Package `dev.gpui.mobile.example`, minimum API 26, target/compile API 34. APK signature verification passed. Build-Tools 36 used the SDK's existing accepted license; no new license was accepted interactively. Logs include `android-apk-badging.txt`, `android-apk-signature.txt`, and `android-apk-native.sha256`.
+
+The separate final Ely APK is `outputs/ely-integration-arm64-debug.apk`, SHA-256 `d7954fb57bdb62bab127f7521248efe89e16990760fa53eb1cebd2d4f52bef9e`. The builder verified package `dev.gpui.mobile.ely`, label `Ely Integration`, ARM64 native library `gpui_mobile_ely_integration`, JNI/NativeActivity exports and the v2 debug signature. Its NativeActivity host initializes JNI and runs the Ely root with Ely assets; BLE initialization is disabled. Reproduce with `sh examples/ely-integration/android-apk.sh`; see the [integration README](../examples/ely-integration/README.md) for SDK/JDK setup. Independent verification confirmed the SHA-256 above and passed apksigner v2 signature verification. Packaging success does not establish keyboard assertion or UI execution results.
 
 ## Reproduce
 
@@ -81,6 +86,7 @@ Use cdylib-only for the Android example: its general manifest also emits an unne
 
 ## Platform limits
 
+- The Ely app combines safe area and docked keyboard occlusion with `max`. A docked rectangle must cover the usable content width; floating rectangles instead drive focus visibility from the input's painted bounds and Ely reveal helpers. Full control-area occlusion has no vertical scroll destination. Avoidance assertions passed in the iOS simulator; actual keyboard interaction remains unverified and the locked Mac UI was untouched.
 - System-power sleep/wake notifications are unsupported here. App background, focus and resume do not synthesize these callbacks; they have separate mobile lifecycle events.
 - UIKit idle inhibition is reference-counted and restores the prior idle-timer value on the main queue. Android idle inhibition returns an explicit unsupported error. Pointer visibility/hide behavior remains OS-managed.
 - The recorded simulator lacks some AppleColorEmoji glyphs; several example icons render as boxed question marks. Text, quads, cards and navigation render normally. No FPS measurement was taken.

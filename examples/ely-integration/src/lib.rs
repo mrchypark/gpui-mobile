@@ -1,4 +1,5 @@
 //! Mobile event adapter and native Ely viewport; no network or backend UI dependency.
+mod floating_keyboard;
 mod mobile;
 use ely_gpui_component::{
     Assets,
@@ -7,8 +8,8 @@ use ely_gpui_component::{
     forms::{Input, TextInput},
 };
 use gpui::{
-    App, Bounds, Context, Entity, IntoElement, Render, Window, WindowOptions, canvas, div, point,
-    prelude::*, px, size,
+    App, Bounds, Context, Entity, Focusable, IntoElement, Render, Window, WindowOptions, canvas,
+    div, point, prelude::*, px, size,
 };
 use gpui_mobile::mobile_events::{
     MobileEvent, TouchDeliveryPolicy, set_mobile_event_handler, set_touch_delivery_policy,
@@ -24,6 +25,9 @@ struct ElyRoot {
     mobile: MobileViewport,
     route: Rc<RefCell<GestureRoute>>,
     input: Entity<TextInput>,
+    controls_scroll: gpui::ScrollHandle,
+    keyboard_reveal: Rc<RefCell<floating_keyboard::RevealState>>,
+    _focus_subscriptions: Vec<gpui::Subscription>,
     events: usize,
     resets: usize,
 }
@@ -41,6 +45,14 @@ impl Render for ElyRoot {
             ),
         );
         let measure = self.route.clone();
+        let scroll = self.controls_scroll.clone();
+        let keyboard_reveal = self.keyboard_reveal.clone();
+        let focus = self.input.read(cx).focus_handle(cx);
+        let keyboard = if self.mobile.insets.keyboard_visible == Some(false) {
+            None
+        } else {
+            self.mobile.insets.keyboard
+        };
         div()
             .size_full()
             .relative()
@@ -55,6 +67,12 @@ impl Render for ElyRoot {
                     .w(available.size.width)
                     .h(header)
                     .overflow_y_scroll()
+                    .track_scroll(&self.controls_scroll)
+                    .child(div()
+                    // Leave room to reveal a field above or below a floating keyboard.
+                    .pt(px(180.))
+                    .pb(px(180.))
+                    .child(div()
                     .p_3()
                     .flex()
                     .flex_col()
@@ -69,7 +87,16 @@ impl Render for ElyRoot {
                                 cx.notify();
                             })),
                     )
-                    .child(Input::new(&self.input))
+                    .child(div().relative().flex_shrink_0()
+                        .child(Input::new(&self.input))
+                        .child(canvas(
+                            |bounds, _, _| bounds,
+                            move |_, field, window, _| {
+                                if keyboard_reveal.borrow_mut().reveal(&scroll, focus.is_focused(window), field, keyboard) {
+                                    window.request_animation_frame();
+                                }
+                            },
+                        ).absolute().top_0().left_0().size_full()))
                     .child(format!(
                         "OS {} · zoom {:.2} · pan {:.0},{:.0} · commits {}",
                         self.events,
@@ -80,7 +107,7 @@ impl Render for ElyRoot {
                     ))
                     .child("Canvas: drag / pinch. Controls: native tap / scroll.")
                     .child("Scroll this control area; gestures stay with their start region.")
-                    .child("Floating keyboard focus avoidance is not implemented."),
+                    .child("Focused input scrolls clear of keyboard overlap."))),
             )
             .child(
                 div()
@@ -139,6 +166,8 @@ fn open_window(cx: &mut App) {
     #[cfg(debug_assertions)]
     {
         mobile::self_check();
+        floating_keyboard::self_check();
+        eprintln!("ELY_FLOATING_KEYBOARD_SELFCHECK PASS");
         eprintln!("ELY_ADAPTER_SELFCHECK PASS");
     }
     ely_gpui_component::init(cx).expect("initialize Ely assets/fonts/theme");
@@ -155,12 +184,26 @@ fn open_window(cx: &mut App) {
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         let owner = 0;
         let route = Rc::new(RefCell::new(GestureRoute::new(owner)));
-        let root = cx.new(|cx| ElyRoot {
-            mobile: MobileViewport::default(),
-            route: route.clone(),
-            input: cx.new(|cx| TextInput::new(window, cx).placeholder("Tap to edit a map label")),
-            events: 0,
-            resets: 0,
+        let root = cx.new(|cx| {
+            let input =
+                cx.new(|cx| TextInput::new(window, cx).placeholder("Tap to edit a map label"));
+            let focus = input.read(cx).focus_handle(cx);
+            let subscriptions = vec![
+                cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+            ];
+            let controls_scroll = gpui::ScrollHandle::new();
+            controls_scroll.set_offset(point(px(0.), px(-180.)));
+            ElyRoot {
+                mobile: MobileViewport::default(),
+                route: route.clone(),
+                input,
+                controls_scroll,
+                keyboard_reveal: Default::default(),
+                _focus_subscriptions: subscriptions,
+                events: 0,
+                resets: 0,
+            }
         });
         let weak = root.downgrade();
         let app = cx.to_async();
@@ -218,4 +261,13 @@ fn open_window(cx: &mut App) {
         root
     })
     .expect("open Ely viewport window");
+}
+
+/// NativeActivity enters here; initialize JNI once, then reuse its platform and Ely assets.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+fn android_main(app: android_activity::AndroidApp) {
+    gpui_mobile::android::jni::install_panic_hook();
+    gpui_mobile::android::jni::init_platform(&app);
+    run();
 }

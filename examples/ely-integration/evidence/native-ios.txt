@@ -25,3 +25,16 @@ Actual button clicks, drag/pinch, input, scroll and lifecycle recovery are NOT V
 Startup assertions cover coordinate translation, final Ended snapshot, cancellation,
 additional-finger outside canvas, exclusive pinch, routing latch, foreign windows,
 safe-area/keyboard max, and bottom-touching narrow floating keyboard exclusion.
+
+Final keyboard/Android-packaging source verification, 2026-10-15 21:28 KST:
+CARGO_NET_OFFLINE=true sh examples/ely-integration/ios-simulator.sh --no-run
+Rust staticlib build PASS (3m56s), native link/sign PASS.
+Developer simctl install/launch PASS, ElyIntegration PID 18809.
+ELY_FLOATING_KEYBOARD_SELFCHECK PASS
+ELY_ADAPTER_SELFCHECK PASS
+Real GPUI ScrollHandle/types and published Ely helpers; no stubs.
+Actual initial safe-area event: top62 bottom34, keyboard hidden.
+Screenshot outputs/ely-viewport-keyboard-ready.png inspected: reset button,
+input, status and canvas initially visible; previous screenshots preserved.
+No actual UI interaction or keyboard gesture was performed.
+Linker retains prior large __eh_frame compact-unwind warning.

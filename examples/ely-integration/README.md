@@ -1,6 +1,6 @@
 # Native Ely mobile viewport
 
-A small UIKit app using actual Ely Button/Input/InfiniteCanvas components,
+A small native app using actual Ely Button/Input/InfiniteCanvas components,
 mobile OS events, and one GPUI dependency graph. No network client or TLS bypass.
 
 ## Build and run
@@ -22,6 +22,36 @@ For an already populated cache, `CARGO_NET_OFFLINE=true` is optional. The script
 uses `--locked` but does not require offline caches on fresh clones.
 
 Generated `ios-build/` is ignored. Do not commit the app or build artifacts.
+
+### Android APK
+
+On macOS, install Android SDK platform 34, NDK 28.2.13676358, JDK 21 and the
+Rust 1.97.1 `aarch64-linux-android` target, then run:
+
+```sh
+sh examples/ely-integration/android-apk.sh
+```
+
+If the shell already exports an older JDK, explicitly set `JAVA_HOME` to JDK 21
+before running the script (for Homebrew: `/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home`).
+
+`ANDROID_HOME`, `ANDROID_NDK_HOME`, `JAVA_HOME` and `CARGO_TARGET_DIR` can override
+the local defaults. The script builds only an arm64 cdylib with `--locked`, one
+job, debug=0 and incremental=false, then uses the existing Gradle wrapper to
+assemble a signed debug APK. It reuses the repository's NativeActivity Java,
+resources and assets without copying or changing that host. Generated staging
+and Gradle outputs are ignored.
+
+The distinct output is `android-build/ely-integration-arm64-debug.apk` beneath
+this example, with application ID `dev.gpui.mobile.ely`, label `Ely Integration`,
+and native library `gpui_mobile_ely_integration`. This is the Ely UI, not the
+BLE demo. The manifest requests no network or BLE permissions. The reused host's
+BLE initialization is disabled.
+
+The final arm64 cdylib and debug APK built successfully on 2026-10-15. Manifest,
+NativeActivity/JNI exports and APK v2 debug signature verification passed; see
+`evidence/native-android.txt` for hashes and commands. AndroidX adds biometric,
+fingerprint and internal receiver permissions through manifest merging.
 
 ## Source identity
 
@@ -64,8 +94,13 @@ touch-generated mouse/scroll in the canvas; outside controls retain synthesis.
 
 Safe area and docked bottom keyboard occlusion combine using max, not addition.
 A keyboard rectangle must reach the bottom **and cover the usable content width**
-to count as bottom occlusion. Floating rectangles remain in WindowInsets but
-floating-keyboard focus avoidance is unsupported. Android IME bottom insets also
+to count as bottom occlusion. Floating rectangles remain in WindowInsets. The
+focused input's actual painted bounds are checked against keyboard geometry on
+focus/keyboard/frame changes; Ely reveal helpers scroll it only when those bounds
+intersect the keyboard. Unchanged paints and hidden-keyboard updates preserve
+manual scrolling. Ordinary offscreen fields do not trigger keyboard avoidance.
+Full control-area occlusion has no vertical scroll destination and remains a
+limitation. Android IME bottom insets also
 participate in the max. The header scroll area and input remain actual Ely UI.
 
 ## Startup and evidence
@@ -84,6 +119,14 @@ and a canvas-start/header-second-finger pinch. Actual OS safe-area events (top
 62, bottom 34 logical pixels) reached the live view. The developer screenshot
 shows actual Ely Button/Input/canvas; see `evidence/native-ios.txt`.
 
+The final Android-packaging/keyboard source was also built and developer-launched
+on iOS at 21:28 KST (PID 18809). The 3m56s build, native link and signing passed.
+Both `ELY_FLOATING_KEYBOARD_SELFCHECK PASS` and `ELY_ADAPTER_SELFCHECK PASS`
+executed using real GPUI types and Ely helpers. This covers focus, keyboard
+movement/resizing/hiding, manual-scroll preservation, and the nonintersecting
+offscreen-field regression. The new `ely-viewport-keyboard-ready.png` developer
+screenshot confirms the initial button, input, status and canvas remain visible.
+
 The Mac was locked during attempted UI verification. **No actual clicks, drags,
 pinches, text entry or scroll gestures were performed.** Those interactive gates,
 keyboard focus behavior, lifecycle stress/recovery, physical devices and FPS
@@ -96,6 +139,9 @@ second-finger preview cancellation, exclusive pinch, foreign windows, latched
 routing, inset max, and narrow floating keyboards. ELY_ROUTE/ELY_MOBILE traces
 identify actual OS events separately from ELY_ADAPTER_SELFCHECK assertions.
 
-Android's app path uses jni::shared_platform after init_platform, rather than
-constructing a second platform. Android metadata identity passed; this example
-has no APK host and no Android runtime validation.
+Android's exported `android_main` initializes JNI, then uses `jni::shared_platform`
+and Ely `Assets` for the same root UI. The blocking Android event loop retains
+the Application for its lifetime. No second platform is constructed.
+Android runtime validation is unavailable: elevated `adb devices` found no
+connected device, and the SDK emulator executable is absent. The keyboard
+assertions executed on iOS as described above; Android runtime remains unverified.
