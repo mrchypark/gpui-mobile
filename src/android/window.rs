@@ -53,6 +53,7 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use super::{AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
+use crate::mobile_events::{self, AppLifecycle, MobileEvent, MobileEventState, SurfaceLifecycle};
 use crate::momentum::{MomentumScroller, VelocityTracker};
 
 /// Lightweight, owned window handle for wgpu surface creation.
@@ -297,6 +298,7 @@ struct WindowState {
     /// `WindowResized`.  The top inset accounts for the status bar / notch,
     /// and the bottom inset accounts for the navigation bar / gesture area.
     safe_area_insets: SafeAreaInsets,
+    has_native_insets: bool,
 
     /// Current appearance.
     appearance: WindowAppearance,
@@ -340,6 +342,11 @@ pub struct AndroidWindow {
     /// lifecycle handlers can set it without acquiring the state lock
     /// (which may be held by a background render thread).
     active: Arc<std::sync::atomic::AtomicBool>,
+    mobile_events: Mutex<MobileEventState>,
+    legacy_multitouch: std::sync::atomic::AtomicBool,
+    app_resumed: std::sync::atomic::AtomicBool,
+    surface_available: std::sync::atomic::AtomicBool,
+    visibility_callback: Mutex<Option<Box<dyn FnMut(gpui::WindowVisibility) + Send>>>,
 }
 
 // SAFETY: `WindowState` is protected by a `Mutex`.
@@ -347,6 +354,73 @@ unsafe impl Send for AndroidWindow {}
 unsafe impl Sync for AndroidWindow {}
 
 impl AndroidWindow {
+    fn emit_mobile_events(&self, events: Vec<MobileEvent>) {
+        mobile_events::dispatch_batch(self.id, events);
+    }
+
+    /// Activity resume/pause, distinct from focus and system sleep. Call on the UI thread.
+    pub fn notify_app_lifecycle(&self, resumed: bool) {
+        use std::sync::atomic::Ordering;
+        let before = self.visibility();
+        self.app_resumed.store(resumed, Ordering::Relaxed);
+        let lifecycle = if resumed {
+            AppLifecycle::Resumed
+        } else {
+            AppLifecycle::Paused
+        };
+        let events = self
+            .mobile_events
+            .lock()
+            .lifecycle(lifecycle, std::time::Duration::ZERO);
+        if !resumed {
+            self.cancel_legacy_touch();
+            self.legacy_multitouch.store(false, Ordering::Relaxed);
+        }
+        self.emit_mobile_events(events);
+        self.notify_visibility(before);
+    }
+
+    fn visibility(&self) -> gpui::WindowVisibility {
+        use std::sync::atomic::Ordering;
+        if self.app_resumed.load(Ordering::Relaxed)
+            && self.surface_available.load(Ordering::Relaxed)
+        {
+            gpui::WindowVisibility::Visible
+        } else {
+            gpui::WindowVisibility::Hidden
+        }
+    }
+
+    fn notify_visibility(&self, previous: gpui::WindowVisibility) {
+        let current = self.visibility();
+        if previous != current {
+            let callback = self.visibility_callback.lock().take();
+            if let Some(mut callback) = callback {
+                callback(current);
+                let mut slot = self.visibility_callback.lock();
+                if slot.is_none() {
+                    *slot = Some(callback);
+                }
+            }
+        }
+    }
+
+    fn cancel_legacy_touch(&self) {
+        let callback = self.state.lock().touch_callback.take();
+        if let Some(mut callback) = callback {
+            callback(TouchPoint {
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                action: 3,
+            });
+            let mut state = self.state.lock();
+            if state.touch_callback.is_none() {
+                state.touch_callback = Some(callback);
+            }
+        }
+    }
+
     // ── constructors ─────────────────────────────────────────────────────────
 
     /// Create an `AndroidWindow` from an `ndk::NativeWindow`.
@@ -399,6 +473,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            has_native_insets: false,
             appearance: WindowAppearance::Light,
             is_active: true,
             transparent,
@@ -415,6 +490,15 @@ impl AndroidWindow {
             state,
             id,
             active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            mobile_events: Mutex::new({
+                let mut events = MobileEventState::default();
+                events.surface(SurfaceLifecycle::Available, std::time::Duration::ZERO);
+                events
+            }),
+            legacy_multitouch: std::sync::atomic::AtomicBool::new(false),
+            app_resumed: std::sync::atomic::AtomicBool::new(true),
+            surface_available: std::sync::atomic::AtomicBool::new(true),
+            visibility_callback: Mutex::new(None),
         }))
     }
 
@@ -430,6 +514,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            has_native_insets: false,
             appearance: WindowAppearance::Light,
             is_active: false,
             transparent: false,
@@ -446,6 +531,11 @@ impl AndroidWindow {
             state,
             id: ((width as u64) << 32) | (height as u64),
             active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mobile_events: Mutex::new(MobileEventState::default()),
+            legacy_multitouch: std::sync::atomic::AtomicBool::new(false),
+            app_resumed: std::sync::atomic::AtomicBool::new(false),
+            surface_available: std::sync::atomic::AtomicBool::new(false),
+            visibility_callback: Mutex::new(None),
         })
     }
 
@@ -454,6 +544,7 @@ impl AndroidWindow {
     /// Called when `APP_CMD_INIT_WINDOW` fires and a new `NativeWindow` is
     /// available (e.g. after returning from the background).
     pub fn init_window(&self, native_window: NativeWindow, gpu_context: GpuContext) -> Result<()> {
+        let previous_visibility = self.visibility();
         request_high_frame_rate(&native_window);
 
         let width = native_window.width();
@@ -515,6 +606,15 @@ impl AndroidWindow {
         self.active
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
+        drop(state);
+        self.surface_available
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let events = self
+            .mobile_events
+            .lock()
+            .surface(SurfaceLifecycle::Available, std::time::Duration::ZERO);
+        self.emit_mobile_events(events);
+        self.notify_visibility(previous_visibility);
         Ok(())
     }
 
@@ -524,6 +624,18 @@ impl AndroidWindow {
     /// Drops the renderer (and therefore the wgpu surface) but keeps the window
     /// struct alive so callbacks are preserved.
     pub fn term_window(&self) {
+        self.legacy_multitouch
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let previous_visibility = self.visibility();
+        self.surface_available
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let events = self
+            .mobile_events
+            .lock()
+            .surface(SurfaceLifecycle::Lost, std::time::Duration::ZERO);
+        self.cancel_legacy_touch();
+        self.emit_mobile_events(events);
+        self.notify_visibility(previous_visibility);
         let mut state = self.state.lock();
 
         // Unconfigure the surface so the renderer stops trying to present,
@@ -652,6 +764,9 @@ impl AndroidWindow {
     /// - Intermittently during fast scrolling if the layout pass
     ///   hasn't produced new content yet.
     pub fn draw(&self, scene: &gpui::Scene) {
+        if !self.visibility().is_visible() {
+            return;
+        }
         // Skip only truly empty scenes. Text and images are emitted as sprite
         // primitives, not quads, so checking `scene.quads` alone can drop
         // valid text-only frames during scroll or cache refresh and produce
@@ -692,6 +807,9 @@ impl AndroidWindow {
     /// `AndroidWindow::draw`, which needs to acquire the same `state` lock
     /// to access the renderer.
     pub fn request_frame(&self) {
+        if !self.visibility().is_visible() {
+            return;
+        }
         // Take the callback out of the lock so it can be invoked without
         // holding it.  This lets `draw()` (called from inside the callback)
         // acquire the lock for the renderer.
@@ -720,7 +838,63 @@ impl AndroidWindow {
     /// The callback is taken out of the lock before invocation (same pattern
     /// as `request_frame`) to avoid potential deadlocks if the callback
     /// re-enters any window method that needs the lock.
-    pub fn handle_touch(&self, point: TouchPoint) {
+    pub fn handle_touch(&self, mut point: TouchPoint) {
+        use std::sync::atomic::Ordering;
+        let phase = match point.action {
+            0 => gpui::TouchPhase::Started,
+            1 => gpui::TouchPhase::Ended,
+            2 => gpui::TouchPhase::Moved,
+            3 => gpui::TouchPhase::Cancelled,
+            _ => return,
+        };
+        let scale = self.scale_factor();
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let position = gpui::point(gpui::px(point.x / scale), gpui::px(point.y / scale));
+        let (events, count) = {
+            let mut state = self.mobile_events.lock();
+            let mut events: Vec<MobileEvent> = if point.action == 3 {
+                state.cancel_all(std::time::Duration::ZERO)
+            } else {
+                state
+                    .touch(point.id as u64, phase, position, std::time::Duration::ZERO)
+                    .into_iter()
+                    .collect()
+            };
+            if !events.is_empty() && point.action != 3 {
+                if let Some(pinch) = state.pointer_span(std::time::Duration::ZERO) {
+                    events.push(pinch);
+                }
+            }
+            (events, state.active_pointer_count())
+        };
+        let has_events = !events.is_empty();
+        if let Some(MobileEvent::Touch { event, .. }) = events.first() {
+            point.x = f32::from(event.position.x) * scale;
+            point.y = f32::from(event.position.y) * scale;
+        }
+        self.emit_mobile_events(events);
+        if count > 1 {
+            self.legacy_multitouch.store(true, Ordering::Relaxed);
+        }
+        if crate::mobile_events::raw_touch_only() {
+            self.cancel_legacy_touch();
+            if count == 0 {
+                self.legacy_multitouch.store(false, Ordering::Relaxed);
+            }
+            return;
+        }
+        if point.action == 3 || self.legacy_multitouch.load(Ordering::Relaxed) {
+            self.cancel_legacy_touch();
+            if count == 0 {
+                self.legacy_multitouch.store(false, Ordering::Relaxed);
+            }
+            return;
+        }
+        if !has_events {
+            return;
+        }
         let cb = {
             let mut state = self.state.lock();
             state.touch_callback.take()
@@ -907,6 +1081,9 @@ impl AndroidWindow {
         content_bottom: i32,
     ) {
         let mut state = self.state.lock();
+        if state.has_native_insets {
+            return;
+        }
         let insets = SafeAreaInsets {
             top: content_top as f32,
             bottom: (state.height - content_bottom).max(0) as f32,
@@ -921,6 +1098,65 @@ impl AndroidWindow {
             insets.right,
         );
         state.safe_area_insets = insets;
+        let logical = insets.to_logical(state.scale_factor);
+        drop(state);
+        mobile_events::dispatch(
+            self.id,
+            &MobileEvent::Insets(crate::mobile_events::WindowInsets {
+                safe_area: gpui::Edges {
+                    top: gpui::px(logical.top),
+                    bottom: gpui::px(logical.bottom),
+                    left: gpui::px(logical.left),
+                    right: gpui::px(logical.right),
+                },
+                keyboard: None,
+                keyboard_visible: None,
+                keyboard_insets: None,
+            }),
+        );
+    }
+
+    /// Called on the GPUI thread after the Java UI thread reports typed WindowInsets.
+    pub(crate) fn update_window_insets(
+        &self,
+        density: f32,
+        insets: crate::mobile_events::WindowInsets,
+    ) {
+        let mut state = self.state.lock();
+        state.has_native_insets = true;
+        state.safe_area_insets = SafeAreaInsets {
+            top: f32::from(insets.safe_area.top) * density,
+            bottom: f32::from(insets.safe_area.bottom) * density,
+            left: f32::from(insets.safe_area.left) * density,
+            right: f32::from(insets.safe_area.right) * density,
+        };
+        let density_changed = state.scale_factor != density;
+        state.scale_factor = density;
+        let dimensions = Size {
+            width: DevicePixels(state.width),
+            height: DevicePixels(state.height),
+        };
+        let callback = if density_changed {
+            state.resize_callback.take()
+        } else {
+            None
+        };
+        drop(state);
+        crate::set_keyboard_height(
+            insets
+                .keyboard_insets
+                .as_ref()
+                .map(|edges| f32::from(edges.bottom))
+                .unwrap_or(0.0),
+        );
+        mobile_events::dispatch(self.id, &MobileEvent::Insets(insets));
+        if let Some(mut callback) = callback {
+            callback(dimensions, density);
+            let mut state = self.state.lock();
+            if state.resize_callback.is_none() {
+                state.resize_callback = Some(callback);
+            }
+        }
     }
 
     // ── state queries ─────────────────────────────────────────────────────────
@@ -942,7 +1178,7 @@ impl AndroidWindow {
     /// Returns GPU specs from the renderer, if available.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         let state = self.state.lock();
-        state.renderer.as_ref().map(|r| r.gpu_specs())
+        state.renderer.as_ref().and_then(|r| r.gpu_specs())
     }
 
     /// Whether the window is currently active / visible.
@@ -1254,6 +1490,17 @@ impl PlatformWindow for AndroidPlatformWindow {
         self.window.is_active()
     }
 
+    fn visibility(&self) -> gpui::WindowVisibility {
+        self.window.visibility()
+    }
+
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(gpui::WindowVisibility)>) {
+        // Matches the existing main-thread-only active/input callback bridge.
+        let callback: Box<dyn FnMut(gpui::WindowVisibility) + Send> =
+            unsafe { std::mem::transmute(callback) };
+        *self.window.visibility_callback.lock() = Some(callback);
+    }
+
     fn is_hovered(&self) -> bool {
         // Touch-based — always "hovered" when active.
         self.window.is_active()
@@ -1318,7 +1565,7 @@ impl PlatformWindow for AndroidPlatformWindow {
             // emitting at most ONE ScrollWheel event per frame.
             // This avoids redundant layout passes when Android
             // delivers many MOVE events between frames.
-            {
+            if !crate::mobile_events::raw_touch_only() {
                 let mut ms = momentum.lock();
 
                 if ms.has_pending_scroll {
@@ -1460,7 +1707,7 @@ impl PlatformWindow for AndroidPlatformWindow {
         // The threshold is in logical pixels (~8 px ≈ ~3 mm at 160 dpi).
         {
             let cb = Arc::clone(&input_cb);
-            let scale_factor = self.window.scale_factor();
+            let window = Arc::downgrade(&self.window);
             let momentum = Arc::clone(&self.momentum);
 
             /// Distance (logical px) the finger must travel before a touch
@@ -1481,6 +1728,10 @@ impl PlatformWindow for AndroidPlatformWindow {
             let state = Mutex::new(TouchState::Idle);
 
             self.window.on_touch(move |touch| {
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                let scale_factor = window.scale_factor();
                 // Android delivers touch coordinates in physical (device)
                 // pixels, but GPUI performs layout and hit-testing in logical
                 // pixels.  Divide by scale factor.
@@ -1596,8 +1847,33 @@ impl PlatformWindow for AndroidPlatformWindow {
                         }));
                     }
 
-                    // ── ACTION_UP / ACTION_CANCEL ────────────────────────
-                    1 | 3 => {
+                    3 => {
+                        let was_scrolling = matches!(*ts, TouchState::Scrolling { .. });
+                        let position = match *ts {
+                            TouchState::Scrolling { prev_x, prev_y } => {
+                                gpui::point(gpui::px(prev_x), gpui::px(prev_y))
+                            }
+                            _ => Default::default(),
+                        };
+                        *ts = TouchState::Idle;
+                        let mut ms = momentum.lock();
+                        ms.scroller.cancel();
+                        ms.velocity_tracker.reset();
+                        ms.pending_scroll_dx = 0.0;
+                        ms.pending_scroll_dy = 0.0;
+                        ms.has_pending_scroll = false;
+                        drop(ms);
+                        if was_scrolling {
+                            cb.lock()(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                                position,
+                                delta: gpui::ScrollDelta::Pixels(Default::default()),
+                                modifiers,
+                                touch_phase: gpui::TouchPhase::Cancelled,
+                            }));
+                        }
+                    }
+                    // ── ACTION_UP ────────────────────────────────────────
+                    1 => {
                         let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
 
                         match *ts {
@@ -1825,10 +2101,6 @@ impl PlatformWindow for AndroidPlatformWindow {
         self.window.draw(scene);
     }
 
-    fn completed_frame(&self) {
-        // No-op — frame completion is handled by wgpu's present.
-    }
-
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.window
             .sprite_atlas()
@@ -1997,14 +2269,14 @@ impl FallbackAtlas {
 impl PlatformAtlas for FallbackAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> anyhow::Result<
             Option<(gpui::Size<gpui::DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,
     ) -> anyhow::Result<Option<AtlasTile>> {
         let mut state = self.state.lock();
 
-        if let Some(tile) = state.tiles.get(key) {
+        if let Some(tile) = state.tiles.get(&key) {
             return Ok(Some(tile.clone()));
         }
 
@@ -2172,6 +2444,9 @@ mod tests {
     #[test]
     fn touch_callback_fires() {
         let w = AndroidWindow::headless(1080, 1920, 2.0);
+        w.mobile_events
+            .lock()
+            .surface(SurfaceLifecycle::Available, std::time::Duration::ZERO);
         let received = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<TouchPoint>::new()));
         let r2 = received.clone();
 
@@ -2214,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn request_frame_callback_fires() {
+    fn request_frame_requires_visible_surface() {
         let w = AndroidWindow::headless(1080, 1920, 2.0);
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c2 = count.clone();
@@ -2223,6 +2498,12 @@ mod tests {
             c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
 
+        w.request_frame();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        w.app_resumed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        w.surface_available
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         w.request_frame();
         w.request_frame();
 

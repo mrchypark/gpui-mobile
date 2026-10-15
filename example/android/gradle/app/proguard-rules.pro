@@ -9,3 +9,11 @@
 
 # Keep NativeActivity since it is referenced by name in AndroidManifest.xml.
 -keep class android.app.NativeActivity { *; }
+
+# Loaded by the Rust platform on the Java UI thread.
+-keep class dev.gpui.mobile.GpuiInsets { *; }
+
+# BLE classes are accessed by JNI; preserve names and callbacks.
+-keep class org.gpui.mobile.ble.** { *; }
+-keep class com.nonpolynomial.** { *; }
+-keep class io.github.gedgygedgy.** { *; }

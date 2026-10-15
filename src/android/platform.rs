@@ -146,7 +146,9 @@ struct AndroidPlatformState {
     finish_launching: Option<Box<dyn FnOnce() + Send>>,
 
     /// Called when the app is about to quit.
-    quit_callback: Option<Box<dyn FnMut() + Send>>,
+    quit_callback: Option<Box<dyn FnMut() -> bool + Send>>,
+    sleep_callback: Option<Box<dyn FnMut() + Send>>,
+    wake_callback: Option<Box<dyn FnMut() + Send>>,
 
     /// Called when the app is re-opened (e.g. tapped in the recents screen
     /// while already running).
@@ -409,6 +411,8 @@ impl AndroidPlatform {
                 credentials: AndroidCredentialStore::default(),
                 finish_launching: None,
                 quit_callback: None,
+                sleep_callback: None,
+                wake_callback: None,
                 reopen_callback: None,
                 open_urls_callback: None,
                 keyboard_layout_callback: None,
@@ -515,17 +519,14 @@ impl AndroidPlatform {
     /// Invokes the registered quit callback before returning.
     pub fn quit(&self) {
         log::info!("AndroidPlatform::quit");
-        self.should_quit.store(true, Ordering::SeqCst);
-
-        let cb = self.state.lock().quit_callback.as_mut().map(|cb| {
-            // We cannot move out of an `&mut FnMut`, so we call it in place.
-            cb as *mut Box<dyn FnMut() + Send>
-        });
-
-        if let Some(cb_ptr) = cb {
-            // SAFETY: The pointer is valid for the duration of this call
-            // because we hold the lock-guard's lifetime indirectly.
-            unsafe { (*cb_ptr)() };
+        let callback = self.state.lock().quit_callback.take();
+        let mut allow_quit = true;
+        if let Some(mut callback) = callback {
+            allow_quit = callback();
+            self.state.lock().quit_callback.get_or_insert(callback);
+        }
+        if allow_quit {
+            self.should_quit.store(true, Ordering::SeqCst);
         }
     }
 
@@ -893,11 +894,14 @@ impl AndroidPlatform {
     // ── callback registration ─────────────────────────────────────────────────
 
     /// Register a callback invoked when the app is about to quit.
-    pub fn on_quit<F>(&self, cb: F)
+    pub fn on_quit<F>(&self, mut cb: F)
     where
         F: FnMut() + Send + 'static,
     {
-        self.state.lock().quit_callback = Some(Box::new(cb));
+        self.state.lock().quit_callback = Some(Box::new(move || {
+            cb();
+            true
+        }));
     }
 
     /// Register a callback invoked when the app is re-opened.
@@ -951,6 +955,32 @@ impl AndroidPlatform {
 // file pickers, etc.) are no-ops or return sensible defaults.
 
 impl Platform for AndroidPlatform {
+    fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
+        log::debug!("NativeActivity has no system-power sleep notification; app pause is separate");
+        // As with the other Platform callbacks, invocation stays on the native event thread.
+        self.state.lock().sleep_callback = Some(unsafe {
+            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
+        });
+    }
+
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        log::debug!("NativeActivity has no system-power wake notification; app resume is separate");
+        self.state.lock().wake_callback = Some(unsafe {
+            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
+        });
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        true
+    }
+
+    fn prevent_idle_sleep(&self, _reason: &str) -> Task<Result<gpui::ActivityGuard>> {
+        // NativeActivity cannot read the existing flag, so do not clear an app-owned inhibitor.
+        Task::ready(Err(anyhow::anyhow!(
+            "Android idle sleep inhibition is not supported by this backend"
+        )))
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         let dispatcher: Arc<dyn gpui::PlatformDispatcher> = self.state.lock().dispatcher.clone();
         BackgroundExecutor::new(dispatcher)
@@ -975,24 +1005,10 @@ impl Platform for AndroidPlatform {
     }
 
     fn quit(&self) {
-        log::info!("AndroidPlatform::quit");
-        self.should_quit.store(true, Ordering::SeqCst);
-
-        let cb = self
-            .state
-            .lock()
-            .quit_callback
-            .as_mut()
-            .map(|cb| cb as *mut Box<dyn FnMut() + Send>);
-
-        if let Some(cb_ptr) = cb {
-            // SAFETY: pointer is valid for the duration of this call because
-            // we hold the lock-guard's lifetime indirectly.
-            unsafe { (*cb_ptr)() };
-        }
+        AndroidPlatform::quit(self);
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {
         log::warn!("AndroidPlatform::restart — not supported on Android");
     }
 
@@ -1122,9 +1138,11 @@ impl Platform for AndroidPlatform {
         log::info!("AndroidPlatform::open_with_system — Intent launch not yet implemented");
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.state.lock().quit_callback = Some(unsafe {
-            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
+            std::mem::transmute::<Box<dyn FnMut() -> bool>, Box<dyn FnMut() -> bool + Send>>(
+                callback,
+            )
         });
     }
 
@@ -1177,6 +1195,10 @@ impl Platform for AndroidPlatform {
 
     fn path_for_auxiliary_executable(&self, _name: &str) -> Result<PathBuf> {
         anyhow::bail!("auxiliary executables are not supported on Android")
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        // NativeActivity does not expose an until-next-mouse-move cursor API.
     }
 
     fn set_cursor_style(&self, _style: CursorStyle) {
@@ -1292,6 +1314,18 @@ impl SharedPlatform {
 /// so the compiler never accidentally picks the inherent method (which may
 /// have a different return type).
 impl Platform for SharedPlatform {
+    fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_system_sleep(&self.0, callback)
+    }
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_system_wake(&self.0, callback)
+    }
+    fn is_cursor_visible(&self) -> bool {
+        <AndroidPlatform as Platform>::is_cursor_visible(&self.0)
+    }
+    fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<gpui::ActivityGuard>> {
+        <AndroidPlatform as Platform>::prevent_idle_sleep(&self.0, reason)
+    }
     fn background_executor(&self) -> BackgroundExecutor {
         <AndroidPlatform as Platform>::background_executor(&self.0)
     }
@@ -1307,8 +1341,8 @@ impl Platform for SharedPlatform {
     fn quit(&self) {
         <AndroidPlatform as Platform>::quit(&self.0)
     }
-    fn restart(&self, binary_path: Option<PathBuf>) {
-        <AndroidPlatform as Platform>::restart(&self.0, binary_path)
+    fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<std::ffi::OsString>) {
+        <AndroidPlatform as Platform>::restart(&self.0, binary_path, arguments)
     }
     fn activate(&self, ignoring_other_apps: bool) {
         <AndroidPlatform as Platform>::activate(&self.0, ignoring_other_apps)
@@ -1372,7 +1406,7 @@ impl Platform for SharedPlatform {
     fn open_with_system(&self, path: &Path) {
         <AndroidPlatform as Platform>::open_with_system(&self.0, path)
     }
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         <AndroidPlatform as Platform>::on_quit(&self.0, callback)
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
@@ -1405,6 +1439,10 @@ impl Platform for SharedPlatform {
     fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
         <AndroidPlatform as Platform>::path_for_auxiliary_executable(&self.0, name)
     }
+    fn hide_cursor_until_mouse_moves(&self) {
+        <AndroidPlatform as Platform>::hide_cursor_until_mouse_moves(&self.0)
+    }
+
     fn set_cursor_style(&self, style: CursorStyle) {
         <AndroidPlatform as Platform>::set_cursor_style(&self.0, style)
     }
@@ -1480,6 +1518,17 @@ mod tests {
     fn quit_sets_should_quit() {
         let p = headless();
         assert!(!p.should_quit());
+        p.quit();
+        assert!(p.should_quit());
+    }
+
+    #[test]
+    fn platform_quit_callback_can_veto() {
+        let p = headless();
+        <AndroidPlatform as Platform>::on_quit(&p, Box::new(|| false));
+        p.quit();
+        assert!(!p.should_quit());
+        <AndroidPlatform as Platform>::on_quit(&p, Box::new(|| true));
         p.quit();
         assert!(p.should_quit());
     }

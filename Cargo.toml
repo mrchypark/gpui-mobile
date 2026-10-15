@@ -48,6 +48,7 @@ calendar = []
 deeplink = []
 microphone = []
 media_session = []
+ble = ["dep:btleplug", "dep:tokio"]
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -60,9 +61,14 @@ log          = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 parking_lot  = "0.12"
 futures      = "0.3"
 raw-window-handle = "0.6"
+btleplug = { version = "=0.13.5", optional = true }
+tokio = { version = "1.53.1", features = ["rt", "time"], optional = true }
 
 # ── GPUI core crate (provides Platform trait, event types, geometry, etc.) ───
-gpui = { git = "https://github.com/zed-industries/zed", rev = "5688167d224b5eca54875d49afb8bfd73a07915a", package = "gpui", default-features = false }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", package = "gpui", default-features = false }
+
+[build-dependencies]
+cc = "1"
 
 # ── iOS ──────────────────────────────────────────────────────────────────────
 
@@ -79,8 +85,8 @@ uuid                = { version = "1", features = ["v4", "v5"] }
 block2              = "0.6"
 
 # wgpu renderer (Metal backend on iOS/Android)
-gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "5688167d224b5eca54875d49afb8bfd73a07915a", package = "gpui_wgpu", features = ["font-kit"] }
-wgpu = { git = "https://github.com/zed-industries/wgpu.git", branch = "v29" }
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", package = "gpui_wgpu", features = ["font-kit"] }
+wgpu = "=29.0.4"
 
 # Text / font stack
 pathfinder_geometry = "0.5"
@@ -109,7 +115,7 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
 
 # wgpu renderer (Vulkan backend on Android)
-gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "5688167d224b5eca54875d49afb8bfd73a07915a", package = "gpui_wgpu", features = ["font-kit"] }
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", package = "gpui_wgpu", features = ["font-kit"] }
 
 # rustc-hash is required by the PlatformKeyboardMapper trait signature
 rustc-hash = "2"

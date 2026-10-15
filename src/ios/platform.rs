@@ -28,12 +28,19 @@ use std::{
 
 pub struct IosPlatform(Mutex<IosPlatformState>);
 
+thread_local! {
+    static SLEEP_CALLBACK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = Default::default();
+    static WAKE_CALLBACK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = Default::default();
+    static IDLE_GUARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREVIOUS_IDLE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) struct IosPlatformState {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     finish_launching: Option<Box<dyn FnOnce()>>,
-    quit_callback: Option<Box<dyn FnMut()>>,
+    quit_callback: Option<Box<dyn FnMut() -> bool>>,
     open_urls_callback: Option<Box<dyn FnMut(Vec<String>)>>,
     thermal_state_callback: Option<Box<dyn FnMut()>>,
 }
@@ -76,6 +83,62 @@ impl PlatformKeyboardLayout for IosKeyboardLayout {
 }
 
 impl Platform for IosPlatform {
+    fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
+        log::debug!("UIKit has no system-power sleep notification; app pause is separate");
+        SLEEP_CALLBACK.with(|slot| *slot.borrow_mut() = Some(callback));
+    }
+
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        log::debug!("UIKit has no system-power wake notification; app resume is separate");
+        WAKE_CALLBACK.with(|slot| *slot.borrow_mut() = Some(callback));
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        // UIKit manages connected pointer visibility; this backend never hides it.
+        true
+    }
+
+    fn prevent_idle_sleep(&self, _reason: &str) -> Task<Result<gpui::ActivityGuard>> {
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+            IDLE_GUARDS.with(|count| {
+                if count.get() == 0 {
+                    let previous: objc2::runtime::Bool = msg_send![app, isIdleTimerDisabled];
+                    PREVIOUS_IDLE_DISABLED.with(|value| value.set(previous.as_bool()));
+                    let _: () = msg_send![app, setIdleTimerDisabled: objc2::runtime::Bool::YES];
+                }
+                count.set(count.get() + 1);
+            });
+        }
+        Task::ready(Ok(gpui::ActivityGuard::new(move || {
+            // The guard may be dropped off-thread; UIKit changes stay on its main queue.
+            unsafe extern "C" fn release(_: *mut std::ffi::c_void) {
+                IDLE_GUARDS.with(|count| {
+                        count.set(count.get() - 1);
+                        if count.get() == 0 {
+                            let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+                            let previous = PREVIOUS_IDLE_DISABLED.with(|value| value.get());
+                            let _: () = msg_send![app, setIdleTimerDisabled: objc2::runtime::Bool::new(previous)];
+                        }
+                    });
+            }
+            unsafe extern "C" {
+                fn dispatch_async_f(
+                    queue: *mut std::ffi::c_void,
+                    context: *mut std::ffi::c_void,
+                    work: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
+                );
+            }
+            unsafe {
+                dispatch_async_f(
+                    super::dispatcher::dispatch_get_main_queue(),
+                    std::ptr::null_mut(),
+                    Some(release),
+                );
+            }
+        })))
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.0.lock().background_executor.clone()
     }
@@ -119,7 +182,7 @@ impl Platform for IosPlatform {
         log::warn!("iOS apps cannot programmatically quit");
     }
 
-    fn restart(&self, _binary_path: Option<PathBuf>) {
+    fn restart(&self, _binary_path: Option<PathBuf>, _arguments: Vec<std::ffi::OsString>) {
         // iOS apps cannot restart themselves
         log::warn!("iOS apps cannot restart themselves");
     }
@@ -239,7 +302,7 @@ impl Platform for IosPlatform {
         // Would use UIDocumentInteractionController or UIActivityViewController
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.lock().quit_callback = Some(callback);
     }
 
@@ -284,6 +347,10 @@ impl Platform for IosPlatform {
     fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
         let app_path = self.app_path()?;
         Ok(app_path.join(name))
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        // UIKit owns the touch/pointer cursor and exposes no equivalent API.
     }
 
     fn set_cursor_style(&self, _style: CursorStyle) {

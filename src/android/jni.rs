@@ -76,10 +76,38 @@ pub static NATIVE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// processes them AFTER `poll_events` returns.
 static PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
 static RESUME_PENDING: AtomicBool = AtomicBool::new(false);
+static FOCUS_GAINED_PENDING: AtomicBool = AtomicBool::new(false);
+static FOCUS_LOST_PENDING: AtomicBool = AtomicBool::new(false);
 static TERM_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
 static CONFIG_CHANGED_PENDING: AtomicBool = AtomicBool::new(false);
+static WINDOW_INSETS_PENDING: parking_lot::Mutex<Option<(f32, crate::mobile_events::WindowInsets)>> = parking_lot::Mutex::new(None);
+
+/// Java UI callbacks only publish data; GPUI dispatch runs on its native thread.
+#[no_mangle]
+pub unsafe extern "system" fn Java_dev_gpui_mobile_GpuiInsets_nativeInsets(
+    _env: *mut c_void, _class: *mut c_void, density: f32,
+    top: i32, bottom: i32, left: i32, right: i32,
+    ime_top: i32, ime_bottom: i32, ime_left: i32, ime_right: i32,
+    ime_visible: jni::sys::jboolean, x: i32, y: i32, width: i32, height: i32,
+) {
+    if !density.is_finite() || density <= 0.0 ||
+        [top, bottom, left, right, ime_top, ime_bottom, ime_left, ime_right, x, y, width, height].iter().any(|value| *value < 0) {
+        return;
+    }
+    let logical = |value: i32| gpui::px(value as f32 / density);
+    let insets = crate::mobile_events::WindowInsets {
+        safe_area: gpui::Edges { top: logical(top), bottom: logical(bottom), left: logical(left), right: logical(right) },
+        keyboard: (ime_visible && width > 0 && height > 0).then(|| gpui::Bounds {
+            origin: gpui::point(logical(x), logical(y)), size: gpui::size(logical(width), logical(height)),
+        }),
+        keyboard_visible: Some(ime_visible),
+        keyboard_insets: Some(gpui::Edges { top: logical(ime_top), bottom: logical(ime_bottom), left: logical(ime_left), right: logical(ime_right) }),
+    };
+    *WINDOW_INSETS_PENDING.lock() = Some((density, insets));
+    if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+}
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 
@@ -330,6 +358,7 @@ pub fn shared_platform() -> Option<SharedPlatform> {
 const AMOTION_EVENT_ACTION_DOWN: u32 = 0;
 const AMOTION_EVENT_ACTION_UP: u32 = 1;
 const AMOTION_EVENT_ACTION_MOVE: u32 = 2;
+const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
 
 // ── night mode query via NDK Configuration ───────────────────────────────────
 
@@ -380,6 +409,12 @@ fn process_input_events(app: &AndroidApp) {
                         InputEvent::MotionEvent(motion_event) => {
                             let action = motion_event.action();
                             let pointer_count = motion_event.pointer_count();
+                            // Cancellation belongs to the existing stream even over a native view,
+                            // and may arrive without a usable pointer array.
+                            if action == MotionAction::Cancel {
+                                win.handle_touch(crate::android::TouchPoint { id: 0, x: 0.0, y: 0.0, action: AMOTION_EVENT_ACTION_CANCEL });
+                                return android_activity::InputStatus::Handled;
+                            }
 
                             log::debug!(
                                 "process_input_events: MotionEvent action={:?} pointers={}",
@@ -449,7 +484,7 @@ fn process_input_events(app: &AndroidApp) {
                                         AMOTION_EVENT_ACTION_UP
                                     }
                                     MotionAction::Move => AMOTION_EVENT_ACTION_MOVE,
-                                    MotionAction::Cancel => AMOTION_EVENT_ACTION_UP,
+                                    MotionAction::Cancel => AMOTION_EVENT_ACTION_CANCEL,
                                     _ => continue,
                                 };
 
@@ -531,6 +566,14 @@ fn process_input_events(app: &AndroidApp) {
 /// Called from `android_main` after the platform is initialised.
 /// Runs until the platform requests quit or the activity is destroyed.
 pub fn run_event_loop(app: &AndroidApp) {
+    app.run_on_java_main_thread(Box::new(|| {
+        if let Err(error) = with_env(|env| {
+            let class = find_app_class(env, "dev.gpui.mobile.GpuiInsets")?;
+            let activity = activity(env)?;
+            env.call_static_method(&class, jni::jni_str!("install"), jni::jni_sig!("(Landroid/app/Activity;)V"), &[JValue::Object(&activity)])
+                .map(|_| ()).map_err(|error| { env.exception_clear(); error.to_string() })
+        }) { log::error!("WindowInsets observer installation failed: {error}"); }
+    }));
     log::info!("run_event_loop: entering main loop");
 
     // Track whether the on_init_window callback has already been invoked.
@@ -691,6 +734,11 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // 4. ConfigChanged
+        if let Some(window) = PLATFORM.get().and_then(|platform| platform.primary_window()) {
+            let pending = WINDOW_INSETS_PENDING.lock().take();
+            if let Some((density, insets)) = pending { window.update_window_insets(density, insets); }
+        }
+
         if CONFIG_CHANGED_PENDING.swap(false, Ordering::Relaxed) {
             log::debug!("deferred: ConfigChanged");
             if let Some(platform) = PLATFORM.get() {
@@ -707,13 +755,24 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
         }
 
+        if FOCUS_LOST_PENDING.swap(false, Ordering::Relaxed) {
+            if let Some(win) = PLATFORM.get().and_then(|p| p.primary_window()) {
+                win.set_active(false);
+            }
+        }
+        if FOCUS_GAINED_PENDING.swap(false, Ordering::Relaxed) {
+            if let Some(win) = PLATFORM.get().and_then(|p| p.primary_window()) {
+                win.set_active(true);
+            }
+        }
+
         // 5. Pause / background
         if PAUSE_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Pause (iter={})", iteration);
             if let Some(platform) = PLATFORM.get() {
                 platform.did_enter_background();
                 if let Some(win) = platform.primary_window() {
-                    win.set_active(false);
+                    win.notify_app_lifecycle(false);
                 }
             }
             // Pause platform views
@@ -726,7 +785,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             if let Some(platform) = PLATFORM.get() {
                 platform.did_become_active();
                 if let Some(win) = platform.primary_window() {
-                    win.set_active(true);
+                    win.notify_app_lifecycle(true);
                 }
             }
             // Resume platform views
@@ -875,12 +934,12 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 
         MainEvent::GainedFocus => {
             log::info!("MainEvent::GainedFocus");
-            RESUME_PENDING.store(true, Ordering::Relaxed);
+            FOCUS_GAINED_PENDING.store(true, Ordering::Relaxed);
         }
 
         MainEvent::LostFocus => {
             log::info!("MainEvent::LostFocus");
-            PAUSE_PENDING.store(true, Ordering::Relaxed);
+            FOCUS_LOST_PENDING.store(true, Ordering::Relaxed);
         }
 
         MainEvent::Resume { .. } => {
