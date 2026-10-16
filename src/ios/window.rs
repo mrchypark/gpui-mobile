@@ -10,15 +10,21 @@
 //! whose view hosts a CAMetalLayer. Rendering is performed by
 //! `gpui_wgpu::WgpuRenderer` which drives wgpu over the Metal backend.
 
-use super::events::*;
 use super::IosDisplay;
+#[path = "input_traits.rs"]
+mod input_traits;
+use super::events::*;
+use crate::mobile_dispatch::Callback;
+use crate::mobile_events::{
+    self, AppLifecycle, MobileEvent, MobileEventState, SurfaceLifecycle, WindowInsets,
+};
 use crate::momentum::{MomentumScroller, VelocityTracker};
 use gpui::{
-    point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
-    Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, Capslock,
+    DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, Scene, Size, TileId, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowParams, point, px, size,
 };
 use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -38,6 +44,85 @@ use std::{
 };
 
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
+const IME_NATIVE_EDIT_IVAR: &str = "gpui_ime_native_edit";
+
+// UIKit may call another overridden input method while updating its document.
+// Only the outer native operation delivers to the GPUI document.
+#[allow(deprecated)]
+unsafe fn native_ime_edit(this: *mut AnyObject, edit: impl FnOnce()) {
+    let previous = *(*this).get_ivar::<Bool>(IME_NATIVE_EDIT_IVAR);
+    *(*this).get_mut_ivar::<Bool>(IME_NATIVE_EDIT_IVAR) = Bool::YES;
+    edit();
+    *(*this).get_mut_ivar::<Bool>(IME_NATIVE_EDIT_IVAR) = previous;
+}
+
+#[allow(deprecated)]
+unsafe fn inside_native_ime_edit(this: *mut AnyObject) -> bool {
+    (*(*this).get_ivar::<Bool>(IME_NATIVE_EDIT_IVAR)).as_bool()
+}
+
+unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, before_edit: bool) {
+    let native: *mut AnyObject = msg_send![this, text];
+    let utf8: *const i8 = msg_send![native, UTF8String];
+    let native = if utf8.is_null() { String::new() } else {
+        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+    };
+    // UIKit can mutate textStorage directly before invoking insertText. Verify
+    // the last acknowledged document, not this partially applied native edit.
+    let expected = if before_edit { window.proxy_text.borrow().clone() } else { native.clone() };
+    let (context, matches) = window.input_handler.call(|| !window.closed.get(), |handler| {
+        let (accepts, owner) = mobile_events::query_text_input_owner(|| handler.query_accepts_text_input());
+        if !accepts { return (None, false); }
+        let context = handler.selected_text_range(false).map(|selection| (owner, selection.range));
+        let matches = window.proxy_base.get().and_then(|base| {
+            let end = base.checked_add(expected.encode_utf16().count())?;
+            let range = base..end;
+            let mut adjusted = None;
+            let actual = handler.text_for_range(range.clone(), &mut adjusted)?;
+            Some(actual == expected && adjusted.is_none_or(|adjusted| adjusted == range))
+        }).unwrap_or(false);
+        (context, matches)
+    }).unwrap_or((None, false));
+    let changed = *window.proxy_context.borrow() != context;
+    let owner_changed = window.proxy_context.borrow().as_ref().map(|c| c.0)
+        != context.as_ref().map(|c| c.0);
+    if (before_edit && changed) || owner_changed || !matches {
+        native_ime_edit(this, || {
+            let _: () = msg_send![this, setText: ptr::null_mut::<AnyObject>()];
+        });
+        window.proxy_base.set(context.as_ref().map(|(_, range)| range.start));
+        window.proxy_mapping_valid.set(false);
+        window.proxy_text.borrow_mut().clear();
+    } else if !before_edit {
+        // A void handler callback is not acceptance. Only authoritative text
+        // at the original anchor can certify this native document's mapping.
+        window.proxy_mapping_valid.set(true);
+        *window.proxy_text.borrow_mut() = native;
+    }
+    *window.proxy_context.borrow_mut() = context;
+}
+
+// Describe one whole native edit, including textStorage mutations that precede
+// an overridden callback. Offsets are UTF-16; comparison boundaries are scalars.
+fn native_text_edit<'a>(before: &str, after: &'a str) -> (std::ops::Range<usize>, &'a str) {
+    let prefix = before.chars().zip(after.chars()).take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    let suffix = before[prefix..].chars().rev().zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b).map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    let start = before[..prefix].encode_utf16().count();
+    let end = before[..before.len() - suffix].encode_utf16().count();
+    (start..end, &after[prefix..after.len() - suffix])
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ImeRange {
+    location: usize,
+    length: usize,
+}
+unsafe impl Encode for ImeRange {
+    const ENCODING: Encoding = Encoding::Struct("_NSRange", &[usize::ENCODING, usize::ENCODING]);
+}
 
 /// Lightweight window handle for wgpu surface creation.
 /// Stores the raw UIView pointer needed by wgpu to create a Metal surface.
@@ -107,15 +192,9 @@ fn register_view_controller_class() -> &'static AnyClass {
             }
 
             // Notify all registered GPUI windows about the layout change.
-            if let Some(wrapper) = super::ffi::IOS_WINDOW_LIST.get() {
-                unsafe {
-                    let windows = &*wrapper.0.get();
-                    for &window_ptr in windows.iter() {
-                        if !window_ptr.is_null() {
-                            let window = &*window_ptr;
-                            window.handle_layout_change();
-                        }
-                    }
+            for window in super::ffi::windows() {
+                if !window.closed.get() {
+                    window.handle_layout_change();
                 }
             }
         }
@@ -152,16 +231,10 @@ pub fn set_status_bar_style(style: crate::StatusBarContentStyle) {
 
     // Ask UIKit to re-query the status bar style
     unsafe {
-        if let Some(wrapper) = super::ffi::IOS_WINDOW_LIST.get() {
-            let windows = &*wrapper.0.get();
-            if let Some(&window_ptr) = windows.last() {
-                if !window_ptr.is_null() {
-                    let window = &*window_ptr;
-                    let vc = window.view_controller;
-                    if !vc.is_null() {
-                        let _: () = msg_send![vc, setNeedsStatusBarAppearanceUpdate];
-                    }
-                }
+        if let Some(window) = super::ffi::windows().last() {
+            let vc = window.view_controller;
+            if !vc.is_null() {
+                let _: () = msg_send![vc, setNeedsStatusBarAppearanceUpdate];
             }
         }
     }
@@ -244,6 +317,56 @@ fn register_metal_view_class() -> &'static AnyClass {
                 touches_cancelled
                     as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject),
             );
+            unsafe extern "C" fn pinch(
+                this: *mut AnyObject,
+                _sel: Sel,
+                recognizer: *mut AnyObject,
+            ) {
+                #[allow(deprecated)]
+                let window: *mut c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
+                if window.is_null() {
+                    return;
+                }
+                let Some(window) = super::ffi::window_for_handle(window as usize) else {
+                    return;
+                };
+                let state: isize = msg_send![recognizer, state];
+                let phase = match state {
+                    1 => gpui::TouchPhase::Started,
+                    2 => gpui::TouchPhase::Moved,
+                    3 => gpui::TouchPhase::Ended,
+                    4 | 5 => gpui::TouchPhase::Cancelled,
+                    _ => return,
+                };
+                let center: super::cg_types::ObjcCGPoint =
+                    msg_send![recognizer, locationInView: this];
+                let scale: f64 = msg_send![recognizer, scale];
+                let event = window.mobile_events.borrow_mut().pinch(
+                    phase,
+                    point(px(center.x as f32), px(center.y as f32)),
+                    scale as f32,
+                    std::time::Duration::ZERO,
+                );
+                if let Some(event) = event {
+                    window.emit_mobile_events(vec![event]);
+                }
+            }
+            decl.add_method(
+                sel!(gpuiPinch:),
+                pinch as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+            unsafe extern "C" fn did_move_to_window(this: *mut AnyObject, _sel: Sel) {
+                let _: () = msg_send![super(this, class!(UIView)), didMoveToWindow];
+                #[allow(deprecated)]
+                let window: *mut c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
+                if let Some(window) = super::ffi::window_for_handle(window as usize) {
+                    window.sync_surface_availability();
+                }
+            }
+            decl.add_method(
+                sel!(didMoveToWindow),
+                did_move_to_window as unsafe extern "C" fn(*mut AnyObject, Sel),
+            );
         }
 
         decl.register();
@@ -252,21 +375,18 @@ fn register_metal_view_class() -> &'static AnyClass {
     class!(GPUIMetalView)
 }
 
-/// Register a custom UIView subclass that implements UIKeyInput protocol.
-///
-/// iOS requires the first-responder view to conform to `UIKeyInput` in order
-/// for the software keyboard to actually route typed characters back to the
-/// app.  Without this, `becomeFirstResponder` silently fails and no keyboard
-/// appears.
-///
-/// The three required methods:
-/// - `hasText` → always returns YES (simplifies things; no harm)
-/// - `insertText:` → forwards the text to `IosWindow::handle_text_input`
-/// - `deleteBackward` → dispatches a backspace via `crate::dispatch_text_input`
+/// UIKit owns the insertion proxy's composition storage and UITextInput protocol;
+/// GPUI owns the document. The legacy string callback receives committed text only.
 fn register_text_input_view_class() -> &'static AnyClass {
     TEXT_INPUT_VIEW_CLASS_REGISTERED.call_once(|| {
-        let superclass = class!(UIView);
+        // UITextView supplies UIKit's positions, ranges, tokenizer and composing
+        // storage. GPUI remains the document owner; this is an insertion proxy.
+        let superclass = class!(UITextView);
         let mut decl = ClassBuilder::new(c"GPUITextInputView", superclass).unwrap();
+        input_traits::register(&mut decl);
+        if let Some(protocol) = objc2::runtime::AnyProtocol::get(c"UITextInputTraits") {
+            decl.add_protocol(protocol);
+        }
 
         // Declare protocol conformance so iOS knows this view can receive
         // keyboard text input.
@@ -276,12 +396,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
 
         // Store the IosWindow pointer so callbacks can reach the Rust window.
         decl.add_ivar::<*mut std::ffi::c_void>(c"gpui_window_ptr");
-
-        // UITextInputTraits property storage — UIView doesn't provide these,
-        // but iOS reads them from the first responder to configure the keyboard.
-        decl.add_ivar::<isize>(c"_keyboardType"); // UIKeyboardType
-        decl.add_ivar::<isize>(c"_autocorrectionType"); // UITextAutocorrectionType
-        decl.add_ivar::<isize>(c"_autocapitalizationType"); // UITextAutocapitalizationType
+        decl.add_ivar::<Bool>(c"gpui_ime_native_edit");
 
         // --- UIKeyInput protocol methods ---
 
@@ -292,62 +407,203 @@ fn register_text_input_view_class() -> &'static AnyClass {
 
         // void insertText:(NSString *)text
         unsafe extern "C" fn insert_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), insertText: text];
+                return;
+            }
             #[allow(deprecated)]
             let window_ptr: *mut std::ffi::c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
             if window_ptr.is_null() || text.is_null() {
                 return;
             }
-            let window = &*(window_ptr as *const IosWindow);
-            window.handle_text_input(text);
+            let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
+                return;
+            };
+            let text: *mut AnyObject = msg_send![text, retain];
+            sync_proxy_context(this, &window, true);
+            let acknowledged = window.proxy_text.borrow().clone();
+            let mapped_base = window.proxy_base.get().filter(|_| window.proxy_mapping_valid.get());
+            // Korean keyboards replace earlier syllable fragments using the
+            // native document. Clearing it turns each fragment into an append.
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), insertText: text];
+            });
+            let delivered = if !crate::mobile_dispatch::has_text_handler() {
+                let utf8: *const i8 = msg_send![text, UTF8String];
+                if utf8.is_null() { false } else {
+                    let value = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+                    let native: *mut AnyObject = msg_send![this, text];
+                    let native_utf8: *const i8 = msg_send![native, UTF8String];
+                    let current = if native_utf8.is_null() { String::new() } else {
+                        std::ffi::CStr::from_ptr(native_utf8).to_string_lossy().into_owned()
+                    };
+                    window.input_handler.call(|| !window.closed.get(), |handler| {
+                        if let Some(base) = mapped_base {
+                            let (range, replacement) = native_text_edit(&acknowledged, &current);
+                            if let (Some(start), Some(end)) = (base.checked_add(range.start), base.checked_add(range.end)) {
+                                handler.replace_text_in_range(Some(start..end), replacement);
+                                // An unchanged-text commit still ends composition.
+                                // Some handlers ignore an empty textual diff.
+                                if handler.marked_text_range().is_some() {
+                                    handler.unmark_text();
+                                }
+                            }
+                        } else {
+                            handler.replace_text_in_range(None, &value);
+                        }
+                    }).is_some()
+                }
+            } else { false };
+            if !delivered { window.handle_text_input(text); }
+            sync_proxy_context(this, &window, false);
+            let _: () = msg_send![text, release];
+        }
+
+        unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, selection: ImeRange) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
+                return;
+            }
+            #[allow(deprecated)]
+            let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
+            let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            sync_proxy_context(this, &window, true);
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
+            });
+            let text = if text.is_null() { String::new() } else {
+                let utf8: *const i8 = msg_send![text, UTF8String];
+                if utf8.is_null() { return; }
+                std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+            };
+            let selection = crate::mobile_dispatch::composing_selection(&text, selection.location, selection.length);
+            if !crate::mobile_dispatch::has_text_handler() { window.input_handler.call(|| !window.closed.get(), |handler| {
+                handler.replace_and_mark_text_in_range(None, &text, Some(selection));
+            }); }
+            sync_proxy_context(this, &window, false);
+        }
+
+        unsafe extern "C" fn replace_range(this: *mut AnyObject, _sel: Sel, range: *mut AnyObject, text: *mut AnyObject) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), replaceRange: range, withText: text];
+                return;
+            }
+            #[allow(deprecated)]
+            let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
+            let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            if range.is_null() || text.is_null() { return; }
+            // Do not apply a range obtained from a previous owner's document.
+            let previous = window.proxy_context.borrow().clone();
+            sync_proxy_context(this, &window, true);
+            if previous != *window.proxy_context.borrow() || !window.proxy_mapping_valid.get() { return; }
+            let beginning: *mut AnyObject = msg_send![this, beginningOfDocument];
+            let start: *mut AnyObject = msg_send![range, start];
+            let end: *mut AnyObject = msg_send![range, end];
+            let start: isize = msg_send![this, offsetFromPosition: beginning, toPosition: start];
+            let end: isize = msg_send![this, offsetFromPosition: beginning, toPosition: end];
+            let utf8: *const i8 = msg_send![text, UTF8String];
+            if utf8.is_null() || start < 0 || end < start { return; }
+            let replacement = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+            // The proxy contains the current insertion context, not the full
+            // document. Translate from its caret to the actual owner's caret.
+            window.input_handler.call(|| !window.closed.get(), |handler| {
+                let Some(base) = window.proxy_base.get() else { return; };
+                let Some(owner_start) = base.checked_add(start as usize) else { return; };
+                let Some(owner_end) = base.checked_add(end as usize) else { return; };
+                native_ime_edit(this, || {
+                    let _: () = msg_send![super(this, class!(UITextView)), replaceRange: range, withText: text];
+                });
+                handler.replace_text_in_range(Some(owner_start..owner_end), &replacement);
+            });
+            sync_proxy_context(this, &window, false);
+        }
+
+        unsafe extern "C" fn unmark_text(this: *mut AnyObject, _sel: Sel) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), unmarkText];
+                return;
+            }
+            #[allow(deprecated)]
+            let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
+            let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            sync_proxy_context(this, &window, true);
+            let marked: *mut AnyObject = msg_send![this, markedTextRange];
+            if marked.is_null() { return; }
+            let text: *mut AnyObject = msg_send![this, textInRange: marked];
+            let text: *mut AnyObject = msg_send![text, retain];
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), unmarkText];
+            });
+            if crate::mobile_dispatch::has_text_handler() || window.input_handler.call(|| !window.closed.get(), |handler| handler.unmark_text()).is_none() {
+                window.handle_text_input(text);
+            }
+            let _: () = msg_send![text, release];
+            sync_proxy_context(this, &window, false);
         }
 
         // void deleteBackward
         unsafe extern "C" fn delete_backward(this: *mut AnyObject, _sel: Sel) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), deleteBackward];
+                return;
+            }
             #[allow(deprecated)]
             let window_ptr: *mut std::ffi::c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
             if window_ptr.is_null() {
                 return;
             }
-            let window = &*(window_ptr as *const IosWindow);
+            let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
+                return;
+            };
+            sync_proxy_context(this, &window, true);
+            let marked: *mut AnyObject = msg_send![this, markedTextRange];
+            if !marked.is_null() {
+                let beginning: *mut AnyObject = msg_send![this, beginningOfDocument];
+                let start: *mut AnyObject = msg_send![marked, start];
+                let start: isize = msg_send![this, offsetFromPosition: beginning, toPosition: start];
+                if start < 0 { return; }
+                let text: *mut AnyObject = msg_send![this, textInRange: marked];
+                let length: usize = msg_send![text, length];
+                let selection: ImeRange = msg_send![this, selectedRange];
+                let Some(location) = selection.location.checked_sub(start as usize) else { return; };
+                if location > length || selection.length > length - location { return; }
+                let deletion = if selection.length != 0 {
+                    ImeRange { location, length: selection.length }
+                } else {
+                    if location == 0 { return; }
+                    // UITextView.deleteBackward cancels the whole marked text.
+                    // Preserve composition and delete one native grapheme instead.
+                    let range: ImeRange = msg_send![text, rangeOfComposedCharacterSequenceAtIndex: location - 1];
+                    range
+                };
+                let empty: *mut AnyObject = msg_send![class!(NSString), string];
+                let updated: *mut AnyObject = msg_send![text, stringByReplacingCharactersInRange: deletion, withString: empty];
+                let updated: *mut AnyObject = msg_send![updated, retain];
+                set_marked_text(this, sel!(setMarkedText:selectedRange:), updated,
+                    ImeRange { location: deletion.location, length: 0 });
+                let _: () = msg_send![updated, release];
+                return;
+            }
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), deleteBackward];
+            });
             window.handle_delete_backward();
+            sync_proxy_context(this, &window, false);
         }
 
         // canBecomeFirstResponder must return Bool::YES
         unsafe extern "C" fn can_become_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
             Bool::YES
         }
-
-        // --- UITextInputTraits property accessors ---
-        #[allow(deprecated)]
-        unsafe extern "C" fn get_keyboard_type(this: *mut AnyObject, _sel: Sel) -> isize {
-            *(*this).get_ivar::<isize>("_keyboardType")
+        unsafe extern "C" fn caret_rect(this: *mut AnyObject, _sel: Sel, _position: *mut AnyObject) -> ObjcCGRect {
+            msg_send![this, bounds]
         }
-        #[allow(deprecated)]
-        unsafe extern "C" fn set_keyboard_type(this: *mut AnyObject, _sel: Sel, val: isize) {
-            *(*this).get_mut_ivar::<isize>("_keyboardType") = val;
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn get_autocorrection_type(this: *mut AnyObject, _sel: Sel) -> isize {
-            *(*this).get_ivar::<isize>("_autocorrectionType")
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn set_autocorrection_type(this: *mut AnyObject, _sel: Sel, val: isize) {
-            *(*this).get_mut_ivar::<isize>("_autocorrectionType") = val;
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn get_autocapitalization_type(this: *mut AnyObject, _sel: Sel) -> isize {
-            *(*this).get_ivar::<isize>("_autocapitalizationType")
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn set_autocapitalization_type(
-            this: *mut AnyObject,
-            _sel: Sel,
-            val: isize,
-        ) {
-            *(*this).get_mut_ivar::<isize>("_autocapitalizationType") = val;
-        }
-
         unsafe {
+            decl.add_method(sel!(caretRectForPosition:), caret_rect as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> ObjcCGRect);
+            decl.add_method(sel!(firstRectForRange:), caret_rect as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> ObjcCGRect);
+            decl.add_method(sel!(setMarkedText:selectedRange:), set_marked_text as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, ImeRange));
+            decl.add_method(sel!(unmarkText), unmark_text as unsafe extern "C" fn(*mut AnyObject, Sel));
+            decl.add_method(sel!(replaceRange:withText:), replace_range as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject));
             decl.add_method(
                 sel!(hasText),
                 has_text as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
@@ -365,31 +621,6 @@ fn register_text_input_view_class() -> &'static AnyClass {
                 can_become_first_responder as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
             );
 
-            // UITextInputTraits property methods
-            decl.add_method(
-                sel!(keyboardType),
-                get_keyboard_type as unsafe extern "C" fn(*mut AnyObject, Sel) -> isize,
-            );
-            decl.add_method(
-                sel!(setKeyboardType:),
-                set_keyboard_type as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
-            );
-            decl.add_method(
-                sel!(autocorrectionType),
-                get_autocorrection_type as unsafe extern "C" fn(*mut AnyObject, Sel) -> isize,
-            );
-            decl.add_method(
-                sel!(setAutocorrectionType:),
-                set_autocorrection_type as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
-            );
-            decl.add_method(
-                sel!(autocapitalizationType),
-                get_autocapitalization_type as unsafe extern "C" fn(*mut AnyObject, Sel) -> isize,
-            );
-            decl.add_method(
-                sel!(setAutocapitalizationType:),
-                set_autocapitalization_type as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
-            );
         }
 
         decl.register();
@@ -409,7 +640,9 @@ fn handle_touches(view: *mut AnyObject, touches: *mut AnyObject, event: *mut Any
             return;
         }
 
-        let window = &*(window_ptr as *const IosWindow);
+        let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
+            return;
+        };
 
         // Get all touches from the set
         let all_touches: *mut AnyObject = msg_send![touches, allObjects];
@@ -443,6 +676,32 @@ enum TouchState {
 
 #[allow(clippy::type_complexity)]
 pub(crate) struct IosWindow {
+    inner: Rc<IosWindowInner>,
+}
+
+impl std::ops::Deref for IosWindow {
+    type Target = IosWindowInner;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl IosWindow {
+    pub fn new(handle: AnyWindowHandle, params: WindowParams) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: Rc::new(IosWindowInner::new(handle, params)?),
+        })
+    }
+    pub(crate) fn register_with_ffi(&self) {
+        self.inner.register_with_ffi();
+    }
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) struct IosWindowInner {
+    gpui_handle: AnyWindowHandle,
+    handle_id: Cell<usize>,
+    pub(crate) closed: Cell<bool>,
     /// The UIWindow object
     window: *mut AnyObject,
     /// The UIViewController
@@ -456,36 +715,49 @@ pub(crate) struct IosWindow {
     /// Scale factor
     scale_factor: Cell<f32>,
     /// Input handler for text input
-    input_handler: RefCell<Option<PlatformInputHandler>>,
+    input_handler: Callback<PlatformInputHandler>,
+    proxy_context: RefCell<Option<(Option<mobile_events::TextInputOwner>, std::ops::Range<usize>)>>,
+    proxy_base: Cell<Option<usize>>,
+    proxy_mapping_valid: Cell<bool>,
+    proxy_text: RefCell<String>,
+    input_configuration: RefCell<gpui::TextInputConfiguration>,
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
-    pub(super) request_frame_callback: RefCell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
+    pub(super) request_frame_callback: Callback<Box<dyn FnMut(RequestFrameOptions)>>,
     /// Callback for input events
-    input_callback: RefCell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
+    input_callback: Callback<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     /// Callback for active status changes
-    active_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
+    active_status_callback: Callback<Box<dyn FnMut(bool)>>,
+    visibility_callback: Callback<Box<dyn FnMut(gpui::WindowVisibility)>>,
+    app_active: Cell<bool>,
+    surface_available: Cell<bool>,
+    keyboard_observers: RefCell<Vec<*mut AnyObject>>,
     /// Callback for hover status changes (not really applicable on iOS)
-    hover_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
+    hover_status_callback: Callback<Box<dyn FnMut(bool)>>,
     /// Callback for resize events
-    resize_callback: RefCell<Option<Box<dyn FnMut(Size<Pixels>, f32)>>>,
+    resize_callback: Callback<Box<dyn FnMut(Size<Pixels>, f32)>>,
     /// Callback for move events (not applicable on iOS)
-    moved_callback: RefCell<Option<Box<dyn FnMut()>>>,
+    moved_callback: Callback<Box<dyn FnMut()>>,
     /// Callback for should close
-    should_close_callback: RefCell<Option<Box<dyn FnMut() -> bool>>>,
+    should_close_callback: Callback<Box<dyn FnMut() -> bool>>,
     /// Callback for hit test
-    hit_test_callback: RefCell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
+    hit_test_callback: Callback<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     /// Callback for close
-    close_callback: RefCell<Option<Box<dyn FnOnce()>>>,
+    close_callback: Callback<Box<dyn FnOnce()>>,
     /// Callback for appearance changes
-    appearance_changed_callback: RefCell<Option<Box<dyn FnMut()>>>,
+    appearance_changed_callback: Callback<Box<dyn FnMut()>>,
     /// Current mouse position (from touch)
     mouse_position: Cell<Point<Pixels>>,
     /// Current modifiers
     modifiers: Cell<Modifiers>,
+    capslock: Cell<bool>,
     /// Track if a touch is currently pressed
     touch_pressed: Cell<bool>,
     /// Touch gesture state machine — distinguishes taps from scroll drags.
     touch_state: Cell<TouchState>,
+    mobile_events: RefCell<MobileEventState>,
+    legacy_multitouch: Cell<bool>,
+    keyboard_bounds: Cell<Option<Bounds<Pixels>>>,
     /// Velocity tracker — records recent touch samples during drag gestures
     /// so we can compute the release velocity when the finger lifts.
     velocity_tracker: RefCell<VelocityTracker>,
@@ -497,13 +769,175 @@ pub(crate) struct IosWindow {
     /// `request_frame` callback) can acquire a mutable reference without
     /// conflicting with the outer `&self` borrow.
     renderer: Mutex<Option<WgpuRenderer>>,
+    gpu_context: GpuContext,
 }
 
 // Required for raw_window_handle
 unsafe impl Send for IosWindow {}
 unsafe impl Sync for IosWindow {}
 
-impl IosWindow {
+impl IosWindowInner {
+    fn apply_input_configuration(&self) {
+        let configuration = self.input_configuration.borrow().clone();
+        let (correct, capitalize, spellcheck, action) =
+            mobile_events::ios_input_traits(&configuration);
+        unsafe {
+            let _: () = msg_send![self.text_input_view, setAutocorrectionType: correct];
+            let _: () = msg_send![self.text_input_view, setAutocapitalizationType: capitalize];
+            let _: () = msg_send![self.text_input_view, setSpellCheckingType: spellcheck];
+            let _: () = msg_send![self.text_input_view, setReturnKeyType: action];
+            let _: () = msg_send![self.text_input_view, reloadInputViews];
+        }
+    }
+    pub(crate) fn native_handle(&self) -> usize {
+        self.handle_id.get()
+    }
+
+    pub(crate) fn active_handle(&self) -> Option<AnyWindowHandle> {
+        if self.closed.get() || !self.app_active.get() {
+            return None;
+        }
+        let key: Bool = unsafe { msg_send![self.window, isKeyWindow] };
+        key.as_bool().then_some(self.gpui_handle)
+    }
+
+    fn dispatch_input(&self, event: PlatformInput) {
+        self.input_callback
+            .call(|| !self.closed.get(), |callback| callback(event));
+    }
+
+    pub(crate) fn can_render(&self) -> bool {
+        !self.closed.get() && self.app_active.get() && self.surface_available.get()
+    }
+
+    fn notify_visibility(&self, previously_visible: bool) {
+        if previously_visible != self.can_render() {
+            self.visibility_callback.call(
+                || !self.closed.get(),
+                |callback| {
+                    callback(if self.can_render() {
+                        gpui::WindowVisibility::Visible
+                    } else {
+                        gpui::WindowVisibility::Hidden
+                    });
+                },
+            );
+        }
+    }
+
+    /// UIKit retains the view across backgrounding; surface loss is tied to actual
+    /// window attachment (or zero drawable size), independently of app activation.
+    fn sync_surface_availability(&self) {
+        if self.closed.get() {
+            return;
+        }
+        unsafe {
+            let native_window: *mut AnyObject = msg_send![self.view, window];
+            let bounds: ObjcCGRect = msg_send![self.view, bounds];
+            let available = !native_window.is_null() && bounds.width > 0.0 && bounds.height > 0.0;
+            if available == self.surface_available.get() {
+                return;
+            }
+            let previously_visible = self.can_render();
+            if available {
+                let instance = self
+                    .gpu_context
+                    .borrow()
+                    .as_ref()
+                    .map(|context| context.instance.clone());
+                let Some(instance) = instance else {
+                    return;
+                };
+                let scale: f64 = msg_send![self.view, contentScaleFactor];
+                let config = WgpuSurfaceConfig {
+                    size: size(
+                        DevicePixels((bounds.width * scale) as i32),
+                        DevicePixels((bounds.height * scale) as i32),
+                    ),
+                    transparent: false,
+                    preferred_present_mode: None,
+                };
+                let mut renderer = self.renderer.lock();
+                let Some(renderer) = renderer.as_mut() else {
+                    return;
+                };
+                if let Err(error) = renderer.replace_surface(
+                    &RawIosWindow {
+                        view: self.view.cast(),
+                    },
+                    config,
+                    &instance,
+                ) {
+                    log::error!("Failed to recreate UIKit Metal surface: {error:#}");
+                    return;
+                }
+            } else {
+                if let Some(renderer) = self.renderer.lock().as_mut() {
+                    renderer.unconfigure_surface();
+                }
+                self.cancel_legacy_touch();
+                if self.closed.get() {
+                    return;
+                }
+                self.legacy_multitouch.set(false);
+            }
+            self.surface_available.set(available);
+            let phase = if available {
+                SurfaceLifecycle::Available
+            } else {
+                SurfaceLifecycle::Lost
+            };
+            let events = self
+                .mobile_events
+                .borrow_mut()
+                .surface(phase, std::time::Duration::ZERO);
+            self.emit_mobile_events(events);
+            self.notify_visibility(previously_visible);
+        }
+    }
+
+    fn emit_mobile_events(&self, events: Vec<MobileEvent>) {
+        if !self.closed.get() {
+            mobile_events::dispatch_batch(self.handle_id.get() as u64, events);
+        }
+    }
+
+    fn cancel_legacy_touch(&self) {
+        let was_scrolling = matches!(
+            self.touch_state.replace(TouchState::Idle),
+            TouchState::Scrolling { .. }
+        );
+        self.touch_pressed.set(false);
+        self.velocity_tracker.borrow_mut().reset();
+        self.momentum_scroller.borrow_mut().cancel();
+        if was_scrolling {
+            self.dispatch_input(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position: self.mouse_position.get(),
+                delta: gpui::ScrollDelta::Pixels(Point::default()),
+                modifiers: self.modifiers.get(),
+                touch_phase: gpui::TouchPhase::Cancelled,
+            }));
+        }
+    }
+
+    fn emit_insets(&self) {
+        if self.closed.get() {
+            return;
+        }
+        let (top, bottom, left, right) = self.safe_area_insets();
+        self.emit_mobile_events(vec![MobileEvent::Insets(WindowInsets {
+            safe_area: gpui::Edges {
+                top: px(top),
+                bottom: px(bottom),
+                left: px(left),
+                right: px(right),
+            },
+            keyboard: self.keyboard_bounds.get(),
+            keyboard_visible: Some(self.keyboard_bounds.get().is_some()),
+            keyboard_insets: None,
+        })]);
+    }
+
     pub fn new(handle: AnyWindowHandle, _params: WindowParams) -> anyhow::Result<Self> {
         // Create the window on the main screen
         let screen = IosDisplay::main();
@@ -541,6 +975,13 @@ impl IosWindow {
             // Enable user interaction on the Metal view for touch handling
             let _: () = msg_send![view, setUserInteractionEnabled: true];
             let _: () = msg_send![view, setMultipleTouchEnabled: true];
+            let recognizer: *mut AnyObject = msg_send![class!(UIPinchGestureRecognizer), alloc];
+            let recognizer: *mut AnyObject =
+                msg_send![recognizer, initWithTarget: view, action: sel!(gpuiPinch:)];
+            let _: () = msg_send![recognizer, setCancelsTouchesInView: false];
+            let _: () = msg_send![recognizer, setDelaysTouchesEnded: false];
+            let _: () = msg_send![view, addGestureRecognizer: recognizer];
+            let _: () = msg_send![recognizer, release];
 
             // Set the view as the view controller's view
             let _: () = msg_send![view_controller, setView: view];
@@ -559,7 +1000,14 @@ impl IosWindow {
             let text_input_frame = ObjcCGRect::new(0.0, 0.0, 1.0, 1.0);
             let text_input_view: *mut AnyObject =
                 msg_send![text_input_view, initWithFrame: text_input_frame];
+            input_traits::initialize(text_input_view);
+            #[cfg(debug_assertions)]
+            input_traits::verify_live_proxy(text_input_view);
             let _: () = msg_send![text_input_view, setAlpha: 0.01_f64];
+            let clear: *mut AnyObject = msg_send![class!(UIColor), clearColor];
+            let _: () = msg_send![text_input_view, setTextColor: clear];
+            let _: () = msg_send![text_input_view, setBackgroundColor: clear];
+            let _: () = msg_send![text_input_view, setScrollEnabled: Bool::NO];
             let _: () = msg_send![text_input_view, setUserInteractionEnabled: true];
             let _: () = msg_send![view, addSubview: text_input_view];
 
@@ -567,32 +1015,48 @@ impl IosWindow {
             let pixel_w = (screen_bounds_cg.width * scale) as i32;
             let pixel_h = (screen_bounds_cg.height * scale) as i32;
 
-            let _handle = handle; // consumed but not stored
             let ios_window = Self {
+                gpui_handle: handle,
+                handle_id: Cell::new(0),
+                closed: Cell::new(false),
                 window,
                 view_controller,
                 view,
                 text_input_view,
                 bounds: Cell::new(screen_bounds),
                 scale_factor: Cell::new(scale_factor),
-                input_handler: RefCell::new(None),
-                request_frame_callback: RefCell::new(None),
-                input_callback: RefCell::new(None),
-                active_status_callback: RefCell::new(None),
-                hover_status_callback: RefCell::new(None),
-                resize_callback: RefCell::new(None),
-                moved_callback: RefCell::new(None),
-                should_close_callback: RefCell::new(None),
-                hit_test_callback: RefCell::new(None),
-                close_callback: RefCell::new(None),
-                appearance_changed_callback: RefCell::new(None),
+                input_handler: Callback::default(),
+                proxy_context: RefCell::new(None),
+                proxy_base: Cell::new(None),
+                proxy_mapping_valid: Cell::new(false),
+                proxy_text: RefCell::new(String::new()),
+                input_configuration: RefCell::new(gpui::TextInputConfiguration::default()),
+                request_frame_callback: Callback::default(),
+                input_callback: Callback::default(),
+                active_status_callback: Callback::default(),
+                visibility_callback: Callback::default(),
+                app_active: Cell::new(true),
+                surface_available: Cell::new(false),
+                keyboard_observers: RefCell::new(Vec::new()),
+                hover_status_callback: Callback::default(),
+                resize_callback: Callback::default(),
+                moved_callback: Callback::default(),
+                should_close_callback: Callback::default(),
+                hit_test_callback: Callback::default(),
+                close_callback: Callback::default(),
+                appearance_changed_callback: Callback::default(),
                 mouse_position: Cell::new(Point::default()),
                 modifiers: Cell::new(Modifiers::default()),
+                capslock: Cell::new(false),
                 touch_pressed: Cell::new(false),
                 touch_state: Cell::new(TouchState::Idle),
+                mobile_events: RefCell::new(MobileEventState::default()),
+                legacy_multitouch: Cell::new(false),
+                keyboard_bounds: Cell::new(None),
                 velocity_tracker: RefCell::new(VelocityTracker::new()),
                 momentum_scroller: RefCell::new(MomentumScroller::new()),
                 renderer: Mutex::new(None),
+                gpu_context: Rc::new(RefCell::new(None)),
             };
 
             // Create the wgpu renderer using the Metal backend.
@@ -612,7 +1076,9 @@ impl IosWindow {
                 flags: wgpu::InstanceFlags::default(),
                 backend_options: wgpu::BackendOptions::default(),
                 memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                display: None,
+                display: Some(Box::new(RawIosWindow {
+                    view: ios_window.view as *mut c_void,
+                })),
             });
 
             let raw_window = RawIosWindow {
@@ -637,7 +1103,8 @@ impl IosWindow {
                         // Pre-populate gpu_context so WgpuRenderer::new()
                         // reuses our Metal-backed context (and its instance)
                         // instead of creating a Vulkan+GL one.
-                        let gpu_context: GpuContext = Rc::new(RefCell::new(Some(context)));
+                        *ios_window.gpu_context.borrow_mut() = Some(context);
+                        let gpu_context = Rc::clone(&ios_window.gpu_context);
                         drop(surface); // no longer needed — new() creates its own
 
                         match WgpuRenderer::new(gpu_context, &raw_window, config, None) {
@@ -647,15 +1114,18 @@ impl IosWindow {
                             }
                             Err(e) => {
                                 log::error!("Failed to create iOS wgpu renderer: {e:#}");
+                                return Err(e);
                             }
                         }
                     }
                     Err(e) => {
                         log::error!("Failed to create iOS WgpuContext: {e:#}");
+                        return Err(e);
                     }
                 },
                 Err(e) => {
                     log::error!("Failed to create iOS wgpu Metal surface: {e:#}");
+                    return Err(e.into());
                 }
             }
 
@@ -676,13 +1146,16 @@ impl IosWindow {
     /// Register this window with the FFI layer after it's been stored.
     /// This must be called after the window is placed at a stable address
     /// (e.g., in a Box or Arc).
-    pub(crate) fn register_with_ffi(&self) {
-        super::ffi::register_window(self as *const Self);
+    pub(crate) fn register_with_ffi(self: &Rc<Self>) {
+        if self.handle_id.get() != 0 {
+            return;
+        }
+        self.handle_id.set(super::ffi::register_window(self));
 
         // Set the window pointer on the view so touch events can find us,
         // and on the text input view so keyboard input can find us.
         unsafe {
-            let window_ptr = self as *const Self as *mut std::ffi::c_void;
+            let window_ptr = self.handle_id.get() as *mut std::ffi::c_void;
             #[allow(deprecated)]
             {
                 *(*self.view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) = window_ptr;
@@ -701,6 +1174,7 @@ impl IosWindow {
 
         // Listen for keyboard show/hide so we can expose the keyboard height.
         self.register_keyboard_observers();
+        self.sync_surface_availability();
     }
 
     /// Register for keyboard show/hide notifications so we can track the
@@ -710,8 +1184,9 @@ impl IosWindow {
             let notification_center: *mut AnyObject =
                 msg_send![class!(NSNotificationCenter), defaultCenter];
 
-            let show_name = crate::ios::util::nsstring("UIKeyboardWillShowNotification");
+            let show_name = crate::ios::util::nsstring("UIKeyboardWillChangeFrameNotification");
             let hide_name = crate::ios::util::nsstring("UIKeyboardWillHideNotification");
+            let window_address = self.handle_id.get();
 
             // Block that fires when the keyboard appears — extracts the
             // end-frame height and stores it in the global atomic.
@@ -731,23 +1206,44 @@ impl IosWindow {
                     return;
                 }
                 let frame: ObjcCGRect = msg_send![frame_value, CGRectValue];
-                let height = frame.height as f32;
-                log::info!("GPUI iOS: Keyboard will show, height={}", height);
-                crate::set_keyboard_height(height);
+                let Some(window) = super::ffi::window_for_handle(window_address) else {
+                    return;
+                };
+                let screen: *mut AnyObject = msg_send![window.window, screen];
+                let coordinate_space: *mut AnyObject = msg_send![screen, coordinateSpace];
+                let local: ObjcCGRect = msg_send![window.view, convertRect: frame, fromCoordinateSpace: coordinate_space];
+                let bounds: ObjcCGRect = msg_send![window.view, bounds];
+                let x = local.x.max(bounds.x);
+                let y = local.y.max(bounds.y);
+                let width = (local.x + local.width).min(bounds.x + bounds.width) - x;
+                let height = (local.y + local.height).min(bounds.y + bounds.height) - y;
+                window
+                    .keyboard_bounds
+                    .set((width > 0.0 && height > 0.0).then(|| Bounds {
+                        origin: point(px(x as f32), px(y as f32)),
+                        size: size(px(width as f32), px(height as f32)),
+                    }));
+                crate::set_keyboard_height(height.max(0.0) as f32);
+                window.emit_insets();
             });
 
             let hide_block = block2::RcBlock::new(move |_notification: *mut AnyObject| {
                 log::info!("GPUI iOS: Keyboard will hide");
                 crate::set_keyboard_height(0.0);
+                let Some(window) = super::ffi::window_for_handle(window_address) else {
+                    return;
+                };
+                window.keyboard_bounds.set(None);
+                window.emit_insets();
             });
 
-            let _: *mut AnyObject = msg_send![notification_center,
+            let show_observer: *mut AnyObject = msg_send![notification_center,
                 addObserverForName: show_name,
                 object: std::ptr::null::<AnyObject>(),
                 queue: std::ptr::null::<AnyObject>(),
                 usingBlock: &*show_block
             ];
-            let _: *mut AnyObject = msg_send![notification_center,
+            let hide_observer: *mut AnyObject = msg_send![notification_center,
                 addObserverForName: hide_name,
                 object: std::ptr::null::<AnyObject>(),
                 queue: std::ptr::null::<AnyObject>(),
@@ -755,9 +1251,9 @@ impl IosWindow {
             ];
             // show_name and hide_name are autoreleased by util::nsstring
 
-            // Leak the blocks so they live for the app lifetime.
-            std::mem::forget(show_block);
-            std::mem::forget(hide_block);
+            self.keyboard_observers
+                .borrow_mut()
+                .extend([show_observer, hide_observer]);
         }
     }
 
@@ -778,10 +1274,53 @@ impl IosWindow {
     /// Interactive screens use `MouseMove` to track the finger during drags
     /// and `MouseUp` to detect the end of a throw/drag gesture.
     pub fn handle_touch(&self, touch: *mut AnyObject, _event: *mut AnyObject) {
-        let position = touch_location_in_view(touch, self.view);
+        if self.closed.get() {
+            return;
+        }
+        let mut position = touch_location_in_view(touch, self.view);
         let phase = touch_phase(touch);
         let tap_count = touch_tap_count(touch);
         let modifiers = self.modifiers.get();
+
+        let native_time: f64 = unsafe { msg_send![touch, timestamp] };
+        let timestamp = std::time::Duration::try_from_secs_f64(native_time).unwrap_or_default();
+        let raw_phase = match phase {
+            UITouchPhase::Began => gpui::TouchPhase::Started,
+            UITouchPhase::Moved => gpui::TouchPhase::Moved,
+            UITouchPhase::Ended => gpui::TouchPhase::Ended,
+            UITouchPhase::Cancelled => gpui::TouchPhase::Cancelled,
+            UITouchPhase::Stationary => return,
+        };
+        let raw =
+            self.mobile_events
+                .borrow_mut()
+                .touch(touch as u64, raw_phase, position, timestamp);
+        if let Some(raw) = raw {
+            if let MobileEvent::Touch { event, .. } = &raw {
+                position = event.position;
+            }
+            self.emit_mobile_events(vec![raw]);
+        } else {
+            return;
+        }
+        let pointer_count = self.mobile_events.borrow().active_pointer_count();
+        if crate::mobile_events::raw_touch_only() {
+            self.cancel_legacy_touch();
+            return;
+        }
+        if self.closed.get() {
+            return;
+        }
+        if pointer_count > 1 {
+            self.legacy_multitouch.set(true);
+        }
+        if matches!(phase, UITouchPhase::Cancelled) || self.legacy_multitouch.get() {
+            self.cancel_legacy_touch();
+            if pointer_count == 0 {
+                self.legacy_multitouch.set(false);
+            }
+            return;
+        }
 
         let logical_x: f32 = position.x.into();
         let logical_y: f32 = position.y.into();
@@ -790,11 +1329,7 @@ impl IosWindow {
 
         let mut ts = self.touch_state.get();
 
-        let emit = |input: PlatformInput| {
-            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                callback(input);
-            }
-        };
+        let emit = |input: PlatformInput| self.dispatch_input(input);
 
         match phase {
             UITouchPhase::Began => {
@@ -887,7 +1422,7 @@ impl IosWindow {
                 }
             }
 
-            UITouchPhase::Ended | UITouchPhase::Cancelled => {
+            UITouchPhase::Ended => {
                 self.touch_pressed.set(false);
                 match ts {
                     TouchState::Pending { start_x, start_y } => {
@@ -950,7 +1485,7 @@ impl IosWindow {
                 ts = TouchState::Idle;
             }
 
-            UITouchPhase::Stationary => {
+            UITouchPhase::Stationary | UITouchPhase::Cancelled => {
                 // No change — ignore.
                 return;
             }
@@ -1012,53 +1547,40 @@ impl IosWindow {
     /// **before** the GPUI render callback runs, so that the scroll delta
     /// is picked up during the current frame's layout/paint cycle.
     pub(crate) fn pump_momentum(&self) {
+        if crate::mobile_events::raw_touch_only() {
+            self.cancel_legacy_touch();
+            return;
+        }
         let mut scroller = self.momentum_scroller.borrow_mut();
         if !scroller.is_active() {
             return;
         }
-
-        if let Some(delta) = scroller.step() {
-            let modifiers = self.modifiers.get();
-            let position = gpui::point(gpui::px(delta.position_x), gpui::px(delta.position_y));
-            let fling_ended = !scroller.is_active();
-
-            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                callback(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                    position,
-                    delta: gpui::ScrollDelta::Pixels(gpui::point(
-                        gpui::px(delta.dx),
-                        gpui::px(delta.dy),
-                    )),
-                    modifiers,
-                    touch_phase: gpui::TouchPhase::Moved,
-                }));
-
-                // If this was the last momentum frame, send Ended now.
-                if fling_ended {
-                    callback(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                        position,
-                        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(0.0))),
-                        modifiers,
-                        touch_phase: gpui::TouchPhase::Ended,
-                    }));
-                }
-            }
-        } else {
-            // Fling finished — emit one final Ended event so GPUI knows
-            // the scroll gesture is truly complete.
-            let position = gpui::point(
-                gpui::px(scroller.position_x()),
-                gpui::px(scroller.position_y()),
-            );
-            let modifiers = self.modifiers.get();
-            if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                callback(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                    position,
-                    delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(0.0))),
-                    modifiers,
-                    touch_phase: gpui::TouchPhase::Ended,
-                }));
-            }
+        let delta = scroller.step();
+        let ended = !scroller.is_active();
+        let position = gpui::point(
+            gpui::px(scroller.position_x()),
+            gpui::px(scroller.position_y()),
+        );
+        drop(scroller);
+        let modifiers = self.modifiers.get();
+        if let Some(delta) = delta {
+            self.dispatch_input(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(
+                    gpui::px(delta.dx),
+                    gpui::px(delta.dy),
+                )),
+                modifiers,
+                touch_phase: gpui::TouchPhase::Moved,
+            }));
+        }
+        if ended {
+            self.dispatch_input(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                position,
+                delta: gpui::ScrollDelta::Pixels(Point::default()),
+                modifiers,
+                touch_phase: gpui::TouchPhase::Ended,
+            }));
         }
     }
 
@@ -1090,10 +1612,7 @@ impl IosWindow {
                 return;
             }
             let _: () = msg_send![self.text_input_view, setKeyboardType: kb_type];
-            log::info!("GPUI iOS: setAutocorrectionType");
-            let _: () = msg_send![self.text_input_view, setAutocorrectionType: 1_isize];
-            log::info!("GPUI iOS: setAutocapitalizationType");
-            let _: () = msg_send![self.text_input_view, setAutocapitalizationType: 0_isize];
+            self.apply_input_configuration();
             log::info!("GPUI iOS: scheduling becomeFirstResponder");
 
             // Defer becomeFirstResponder to the next run-loop iteration.
@@ -1144,11 +1663,20 @@ impl IosWindow {
             // The text is captured in PENDING_TEXT regardless of whether we also
             // send key events below.
             let dispatched = crate::dispatch_text_input(&text_str);
+            if self.closed.get() {
+                return;
+            }
 
             // Try the input handler (for GPUI's built-in text fields)
             if !dispatched {
-                if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
-                    handler.replace_text_in_range(None, &text_str);
+                if self
+                    .input_handler
+                    .call(
+                        || !self.closed.get(),
+                        |handler| handler.replace_text_in_range(None, &text_str),
+                    )
+                    .is_some()
+                {
                     return;
                 }
             }
@@ -1170,9 +1698,7 @@ impl IosWindow {
                     prefer_character_input: true,
                 });
 
-                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                    callback(event);
-                }
+                self.dispatch_input(event);
             }
         }
     }
@@ -1201,9 +1727,7 @@ impl IosWindow {
             is_held: false,
             prefer_character_input: false,
         });
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            callback(event);
-        }
+        self.dispatch_input(event);
     }
 
     /// Handle a key event from an external keyboard
@@ -1215,6 +1739,8 @@ impl IosWindow {
 
         let key = key_code_to_string(key_code);
         let modifiers = modifier_flags_to_modifiers(modifier_flags);
+        self.modifiers.set(modifiers);
+        self.capslock.set(modifier_flags & (1 << 16) != 0);
 
         log::info!(
             "GPUI iOS: Key event - key: {:?}, modifiers: {:?}, down: {}",
@@ -1249,9 +1775,7 @@ impl IosWindow {
             key_code_to_key_up(key_code, modifier_flags)
         };
 
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            callback(event);
-        }
+        self.dispatch_input(event);
     }
 
     /// Notify the window of active status changes (foreground/background).
@@ -1259,11 +1783,36 @@ impl IosWindow {
     /// This is called by the FFI layer when the app transitions between
     /// foreground and background states.
     pub fn notify_active_status_change(&self, is_active: bool) {
-        log::info!("GPUI iOS: Window active status changed to: {}", is_active);
-
-        if let Some(callback) = self.active_status_callback.borrow_mut().as_mut() {
-            callback(is_active);
+        if self.closed.get() {
+            return;
         }
+        let previously_visible = self.can_render();
+        if self.app_active.replace(is_active) == is_active {
+            return;
+        }
+        if !is_active {
+            self.modifiers.set(Modifiers::default());
+            self.capslock.set(false);
+        }
+        log::info!("GPUI iOS: Window active status changed to: {}", is_active);
+        let lifecycle = if is_active {
+            AppLifecycle::Resumed
+        } else {
+            AppLifecycle::Paused
+        };
+        let events = self
+            .mobile_events
+            .borrow_mut()
+            .lifecycle(lifecycle, std::time::Duration::ZERO);
+        if !is_active {
+            self.cancel_legacy_touch();
+            self.legacy_multitouch.set(false);
+        }
+        self.emit_mobile_events(events);
+        self.notify_visibility(previously_visible);
+
+        self.active_status_callback
+            .call(|| !self.closed.get(), |callback| callback(is_active));
     }
 
     /// Handle a layout change (e.g. rotation, split-screen resize).
@@ -1272,6 +1821,11 @@ impl IosWindow {
     /// Queries the current UIView bounds, updates the stored bounds/scale,
     /// reconfigures the Metal layer + wgpu surface, and fires the resize callback.
     pub fn handle_layout_change(&self) {
+        self.sync_surface_availability();
+        self.emit_insets();
+        if self.closed.get() {
+            return;
+        }
         unsafe {
             let view_bounds: ObjcCGRect = msg_send![self.view, bounds];
             let screen: *mut AnyObject = msg_send![class!(UIScreen), mainScreen];
@@ -1324,14 +1878,63 @@ impl IosWindow {
             }
 
             // Fire the resize callback so GPUI re-layouts at the new size.
-            let cb = self.resize_callback.borrow_mut().take();
-            if let Some(mut cb) = cb {
-                cb(new_size, new_scale);
-                // Restore the callback for future resize events.
-                let mut slot = self.resize_callback.borrow_mut();
-                if slot.is_none() {
-                    *slot = Some(cb);
+            self.resize_callback.call(
+                || !self.closed.get(),
+                |callback| callback(new_size, new_scale),
+            );
+        }
+    }
+}
+
+impl Drop for IosWindow {
+    fn drop(&mut self) {
+        self.inner.closed.set(true);
+        super::ffi::unregister_window(self.inner.handle_id.get());
+        unsafe {
+            for view in [self.view, self.text_input_view] {
+                if !view.is_null() {
+                    #[allow(deprecated)]
+                    {
+                        *(*view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) = ptr::null_mut();
+                    }
                 }
+            }
+            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+            let observers = std::mem::take(&mut *self.keyboard_observers.borrow_mut());
+            for observer in observers {
+                let _: () = msg_send![center, removeObserver: observer];
+            }
+            let _: () = msg_send![class!(NSObject), cancelPreviousPerformRequestsWithTarget: self.text_input_view];
+        }
+        self.request_frame_callback.set(None);
+        self.input_callback.set(None);
+        self.active_status_callback.set(None);
+        self.visibility_callback.set(None);
+        self.resize_callback.set(None);
+        self.hover_status_callback.set(None);
+        self.moved_callback.set(None);
+        self.should_close_callback.set(None);
+        self.hit_test_callback.set(None);
+        self.close_callback.set(None);
+        self.appearance_changed_callback.set(None);
+    }
+}
+
+impl Drop for IosWindowInner {
+    fn drop(&mut self) {
+        if let Some(mut renderer) = self.renderer.get_mut().take() {
+            renderer.destroy();
+        }
+        unsafe {
+            let _: () = msg_send![self.window, setHidden: true];
+            let _: () = msg_send![self.window, setRootViewController: ptr::null::<AnyObject>()];
+            for object in [
+                self.text_input_view,
+                self.view,
+                self.view_controller,
+                self.window,
+            ] {
+                let _: () = msg_send![object, release];
             }
         }
     }
@@ -1408,16 +2011,27 @@ impl PlatformWindow for IosWindow {
     }
 
     fn capslock(&self) -> Capslock {
-        // Would need to check UIKeyModifierFlags
-        Capslock { on: false }
+        Capslock {
+            on: self.capslock.get(),
+        }
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        *self.input_handler.borrow_mut() = Some(input_handler);
+        self.input_handler.set(Some(input_handler));
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
-        self.input_handler.borrow_mut().take()
+        self.input_handler.take()
+    }
+
+    fn set_text_input_configuration(&mut self, configuration: gpui::TextInputConfiguration) {
+        if *self.input_configuration.borrow() == configuration {
+            return;
+        }
+        *self.input_configuration.borrow_mut() = configuration;
+        if !self.closed.get() {
+            self.apply_input_configuration();
+        }
     }
 
     fn prompt(
@@ -1427,8 +2041,12 @@ impl PlatformWindow for IosWindow {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<futures::channel::oneshot::Receiver<usize>> {
-        // Would use UIAlertController
-        let (_tx, rx) = futures::channel::oneshot::channel();
+        if answers.is_empty() || self.closed.get() {
+            return None;
+        }
+        let inner = self.inner.clone();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let sender = Rc::new(RefCell::new(Some(tx)));
 
         unsafe {
             // Create UIAlertController
@@ -1437,10 +2055,13 @@ impl PlatformWindow for IosWindow {
 
             let alert_style: i64 = 1; // UIAlertControllerStyleAlert
 
-            let title_str: *mut AnyObject =
-                msg_send![class!(NSString), stringWithUTF8String: title.as_ptr()];
-            let message_str: *mut AnyObject =
-                msg_send![class!(NSString), stringWithUTF8String: message.as_ptr()];
+            // Rust strings are not NUL-terminated; preserve their exact UTF-8 bytes.
+            let title_str: *mut AnyObject = msg_send![class!(NSString), alloc];
+            let title_str: *mut AnyObject = msg_send![title_str,
+                initWithBytes: title.as_ptr(), length: title.len(), encoding: 4_usize];
+            let message_str: *mut AnyObject = msg_send![class!(NSString), alloc];
+            let message_str: *mut AnyObject = msg_send![message_str,
+                initWithBytes: message.as_ptr(), length: message.len(), encoding: 4_usize];
 
             let alert: *mut AnyObject = msg_send![
                 class!(UIAlertController),
@@ -1448,30 +2069,40 @@ impl PlatformWindow for IosWindow {
                 message: message_str,
                 preferredStyle: alert_style
             ];
+            let _: () = msg_send![title_str, release];
+            let _: () = msg_send![message_str, release];
 
             // Add buttons
-            for button in answers.iter() {
-                let button_title: *mut AnyObject = msg_send![
-                    class!(NSString),
-                    stringWithUTF8String: button.label().as_str().as_ptr()
-                ];
+            for (index, button) in answers.iter().enumerate() {
+                let label = button.label();
+                let label = label.as_str();
+                let button_title: *mut AnyObject = msg_send![class!(NSString), alloc];
+                let button_title: *mut AnyObject = msg_send![button_title,
+                    initWithBytes: label.as_ptr(), length: label.len(), encoding: 4_usize];
 
                 let action_style: i64 = if button.is_cancel() { 1 } else { 0 }; // UIAlertActionStyleCancel or Default
 
-                // Note: In production, this would need a block that calls tx.send(index)
+                let sender = sender.clone();
+                let handler = block2::RcBlock::new(move |_action: *mut AnyObject| {
+                    let sender = sender.borrow_mut().take();
+                    if let Some(sender) = sender {
+                        let _ = sender.send(index);
+                    }
+                });
                 let action: *mut AnyObject = msg_send![
                     class!(UIAlertAction),
                     actionWithTitle: button_title,
                     style: action_style,
-                    handler: ptr::null::<AnyObject>()
+                    handler: &*handler
                 ];
+                let _: () = msg_send![button_title, release];
 
                 let _: () = msg_send![alert, addAction: action];
             }
 
             // Present the alert
             let _: () = msg_send![
-                self.view_controller,
+                inner.view_controller,
                 presentViewController: alert,
                 animated: true,
                 completion: ptr::null::<AnyObject>()
@@ -1482,8 +2113,9 @@ impl PlatformWindow for IosWindow {
     }
 
     fn activate(&self) {
+        let inner = self.inner.clone();
         unsafe {
-            let _: () = msg_send![self.window, makeKeyAndVisible];
+            let _: () = msg_send![inner.window, makeKeyAndVisible];
         }
     }
 
@@ -1493,6 +2125,18 @@ impl PlatformWindow for IosWindow {
             let key_window: *mut AnyObject = msg_send![app, keyWindow];
             self.window == key_window
         }
+    }
+
+    fn visibility(&self) -> gpui::WindowVisibility {
+        if self.can_render() {
+            gpui::WindowVisibility::Visible
+        } else {
+            gpui::WindowVisibility::Hidden
+        }
+    }
+
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(gpui::WindowVisibility)>) {
+        self.visibility_callback.set(Some(callback));
     }
 
     fn is_hovered(&self) -> bool {
@@ -1529,46 +2173,49 @@ impl PlatformWindow for IosWindow {
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
-        *self.request_frame_callback.borrow_mut() = Some(callback);
+        self.request_frame_callback.set(Some(callback));
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>) {
-        *self.input_callback.borrow_mut() = Some(callback);
+        self.input_callback.set(Some(callback));
     }
 
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
-        *self.active_status_callback.borrow_mut() = Some(callback);
+        self.active_status_callback.set(Some(callback));
     }
 
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
-        *self.hover_status_callback.borrow_mut() = Some(callback);
+        self.hover_status_callback.set(Some(callback));
     }
 
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>) {
-        *self.resize_callback.borrow_mut() = Some(callback);
+        self.resize_callback.set(Some(callback));
     }
 
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
-        *self.moved_callback.borrow_mut() = Some(callback);
+        self.moved_callback.set(Some(callback));
     }
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
-        *self.should_close_callback.borrow_mut() = Some(callback);
+        self.should_close_callback.set(Some(callback));
     }
 
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
-        *self.hit_test_callback.borrow_mut() = Some(callback);
+        self.hit_test_callback.set(Some(callback));
     }
 
     fn on_close(&self, callback: Box<dyn FnOnce()>) {
-        *self.close_callback.borrow_mut() = Some(callback);
+        self.close_callback.set(Some(callback));
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
-        *self.appearance_changed_callback.borrow_mut() = Some(callback);
+        self.appearance_changed_callback.set(Some(callback));
     }
 
     fn draw(&self, scene: &Scene) {
+        if !self.can_render() {
+            return;
+        }
         let mut guard = self.renderer.lock();
         if let Some(renderer) = guard.as_mut() {
             renderer.draw(scene);
@@ -1598,11 +2245,46 @@ impl PlatformWindow for IosWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         let guard = self.renderer.lock();
-        guard.as_ref().map(|r| r.gpu_specs())
+        guard.as_ref().and_then(|r| r.gpu_specs())
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
-        // iOS handles IME positioning automatically
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        let x = f32::from(bounds.origin.x);
+        let y = f32::from(bounds.origin.y);
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        if self.closed.get()
+            || ![x, y, width, height].iter().all(|value| value.is_finite())
+            || width < 0.0
+            || height < 0.0
+        {
+            return;
+        }
+        unsafe {
+            let frame = ObjcCGRect::new(
+                x as f64,
+                y as f64,
+                width.max(1.0) as f64,
+                height.max(1.0) as f64,
+            );
+            let _: () = msg_send![self.text_input_view, setFrame: frame];
+        }
+    }
+
+    fn text_input_state_changed(&self, change: gpui::TextInputStateChange) {
+        if self.closed.get() {
+            return;
+        }
+        // GPUI takes/restores handlers during painting; only actual focus
+        // transitions should change UIKit's first responder.
+        match change {
+            gpui::TextInputStateChange::FocusGained => {
+                self.show_keyboard_with_type(crate::KeyboardType::Default);
+            }
+            gpui::TextInputStateChange::FocusLost => self.hide_keyboard(),
+            gpui::TextInputStateChange::SelectionChanged
+            | gpui::TextInputStateChange::ContentChanged => {}
+        }
     }
 }
 
@@ -1634,14 +2316,14 @@ impl FallbackAtlas {
 impl PlatformAtlas for FallbackAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> anyhow::Result<
             Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>,
         >,
     ) -> anyhow::Result<Option<AtlasTile>> {
         let mut state = self.state.lock();
 
-        if let Some(tile) = state.tiles.get(key) {
+        if let Some(tile) = state.tiles.get(&key) {
             return Ok(Some(tile.clone()));
         }
 

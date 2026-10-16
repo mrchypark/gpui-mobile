@@ -213,14 +213,14 @@ pub fn ios_main() {
 /// the router starts on the corresponding screen.
 #[cfg(any(target_os = "ios", target_os = "android"))]
 fn open_main_window(cx: &mut App) {
+    // One standard-app observer. This observes lifecycle without consuming GPUI input.
+    gpui_mobile::mobile_events::set_mobile_event_handler(Some(Box::new(|_, event| {
+        screens::on_mobile_event(event);
+    })));
     // Set up HTTP client so gpui::img() can fetch remote images (e.g. picsum.photos).
-    // We build the reqwest client ourselves so we can skip TLS cert verification.
-    // On iOS, rustls-native-certs fails to load system root certs, causing all
-    // HTTPS requests to fail with "UnknownIssuer". Since this is a demo app,
-    // disabling cert verification is acceptable.
+    // The rustls-tls feature supplies WebPKI roots, including on iOS.
     log::info!("Setting up HTTP client for image loading...");
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .expect("Failed to create reqwest client");

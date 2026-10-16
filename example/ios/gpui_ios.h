@@ -135,6 +135,8 @@ void gpui_ios_handle_key_event(void* window_ptr, uint32_t key_code, uint32_t mod
 /// Parameters:
 /// - url_ptr: Pointer to NSString containing the URL
 void gpui_ios_handle_open_url(void* url_ptr);
+// Cold launch only: NSString URL, or NULL for an ordinary launch.
+void gpui_ios_record_initial_url(void* url_ptr);
 
 #ifdef __cplusplus
 }

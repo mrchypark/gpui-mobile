@@ -27,8 +27,8 @@ public final class GpuiContacts {
      */
     public static String searchContacts(Activity activity, String query) {
         return queryContacts(activity,
-            ContactsContract.Contacts.DISPLAY_NAME_PRIMARY + " LIKE ?",
-            new String[]{"%" + query + "%"});
+            ContactsContract.Contacts.DISPLAY_NAME_PRIMARY + " LIKE ? ESCAPE '\\'",
+            new String[]{"%" + escapeSearch(query) + "%"});
     }
 
     /**
@@ -54,7 +54,7 @@ public final class GpuiContacts {
             ContactsContract.Contacts.DISPLAY_NAME_PRIMARY + " ASC"
         );
 
-        if (cursor == null) return "";
+        if (cursor == null) throw new IllegalStateException("Contacts provider returned no cursor");
 
         try {
             while (cursor.moveToNext()) {
@@ -79,7 +79,8 @@ public final class GpuiContacts {
                     new String[]{contactId, ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE},
                     null
                 );
-                if (nameCursor != null) {
+                if (nameCursor == null) throw new IllegalStateException("Contacts name query returned no cursor");
+                {
                     try {
                         if (nameCursor.moveToFirst()) {
                             givenName = nameCursor.getString(0);
@@ -101,18 +102,20 @@ public final class GpuiContacts {
                     new String[]{
                         ContactsContract.CommonDataKinds.Phone.NUMBER,
                         ContactsContract.CommonDataKinds.Phone.TYPE,
+                        ContactsContract.CommonDataKinds.Phone.LABEL,
                     },
                     ContactsContract.CommonDataKinds.Phone.CONTACT_ID + " = ?",
                     new String[]{contactId}, null
                 );
-                if (phoneCursor != null) {
+                if (phoneCursor == null) throw new IllegalStateException("Contacts phone query returned no cursor");
+                {
                     try {
                         while (phoneCursor.moveToNext()) {
                             if (phones.length() > 0) phones.append(",");
                             String number = phoneCursor.getString(0);
                             int type = phoneCursor.getInt(1);
                             String label = ContactsContract.CommonDataKinds.Phone.getTypeLabel(
-                                activity.getResources(), type, "other").toString();
+                                activity.getResources(), type, phoneCursor.getString(2)).toString();
                             number = escapeDelimiters(number != null ? number : "");
                             label = escapeDelimiters(label);
                             phones.append(number).append(":").append(label);
@@ -129,18 +132,20 @@ public final class GpuiContacts {
                     new String[]{
                         ContactsContract.CommonDataKinds.Email.ADDRESS,
                         ContactsContract.CommonDataKinds.Email.TYPE,
+                        ContactsContract.CommonDataKinds.Email.LABEL,
                     },
                     ContactsContract.CommonDataKinds.Email.CONTACT_ID + " = ?",
                     new String[]{contactId}, null
                 );
-                if (emailCursor != null) {
+                if (emailCursor == null) throw new IllegalStateException("Contacts email query returned no cursor");
+                {
                     try {
                         while (emailCursor.moveToNext()) {
                             if (emails.length() > 0) emails.append(",");
                             String addr = emailCursor.getString(0);
                             int type = emailCursor.getInt(1);
                             String label = ContactsContract.CommonDataKinds.Email.getTypeLabel(
-                                activity.getResources(), type, "other").toString();
+                                activity.getResources(), type, emailCursor.getString(2)).toString();
                             addr = escapeDelimiters(addr != null ? addr : "");
                             label = escapeDelimiters(label);
                             emails.append(addr).append(":").append(label);
@@ -168,13 +173,19 @@ public final class GpuiContacts {
     /** Escape pipe characters so they don't break field splitting. */
     private static String escapePipe(String s) {
         if (s == null) return "";
-        return s.replace("|", " ");
+        return escapeDelimiters(s);
+    }
+
+    static String escapeSearch(String query) {
+        if (query == null) throw new IllegalArgumentException("Contact query must not be null");
+        return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
     }
 
     /** Escape colon and comma characters so they don't break phone/email sub-field splitting. */
     private static String escapeDelimiters(String s) {
         if (s == null) return "";
-        return s.replace("|", " ").replace(",", " ").replace(":", " ");
+        return s.replace("%", "%25").replace("|", "%7C").replace("\n", "%0A")
+            .replace("\r", "%0D").replace(",", "%2C").replace(":", "%3A");
     }
 
     private GpuiContacts() {}

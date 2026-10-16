@@ -17,12 +17,17 @@ import androidx.fragment.app.FragmentActivity;
  * in {@link GpuiLocalAuth#sResult}, counts down the latch, and finishes.</p>
  */
 public class GpuiAuthActivity extends FragmentActivity {
+    private GpuiLocalAuth.Session request;
+    private BiometricPrompt prompt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        String reason = GpuiLocalAuth.sReason;
+        request = GpuiLocalAuth.session(getIntent().getLongExtra("gpui.auth.request", -1));
+        if (request == null) { finish(); return; }
+        request.owner = new java.lang.ref.WeakReference<>(this);
+        String reason = request.reason;
         if (reason == null || reason.isEmpty()) {
             reason = "Verify your identity";
         }
@@ -30,6 +35,7 @@ public class GpuiAuthActivity extends FragmentActivity {
         BiometricPrompt.PromptInfo promptInfo = new BiometricPrompt.PromptInfo.Builder()
             .setTitle("Authentication Required")
             .setSubtitle(reason)
+            .setAllowedAuthenticators(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK)
             .setNegativeButtonText("Cancel")
             .build();
 
@@ -39,8 +45,7 @@ public class GpuiAuthActivity extends FragmentActivity {
                 @Override
                 public void onAuthenticationSucceeded(@NonNull BiometricPrompt.AuthenticationResult result) {
                     super.onAuthenticationSucceeded(result);
-                    GpuiLocalAuth.sResult.set(0); // success
-                    deliverResult();
+                    request.complete(0);
                     finish();
                 }
 
@@ -78,25 +83,28 @@ public class GpuiAuthActivity extends FragmentActivity {
                             result = 7; // other
                             break;
                     }
-                    GpuiLocalAuth.sResult.set(result);
-                    deliverResult();
+                    request.complete(result);
                     finish();
                 }
             });
 
+        prompt = biometricPrompt;
         biometricPrompt.authenticate(promptInfo);
     }
 
     @Override
     public void onBackPressed() {
-        GpuiLocalAuth.sResult.set(4); // cancelled
-        deliverResult();
+        if (request != null) request.complete(4);
         super.onBackPressed();
     }
 
-    private void deliverResult() {
-        if (GpuiLocalAuth.sLatch != null) {
-            GpuiLocalAuth.sLatch.countDown();
-        }
+    void cancelAndFinish() {
+        if (prompt != null) prompt.cancelAuthentication();
+        finish();
+    }
+
+    @Override protected void onDestroy() {
+        if (request != null && !isChangingConfigurations()) request.complete(4);
+        super.onDestroy();
     }
 }

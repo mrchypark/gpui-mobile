@@ -5,6 +5,9 @@ use objc2::{class, msg_send};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+#[path = "../audio/ios_loop.rs"]
+mod ios_loop;
+
 /// Global storage for AVPlayer instances keyed by player ID.
 static PLAYERS: Mutex<Option<HashMap<u32, PlayerEntry>>> = Mutex::new(None);
 
@@ -16,6 +19,8 @@ struct PlayerEntry {
     player: *mut AnyObject,
     /// Whether looping is enabled.
     looping: bool,
+    loops: ios_loop::Looping,
+    speed: f32,
 }
 
 // AVPlayer pointers are safe to send across threads when properly retained.
@@ -40,7 +45,7 @@ fn with_player<T>(
 /// Create a new AVPlayer and return its ID.
 pub fn create_player() -> Result<u32, String> {
     unsafe {
-        let player: *mut AnyObject = msg_send![class!(AVPlayer), alloc];
+        let player: *mut AnyObject = msg_send![class!(AVQueuePlayer), alloc];
         let player: *mut AnyObject = msg_send![player, init];
         if player.is_null() {
             return Err("Failed to create AVPlayer".into());
@@ -53,6 +58,8 @@ pub fn create_player() -> Result<u32, String> {
                 PlayerEntry {
                     player,
                     looping: false,
+                    loops: Default::default(),
+                    speed: 1.0,
                 },
             );
         });
@@ -63,51 +70,87 @@ pub fn create_player() -> Result<u32, String> {
 
 /// Get the raw AVPlayer pointer for a given player ID.
 ///
-/// Used by the platform view system to create AVPlayerLayer.
+/// Legacy borrowed accessor; concurrent disposal invalidates the result.
+/// Internal layer construction must use retain_player instead.
 pub fn get_player_ptr(id: u32) -> Option<*mut AnyObject> {
     with_players(|map| map.get(&id).map(|entry| entry.player))
 }
 
-pub fn set_url(id: u32, url: &str) -> Result<VideoInfo, String> {
-    with_player(id, |entry| unsafe {
-        let url_str = make_nsstring(url);
-        let nsurl: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_str];
-        if nsurl.is_null() {
-            let _: () = msg_send![url_str, release];
-            return Err("Invalid URL".into());
-        }
-
-        let item: *mut AnyObject = msg_send![class!(AVPlayerItem), playerItemWithURL: nsurl];
-        let _: () = msg_send![entry.player, replaceCurrentItemWithPlayerItem: item];
-        let _: () = msg_send![url_str, release];
-
-        wait_for_item_ready(entry.player)?;
-        get_video_info(entry.player)
+pub(super) fn retain_player(id: u32) -> Option<objc2::rc::Retained<AnyObject>> {
+    with_players(|map| {
+        let entry = map.get(&id)?;
+        // The registry's +1 cannot be released by dispose until this retain finishes.
+        unsafe { objc2::rc::Retained::retain(entry.player) }
     })
 }
 
+pub fn set_url(id: u32, url: &str) -> Result<VideoInfo, String> {
+    load_source(id, url, false)
+}
+
 pub fn set_file_path(id: u32, path: &str) -> Result<VideoInfo, String> {
-    with_player(id, |entry| unsafe {
-        let path_str = make_nsstring(path);
-        let nsurl: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: path_str];
-        if nsurl.is_null() {
-            let _: () = msg_send![path_str, release];
-            return Err("Invalid file path".into());
-        }
+    load_source(id, path, true)
+}
 
-        let item: *mut AnyObject = msg_send![class!(AVPlayerItem), playerItemWithURL: nsurl];
+fn load_source(id: u32, source: &str, file: bool) -> Result<VideoInfo, String> {
+    objc2::rc::autoreleasepool(|_| load_source_inner(id, source, file))
+}
+
+fn load_source_inner(id: u32, source: &str, file: bool) -> Result<VideoInfo, String> {
+    unsafe {
+        let main: bool = msg_send![class!(NSThread), isMainThread];
+        if main { return Err("Load media from a worker thread".into()); }
+    }
+    let item = with_player(id, |entry| unsafe {
+        let text = make_nsstring(source);
+        let url: *mut AnyObject = if file {
+            msg_send![class!(NSURL), fileURLWithPath: text]
+        } else {
+            msg_send![class!(NSURL), URLWithString: text]
+        };
+        if url.is_null() { return Err("Invalid media URL".into()); }
+        let item: *mut AnyObject = msg_send![class!(AVPlayerItem), playerItemWithURL: url];
+        if item.is_null() { return Err("Failed to create video item".into()); }
+        entry.loops.clear();
+        let _: () = msg_send![entry.player, removeAllItems];
         let _: () = msg_send![entry.player, replaceCurrentItemWithPlayerItem: item];
-        let _: () = msg_send![path_str, release];
-
-        wait_for_item_ready(entry.player)?;
-        get_video_info(entry.player)
+        let _: () = msg_send![entry.player, setActionAtItemEnd: 1isize];
+        let _: *mut AnyObject = msg_send![item, retain];
+        Ok(LoadingItem(item))
+    })?;
+    // No registry lock while native loading waits. Disposal/source replacement can
+    // proceed, and the retained item remains alive until this operation returns.
+    if let Err(error) = unsafe { wait_for_item_ready(item.0) } {
+        // Timeout can leave status Unknown; discard this load before later play,
+        // but never discard a concurrently installed replacement.
+        let _ = with_player(id, |entry| unsafe {
+            let current: *mut AnyObject = msg_send![entry.player, currentItem];
+            if current == item.0 {
+                let _: () = msg_send![entry.player, removeAllItems];
+            }
+            Ok(())
+        });
+        return Err(error);
+    }
+    with_player(id, |entry| unsafe {
+        let current: *mut AnyObject = msg_send![entry.player, currentItem];
+        if current != item.0 { return Err("Video source changed while loading".into()); }
+        let info = get_video_info(entry.player)?;
+        if entry.looping { entry.loops.configure(entry.player, true)?; }
+        Ok(info)
     })
+}
+
+struct LoadingItem(*mut AnyObject);
+impl Drop for LoadingItem {
+    fn drop(&mut self) { unsafe { let _: () = msg_send![self.0, release]; } }
 }
 
 pub fn play(id: u32) -> Result<(), String> {
     with_player(id, |entry| {
         unsafe {
-            let _: () = msg_send![entry.player, play];
+            ios_loop::require_playable(entry.player)?;
+            let _: () = msg_send![entry.player, setRate: entry.speed];
         }
         Ok(())
     })
@@ -144,29 +187,21 @@ pub fn set_volume(id: u32, volume: f32) -> Result<(), String> {
 pub fn set_speed(id: u32, speed: f32) -> Result<(), String> {
     with_player(id, |entry| {
         unsafe {
-            let _: () = msg_send![entry.player, setRate: speed];
+            let rate: f32 = msg_send![entry.player, rate];
+            entry.speed = speed;
+            if rate != 0.0 { let _: () = msg_send![entry.player, setRate: speed]; }
         }
         Ok(())
     })
 }
 
 pub fn set_looping(id: u32, looping: bool) -> Result<(), String> {
-    with_player(id, |entry| {
+    with_player(id, |entry| unsafe {
+        entry.loops.configure(entry.player, looping)?;
         entry.looping = looping;
-        // AVPlayer does not have a built-in loop property.
-        // Looping is typically implemented via AVPlayerLooper or
-        // NSNotification observation. For simplicity we set
-        // actionAtItemEnd so the player pauses (NoAction keeps the
-        // item loaded) and store the flag for the caller to poll.
-        unsafe {
-            // AVPlayerActionAtItemEnd: 0 = Advance, 1 = Pause, 2 = None
-            let action: i64 = if looping { 2 } else { 1 };
-            let _: () = msg_send![entry.player, setActionAtItemEnd: action];
-        }
         Ok(())
     })
 }
-
 pub fn position(id: u32) -> Result<u64, String> {
     with_player(id, |entry| unsafe {
         let time: CMTime = msg_send![entry.player, currentTime];
@@ -205,9 +240,10 @@ pub fn is_playing(id: u32) -> Result<bool, String> {
 
 pub fn dispose(id: u32) -> Result<(), String> {
     let entry = with_players(|map| map.remove(&id));
-    if let Some(entry) = entry {
+    if let Some(mut entry) = entry {
         unsafe {
             let _: () = msg_send![entry.player, pause];
+            entry.loops.clear();
             let _: () = msg_send![entry.player, release];
         }
     }
@@ -228,7 +264,7 @@ struct CMTime {
 
 unsafe impl Encode for CMTime {
     const ENCODING: Encoding = Encoding::Struct(
-        "CMTime",
+        "?",
         &[
             Encoding::LongLong,
             Encoding::Int,
@@ -292,8 +328,7 @@ unsafe fn make_nsstring(s: &str) -> *mut AnyObject {
 }
 
 /// Wait (up to 5 seconds) for the current AVPlayerItem to reach ReadyToPlay status.
-unsafe fn wait_for_item_ready(player: *mut AnyObject) -> Result<(), String> {
-    let item: *mut AnyObject = msg_send![player, currentItem];
+unsafe fn wait_for_item_ready(item: *mut AnyObject) -> Result<(), String> {
     if item.is_null() {
         return Err("No player item".into());
     }
@@ -325,4 +360,61 @@ unsafe fn get_video_info(player: *mut AnyObject) -> Result<VideoInfo, String> {
         width: size.width as u32,
         height: size.height as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_rejects_empty_and_failed_source() {
+        objc2::rc::autoreleasepool(|_| {
+            let id = create_player().unwrap();
+            assert!(play(id).is_err());
+            let failure = std::thread::spawn(move || {
+                set_file_path(id, "/gpui-nonexistent-media-regression.mp4")
+            }).join().unwrap();
+            assert!(failure.is_err());
+            assert!(play(id).is_err());
+            // A later valid source must clear the failed-item condition rather
+            // than leaving a Rust-side sticky failure flag.
+            let path = std::env::temp_dir().join(format!("gpui-play-{}.wav", uuid::Uuid::new_v4()));
+            let mut wav = Vec::new();
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&16036u32.to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&8000u32.to_le_bytes());
+            wav.extend_from_slice(&16000u32.to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&16000u32.to_le_bytes());
+            wav.resize(16044, 0);
+            std::fs::write(&path, wav).unwrap();
+            let source = path.to_string_lossy().into_owned();
+            let recovered = std::thread::spawn(move || set_file_path(id, &source)).join().unwrap();
+            let playback = recovered.and_then(|_| play(id));
+            let _ = pause(id);
+            dispose(id).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(playback.is_ok(), "valid source did not recover: {playback:?}");
+        });
+    }
+
+    #[test]
+    fn retained_player_survives_registry_disposal() {
+        objc2::rc::autoreleasepool(|_| {
+            let id = create_player().unwrap();
+            let retained = retain_player(id).unwrap();
+            std::thread::spawn(move || dispose(id).unwrap()).join().unwrap();
+            assert!(retain_player(id).is_none());
+            let alive: bool = unsafe { msg_send![&*retained, isKindOfClass: class!(AVQueuePlayer)] };
+            assert!(alive);
+            // The guard releases the last reference after the native call, with
+            // no registry mutex held across thread joining or native layer work.
+        });
+    }
 }

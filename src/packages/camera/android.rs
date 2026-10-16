@@ -336,18 +336,24 @@ pub fn set_camera(handle: &CameraHandle, camera: &CameraDescription) -> Result<(
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
         let j_camera_id = env.new_string(&camera.name).e()?;
 
-        env.call_static_method(
-            &cls,
-            jni::jni_str!("setCamera"),
-            jni::jni_sig!("(ILjava/lang/String;)V"),
-            &[JValue::Int(handle.id as i32), JValue::Object(&j_camera_id)],
-        )
-        .map_err(|e| {
-            env.exception_clear();
-            e.to_string()
-        })?;
+        let result = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("setCamera"),
+                jni::jni_sig!("(ILjava/lang/String;)Ljava/lang/String;"),
+                &[JValue::Int(handle.id as i32), JValue::Object(&j_camera_id)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
 
-        Ok(())
+        if result.is_null() {
+            Ok(())
+        } else {
+            Err(jni_helpers::get_string(env, &result))
+        }
     })
 }
 

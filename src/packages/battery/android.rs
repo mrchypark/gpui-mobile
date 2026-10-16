@@ -13,10 +13,24 @@ pub fn battery_level() -> i32 {
         Some(v) => v,
         None => return -1,
     };
-    if scale > 0 {
-        (level * 100) / scale
-    } else {
-        -1
+    percentage(level, scale)
+}
+
+fn percentage(level: i32, scale: i32) -> i32 {
+    if level < 0 || scale <= 0 || level > scale {
+        return -1;
+    }
+    ((i64::from(level) * 100) / i64::from(scale)) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn battery_percentage_preserves_unknown_and_avoids_overflow() {
+        assert_eq!(super::percentage(-1, 100), -1);
+        assert_eq!(super::percentage(1, 0), -1);
+        assert_eq!(super::percentage(i32::MAX, i32::MAX), 100);
+        assert_eq!(super::percentage(1, 4), 25);
     }
 }
 
@@ -80,6 +94,7 @@ pub fn is_battery_save_mode() -> bool {
 /// Returns `(level, scale, status)` or None on failure.
 fn read_battery_sticky() -> Option<(i32, i32, i32)> {
     jni_helpers::with_env(|env| {
+        let result = (|| {
         let activity = jni_helpers::activity(env)?;
 
         // IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
@@ -143,6 +158,9 @@ fn read_battery_sticky() -> Option<(i32, i32, i32)> {
             .map_err(|e| e.to_string())?;
 
         Ok(Some((level, scale, status)))
+        })();
+        if result.is_err() { env.exception_clear(); }
+        result
     })
     .unwrap_or(None)
 }

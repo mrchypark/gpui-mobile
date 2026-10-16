@@ -1,6 +1,8 @@
 # Rust
 target/
 Cargo.lock
+!/example/Cargo.lock
+!/examples/ely-integration/Cargo.lock
 **/*.rs.bk
 *.pdb
 

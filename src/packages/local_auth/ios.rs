@@ -1,7 +1,6 @@
 use super::{AuthResult, BiometricType};
 use objc2::runtime::{AnyObject, Bool};
 use objc2::{class, msg_send};
-use std::ffi::c_void;
 
 /// LAPolicy constants.
 const LA_POLICY_DEVICE_OWNER_AUTHENTICATION_WITH_BIOMETRICS: i64 = 1;
@@ -96,107 +95,50 @@ pub fn get_available_biometrics() -> Result<Vec<BiometricType>, String> {
 }
 
 pub fn authenticate(reason: &str) -> Result<AuthResult, String> {
-    unsafe {
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let main: bool = msg_send![class!(NSThread), isMainThread];
+        if main { return Err("Call authenticate from a worker thread".into()); }
+        if reason.trim().is_empty() { return Err("Authentication reason must not be empty".into()); }
         let context = create_la_context();
-        if context.is_null() {
-            return Err("Failed to create LAContext".into());
-        }
-
-        // Check if we can authenticate first
-        let can_evaluate: bool = msg_send![
-            context,
+        if context.is_null() { return Err("Failed to create LAContext".into()); }
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        let can_evaluate: bool = msg_send![context,
             canEvaluatePolicy: LA_POLICY_DEVICE_OWNER_AUTHENTICATION_WITH_BIOMETRICS,
-            error: std::ptr::null_mut::<*mut AnyObject>()
-        ];
-
+            error: &mut error as *mut *mut AnyObject];
         if !can_evaluate {
-            let biometry_type: i64 = msg_send![context, biometryType];
+            let result = auth_result(false, error);
             let _: () = msg_send![context, release];
-            return Ok(if biometry_type == LA_BIOMETRY_TYPE_NONE {
-                AuthResult::ErrorNotAvailable
-            } else {
-                AuthResult::ErrorNotEnrolled
-            });
+            return Ok(result);
         }
-
-        // Create NSString for reason
-        let reason_nsstring: *mut AnyObject = msg_send![class!(NSString), alloc];
-        let reason_bytes = reason.as_bytes();
-        let reason_nsstring: *mut AnyObject = msg_send![
-            reason_nsstring,
-            initWithBytes: reason_bytes.as_ptr() as *const c_void,
-            length: reason_bytes.len(),
-            encoding: 4u64 // NSUTF8StringEncoding
-        ];
-
-        // Use a dispatch semaphore to block until the callback fires
-        let semaphore = dispatch_semaphore_create(0);
-
-        // We need to capture the result from the callback.
-        // Use a Box<std::sync::Mutex<AuthResult>> shared via raw pointer.
-        let result_holder = Box::into_raw(Box::new(std::sync::Mutex::new(AuthResult::ErrorOther)));
-
-        // Create the reply block.
-        // The block signature is: void (^)(BOOL success, NSError *error)
-        let block = block2::RcBlock::new(move |success: Bool, error: *mut AnyObject| {
-            let auth_result = if success.as_bool() {
-                AuthResult::Success
-            } else if error.is_null() {
-                AuthResult::Failed
-            } else {
-                let error_code: i64 = msg_send![error, code];
-                match error_code {
-                    LA_ERROR_AUTHENTICATION_FAILED => AuthResult::Failed,
-                    LA_ERROR_USER_CANCEL => AuthResult::ErrorUserCancelled,
-                    LA_ERROR_SYSTEM_CANCEL => AuthResult::ErrorUserCancelled,
-                    LA_ERROR_PASSCODE_NOT_SET => AuthResult::ErrorPasscodeNotSet,
-                    LA_ERROR_BIOMETRY_NOT_AVAILABLE => AuthResult::ErrorNotAvailable,
-                    LA_ERROR_BIOMETRY_NOT_ENROLLED => AuthResult::ErrorNotEnrolled,
-                    LA_ERROR_BIOMETRY_LOCKOUT => AuthResult::ErrorLockout,
-                    _ => AuthResult::ErrorOther,
-                }
-            };
-
-            // Store the result
-            if let Ok(mut guard) = (*result_holder).lock() {
-                *guard = auth_result;
-            }
-
-            dispatch_semaphore_signal(semaphore);
+        let reason = crate::ios::util::nsstring(reason);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // Native owns its block copy. A late reply owns only its sender, never a
+        // raw Rust allocation or a semaphore released by the waiting thread.
+        let reply = block2::RcBlock::new(move |success: Bool, error: *mut AnyObject| {
+            let _ = sender.send(auth_result(success.as_bool(), error));
         });
-
-        // Call evaluatePolicy:localizedReason:reply:
-        let _: () = msg_send![
-            context,
+        let _: () = msg_send![context,
             evaluatePolicy: LA_POLICY_DEVICE_OWNER_AUTHENTICATION_WITH_BIOMETRICS,
-            localizedReason: reason_nsstring,
-            reply: &*block as *const _ as *const c_void
-        ];
-
-        // Wait for the callback
-        dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-
-        // Read the result
-        let result_box = Box::from_raw(result_holder);
-        let auth_result = result_box
-            .lock()
-            .map(|g| *g)
-            .unwrap_or(AuthResult::ErrorOther);
-
-        let _: () = msg_send![reason_nsstring, release];
+            localizedReason: reason, reply: &*reply];
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(120))
+            .map_err(|_| "Authentication timed out or callback disconnected".to_owned());
+        let _: () = msg_send![context, invalidate];
         let _: () = msg_send![context, release];
-        dispatch_release(semaphore as *mut c_void);
-
-        Ok(auth_result)
-    }
+        result
+    })
 }
 
-// Grand Central Dispatch C functions
-const DISPATCH_TIME_FOREVER: u64 = !0;
-
-extern "C" {
-    fn dispatch_semaphore_create(value: i64) -> *mut AnyObject;
-    fn dispatch_semaphore_signal(dsema: *mut AnyObject) -> i64;
-    fn dispatch_semaphore_wait(dsema: *mut AnyObject, timeout: u64) -> i64;
-    fn dispatch_release(object: *mut c_void);
+unsafe fn auth_result(success: bool, error: *mut AnyObject) -> AuthResult {
+    if success { return AuthResult::Success; }
+    if error.is_null() { return AuthResult::Failed; }
+    let code: i64 = msg_send![error, code];
+    match code {
+        LA_ERROR_AUTHENTICATION_FAILED => AuthResult::Failed,
+        LA_ERROR_USER_CANCEL | LA_ERROR_SYSTEM_CANCEL | -9 => AuthResult::ErrorUserCancelled,
+        LA_ERROR_PASSCODE_NOT_SET => AuthResult::ErrorPasscodeNotSet,
+        LA_ERROR_BIOMETRY_NOT_AVAILABLE => AuthResult::ErrorNotAvailable,
+        LA_ERROR_BIOMETRY_NOT_ENROLLED => AuthResult::ErrorNotEnrolled,
+        LA_ERROR_BIOMETRY_LOCKOUT => AuthResult::ErrorLockout,
+        _ => AuthResult::ErrorOther,
+    }
 }

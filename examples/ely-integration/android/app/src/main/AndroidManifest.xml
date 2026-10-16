@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries><package android:name="com.android.vending" /></queries>
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Foreground location; runtime authorization remains application-owned. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <application android:label="Ely Integration" android:hasCode="true"
+        android:hardwareAccelerated="true" android:theme="@style/GpuiTheme">
+        <meta-data android:name="com.google.android.geo.API_KEY" android:value="${mapsApiKey}" />
+        <service android:name="dev.gpui.mobile.GpuiLocationService"
+            android:exported="false" android:foregroundServiceType="location" />
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.gpui.picker.files"
+            android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/gpui_picker_paths" />
+        </provider>
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.gpui.clipboard.files"
+            android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/gpui_clipboard_paths" />
+        </provider>
+        <activity android:name="dev.gpui.mobile.GpuiNotificationActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity android:name="dev.gpui.mobile.GpuiPickerActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity android:name="dev.gpui.mobile.GpuiPermissionActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity android:name="dev.gpui.mobile.GpuiActivity"
+            android:exported="true" android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density"
+            android:theme="@style/GpuiSplashTheme" android:windowSoftInputMode="adjustResize">
+            <meta-data android:name="android.app.lib_name" android:value="gpui_mobile_ely_integration" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

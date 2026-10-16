@@ -5,8 +5,22 @@ import android.content.Intent;
 import android.net.Uri;
 
 public class GpuiDeepLink {
+    private static boolean captured;
+    private static String initialLink;
 
-    public static String getInitialLink(Activity activity) {
+    /** Call from Activity.onCreate before native startup and before any setIntent replacement. */
+    public static synchronized void captureInitialLink(Activity activity) {
+        if (captured) return;
+        initialLink = readLink(activity);
+        captured = true;
+    }
+
+    public static synchronized String getInitialLink(Activity activity) {
+        if (!captured) throw new IllegalStateException("Host has not captured the initial launch URL");
+        return initialLink;
+    }
+
+    private static String readLink(Activity activity) {
         if (activity == null) return null;
         Intent intent = activity.getIntent();
         if (intent == null) return null;

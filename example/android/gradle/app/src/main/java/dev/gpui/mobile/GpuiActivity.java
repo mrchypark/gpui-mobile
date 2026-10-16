@@ -11,6 +11,8 @@ import android.util.Log;
 import android.view.KeyEvent;
 
 import androidx.core.splashscreen.SplashScreen;
+import dev.gpui.mobile.example.BuildConfig;
+import org.gpui.mobile.ble.Ble;
 
 /**
  * Custom Activity extending NativeActivity that integrates with the
@@ -37,6 +39,7 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        GpuiDeepLink.captureInitialLink(this);
         // Install the splash screen BEFORE calling super.onCreate().
         // This is required by the AndroidX SplashScreen API.
         SplashScreen splash = SplashScreen.installSplashScreen(this);
@@ -61,6 +64,11 @@ public class GpuiActivity extends NativeActivity {
                 // Library may already be loaded by NativeActivity; that's fine.
                 sNativeLibLoaded = true;
             }
+        }
+
+        // Gradle's BLE mode also builds Rust with --features ble before packaging.
+        if (BuildConfig.BLE_ENABLED) {
+            Ble.initialize();
         }
 
         // Keep the splash screen visible until the native side signals readiness.
@@ -126,9 +134,28 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        GpuiLocation.setHostResumed(this, false);
+        GpuiThermal.unregister(this);
+        GpuiSensors.setHostResumed(this, false);
         // Release media session when activity is destroyed.
         GpuiMediaSession.release();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        GpuiLocation.setHostResumed(this, true);
+        GpuiSensors.setHostResumed(this, true);
+        GpuiServiceProbe.resumed(this);
+    }
+
+    @Override
+    protected void onPause() {
+        GpuiServiceProbe.paused();
+        GpuiLocation.setHostResumed(this, false);
+        GpuiSensors.setHostResumed(this, false);
+        super.onPause();
     }
 
     /**

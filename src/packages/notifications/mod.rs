@@ -132,3 +132,7 @@ pub fn cancel_all() -> Result<(), String> {
         Err("notifications are only available on iOS and Android".into())
     }
 }
+
+mod system;
+pub(crate) use system::{show_system_notification, dismiss_system_notification,
+    take_system_notification_responses, poll_system_notification_responses};

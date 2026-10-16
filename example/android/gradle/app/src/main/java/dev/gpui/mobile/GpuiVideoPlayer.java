@@ -33,6 +33,9 @@ public final class GpuiVideoPlayer {
     private static final SparseArray<SurfaceView> sSurfaces = new SparseArray<>();
     private static int sNextId = 1;
     private static final Object sLock = new Object();
+    private static final SparseArray<GpuiMediaLoad> sLoads = new SparseArray<>();
+    private static final SparseArray<Options> sOptions = new SparseArray<>();
+    private static final class Options { float speed = 1, volume = 1; boolean looping; }
 
     /**
      * Create a new MediaPlayer instance.
@@ -46,6 +49,7 @@ public final class GpuiVideoPlayer {
             synchronized (sLock) {
                 int id = sNextId++;
                 sPlayers.put(id, mp);
+                sOptions.put(id, new Options());
                 return id;
             }
         } catch (Exception e) {
@@ -62,269 +66,92 @@ public final class GpuiVideoPlayer {
      * @param url      URL to play.
      * @return "duration|width|height" on success, or null on failure.
      */
-    public static String setUrl(Activity activity, int id, String url) {
+    public static String setUrl(Activity activity, int id, String url) { return load(activity, id, url, false); }
+    public static String setFilePath(Activity activity, int id, String path) { return load(activity, id, path, true); }
+
+    private static String load(Activity activity, int id, String source, boolean file) {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            throw new IllegalStateException("Load media from a worker thread");
+        }
+        GpuiMediaLoad load = new GpuiMediaLoad();
         MediaPlayer mp;
         synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return null;
-
-        try {
-            mp.reset();
-            // Use the String overload for http/https URLs to avoid
-            // ContentResolver trying to resolve them as content:// URIs.
-            Uri uri = Uri.parse(url);
-            String scheme = uri.getScheme();
-            if ("http".equals(scheme) || "https".equals(scheme)) {
-                mp.setDataSource(url);
-            } else {
-                mp.setDataSource(activity, uri);
+            mp = requirePlayer(id);
+            sLoads.put(id, load);
+            try {
+                mp.reset();
+                mp.setOnPreparedListener(player -> load.complete(null));
+                mp.setOnErrorListener((player, what, extra) -> {
+                    load.complete(new IllegalStateException("Video error " + what + "/" + extra)); return true;
+                });
+                Uri uri = Uri.parse(source);
+                String scheme = uri.getScheme();
+                if (file || "http".equals(scheme) || "https".equals(scheme)) mp.setDataSource(source);
+                else mp.setDataSource(activity, uri);
+                mp.prepareAsync();
+            } catch (Exception error) {
+                sLoads.remove(id);
+                throw new IllegalStateException("Video preparation failed", error);
             }
-            mp.prepare();
-            return mp.getDuration() + "|" + mp.getVideoWidth() + "|" + mp.getVideoHeight();
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "setUrl failed", e);
-            return null;
         }
-    }
-
-    /**
-     * Set a file path as the data source and prepare synchronously.
-     *
-     * @param activity The current Activity.
-     * @param id       Player ID.
-     * @param path     File path to play.
-     * @return "duration|width|height" on success, or null on failure.
-     */
-    public static String setFilePath(Activity activity, int id, String path) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return null;
-
         try {
-            mp.reset();
-            mp.setDataSource(path);
-            mp.prepare();
-            return mp.getDuration() + "|" + mp.getVideoWidth() + "|" + mp.getVideoHeight();
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "setFilePath failed", e);
-            return null;
+            load.await(); // No registry/native-operation lock while waiting for the UI callback.
+            synchronized (sLock) {
+                if (sPlayers.get(id) != mp || sLoads.get(id) != load) throw new IllegalStateException("Video load cancelled");
+                Options options = sOptions.get(id);
+                mp.setLooping(options.looping);
+                mp.setVolume(options.volume, options.volume);
+                return mp.getDuration() + "|" + mp.getVideoWidth() + "|" + mp.getVideoHeight();
+            }
+        } catch (RuntimeException error) {
+            synchronized (sLock) { if (sPlayers.get(id) == mp) mp.reset(); }
+            throw error;
+        } finally {
+            synchronized (sLock) { if (sLoads.get(id) == load) sLoads.remove(id); }
         }
     }
 
-    /**
-     * Start or resume playback.
-     */
+    private interface Operation<T> { T run(MediaPlayer player); }
+    private static MediaPlayer requirePlayer(int id) {
+        MediaPlayer player = sPlayers.get(id);
+        if (player == null) throw new IllegalStateException("Video player not found");
+        if (sLoads.get(id) != null) throw new IllegalStateException("Video source is loading");
+        return player;
+    }
+    private static <T> T withPlayer(int id, Operation<T> operation) {
+        synchronized (sLock) { return operation.run(requirePlayer(id)); }
+    }
     public static void play(int id) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                mp.start();
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "play failed", e);
-            }
-        }
+        withPlayer(id, mp -> {
+            mp.setPlaybackParams(new PlaybackParams().allowDefaults().setSpeed(sOptions.get(id).speed));
+            mp.start(); return null;
+        });
     }
-
-    /**
-     * Pause playback.
-     */
-    public static void pause(int id) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                mp.pause();
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "pause failed", e);
-            }
-        }
-    }
-
-    /**
-     * Seek to a position in milliseconds.
-     */
+    public static void pause(int id) { withPlayer(id, mp -> { if (mp.isPlaying()) mp.pause(); return null; }); }
     public static void seek(int id, long ms) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    mp.seekTo(ms, MediaPlayer.SEEK_CLOSEST);
-                } else {
-                    mp.seekTo((int) ms);
-                }
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "seek failed", e);
-            }
-        }
+        if (ms < 0) throw new IllegalArgumentException("Negative seek");
+        withPlayer(id, mp -> { mp.seekTo(ms, MediaPlayer.SEEK_CLOSEST); return null; });
     }
-
-    /**
-     * Set volume (0.0 to 1.0).
-     */
     public static void setVolume(int id, float volume) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                mp.setVolume(volume, volume);
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "setVolume failed", e);
-            }
-        }
+        if (!Float.isFinite(volume) || volume < 0 || volume > 1) throw new IllegalArgumentException("Invalid volume");
+        withPlayer(id, mp -> { mp.setVolume(volume, volume); sOptions.get(id).volume = volume; return null; });
     }
-
-    /**
-     * Set playback speed.
-     */
     public static void setSpeed(int id, float speed) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    PlaybackParams params = mp.getPlaybackParams();
-                    params.setSpeed(speed);
-                    mp.setPlaybackParams(params);
-                }
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "setSpeed failed", e);
-            }
-        }
+        if (!Float.isFinite(speed) || speed <= 0) throw new IllegalArgumentException("Invalid speed");
+        withPlayer(id, mp -> {
+            if (mp.isPlaying()) mp.setPlaybackParams(new PlaybackParams().allowDefaults().setSpeed(speed));
+            sOptions.get(id).speed = speed; return null;
+        });
     }
-
-    /**
-     * Enable or disable looping.
-     */
     public static void setLooping(int id, boolean looping) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                mp.setLooping(looping);
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "setLooping failed", e);
-            }
-        }
+        withPlayer(id, mp -> { mp.setLooping(looping); sOptions.get(id).looping = looping; return null; });
     }
+    public static long getPosition(int id) { return withPlayer(id, mp -> (long)mp.getCurrentPosition()); }
+    public static long getDuration(int id) { return withPlayer(id, mp -> (long)mp.getDuration()); }
+    public static int getWidth(int id) { return withPlayer(id, MediaPlayer::getVideoWidth); }
+    public static int getHeight(int id) { return withPlayer(id, MediaPlayer::getVideoHeight); }
+    public static boolean isPlaying(int id) { return withPlayer(id, MediaPlayer::isPlaying); }
 
-    /**
-     * Get current playback position in milliseconds.
-     */
-    public static long getPosition(int id) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                return mp.getCurrentPosition();
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "getPosition failed", e);
-            }
-        }
-        return 0;
-    }
-
-    /**
-     * Get total duration in milliseconds.
-     */
-    public static long getDuration(int id) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                return mp.getDuration();
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "getDuration failed", e);
-            }
-        }
-        return 0;
-    }
-
-    /**
-     * Get video width in pixels.
-     */
-    public static int getWidth(int id) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                return mp.getVideoWidth();
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "getWidth failed", e);
-            }
-        }
-        return 0;
-    }
-
-    /**
-     * Get video height in pixels.
-     */
-    public static int getHeight(int id) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                return mp.getVideoHeight();
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "getHeight failed", e);
-            }
-        }
-        return 0;
-    }
-
-    /**
-     * Check if the player is currently playing.
-     */
-    public static boolean isPlaying(int id) {
-        MediaPlayer mp;
-        synchronized (sLock) {
-            mp = sPlayers.get(id);
-        }
-        if (mp != null) {
-            try {
-                return mp.isPlaying();
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "isPlaying failed", e);
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Show a native SurfaceView at the given position and size (in px).
-     * The MediaPlayer renders video frames to this surface.
-     *
-     * @param activity The current Activity.
-     * @param id       Player ID.
-     * @param x        Left position in pixels.
-     * @param y        Top position in pixels.
-     * @param width    Width in pixels.
-     * @param height   Height in pixels.
-     */
     public static void showSurface(Activity activity, int id, int x, int y, int width, int height) {
         MediaPlayer mp;
         synchronized (sLock) {
@@ -350,13 +177,18 @@ public final class GpuiVideoPlayer {
                 activity.addContentView(sv, params);
 
                 synchronized (sLock) {
+                    if (sPlayers.get(id) != fmp) {
+                        ((ViewGroup)sv.getParent()).removeView(sv);
+                        latch.countDown();
+                        return;
+                    }
                     sSurfaces.put(id, sv);
                 }
 
                 sv.getHolder().addCallback(new SurfaceHolder.Callback() {
                     @Override
                     public void surfaceCreated(SurfaceHolder holder) {
-                        attachSurfaceToPlayer(fmp, holder.getSurface());
+                        updateSurface(id, fmp, sv, holder.getSurface());
                         latch.countDown();
                     }
 
@@ -365,15 +197,13 @@ public final class GpuiVideoPlayer {
 
                     @Override
                     public void surfaceDestroyed(SurfaceHolder holder) {
-                        try {
-                            fmp.setSurface(null);
-                        } catch (Exception ignored) {}
+                        updateSurface(id, fmp, sv, null);
                     }
                 });
 
                 // If surface is already valid
                 if (sv.getHolder().getSurface().isValid()) {
-                    attachSurfaceToPlayer(fmp, sv.getHolder().getSurface());
+                    updateSurface(id, fmp, sv, sv.getHolder().getSurface());
                     latch.countDown();
                 }
             } catch (Exception e) {
@@ -410,13 +240,17 @@ public final class GpuiVideoPlayer {
         SurfaceView sv;
         synchronized (sLock) {
             sv = sSurfaces.get(id);
+            MediaPlayer player = sPlayers.get(id);
+            if (sv != null && player != null) updateSurface(id, player, sv, null);
             sSurfaces.remove(id);
         }
         if (sv != null) {
-            ViewGroup parent = (ViewGroup) sv.getParent();
-            if (parent != null) {
-                parent.removeView(sv);
-            }
+            Runnable remove = () -> {
+                ViewGroup parent = (ViewGroup) sv.getParent();
+                if (parent != null) parent.removeView(sv);
+            };
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) remove.run();
+            else new android.os.Handler(android.os.Looper.getMainLooper()).post(remove);
         }
     }
 
@@ -424,14 +258,16 @@ public final class GpuiVideoPlayer {
      * Release and remove the player.
      */
     public static void dispose(int id) {
-        // Remove surface first
-        hideSurfaceInternal(id);
-
         MediaPlayer mp;
         synchronized (sLock) {
+            // No new surface can register between removal and player release.
+            hideSurfaceInternal(id);
             mp = sPlayers.get(id);
             sPlayers.remove(id);
-        }
+            sOptions.remove(id);
+            GpuiMediaLoad load = sLoads.get(id);
+            sLoads.remove(id);
+            if (load != null) load.complete(new IllegalStateException("Video player disposed during load"));
         if (mp != null) {
             try {
                 mp.setSurface(null);
@@ -445,6 +281,7 @@ public final class GpuiVideoPlayer {
                 mp.release();
             } catch (Exception ignored) {
             }
+        }
         }
     }
 
@@ -478,11 +315,16 @@ public final class GpuiVideoPlayer {
         // Render above NativeActivity's own SurfaceView.
         sv.setZOrderOnTop(true);
 
+        synchronized (sLock) {
+            if (sPlayers.get(id) != fmp) return new FrameLayout(activity);
+            sSurfaces.put(id, sv);
+        }
+
         sv.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
                 android.util.Log.i(TAG, "createVideoSurface: surfaceCreated for player " + id);
-                attachSurfaceToPlayer(fmp, holder.getSurface());
+                updateSurface(id, fmp, sv, holder.getSurface());
             }
 
             @Override
@@ -493,20 +335,13 @@ public final class GpuiVideoPlayer {
             @Override
             public void surfaceDestroyed(SurfaceHolder holder) {
                 android.util.Log.i(TAG, "createVideoSurface: surfaceDestroyed for player " + id);
-                try {
-                    fmp.setSurface(null);
-                } catch (Exception ignored) {}
+                updateSurface(id, fmp, sv, null);
             }
         });
 
         // If surface is already valid (shouldn't happen before layout, but be safe)
         if (sv.getHolder().getSurface().isValid()) {
-            attachSurfaceToPlayer(fmp, sv.getHolder().getSurface());
-        }
-
-        // Track this surface
-        synchronized (sLock) {
-            sSurfaces.put(id, sv);
+            updateSurface(id, fmp, sv, sv.getHolder().getSurface());
         }
 
         android.util.Log.i(TAG, "createVideoSurface: SurfaceView created for player " + id);
@@ -518,9 +353,20 @@ public final class GpuiVideoPlayer {
      * to render. Without the re-seek, frames decoded before the surface was
      * attached are discarded and the view stays black.
      */
-    private static void attachSurfaceToPlayer(MediaPlayer mp, Surface surface) {
+    static boolean ownsSurface(Object registeredPlayer, Object expectedPlayer,
+            Object registeredSurface, Object expectedSurface) {
+        return expectedPlayer != null && expectedSurface != null
+            && registeredPlayer == expectedPlayer && registeredSurface == expectedSurface;
+    }
+
+    private static void updateSurface(int id, MediaPlayer mp, SurfaceView owner, Surface surface) {
+        synchronized (sLock) {
+        if (!ownsSurface(sPlayers.get(id), mp, sSurfaces.get(id), owner)) return;
         try {
             mp.setSurface(surface);
+            // Loading/reset and disposal use this same mutex. Do not seek a
+            // player while its asynchronous preparation is still in flight.
+            if (surface == null || sLoads.get(id) != null) return;
             android.util.Log.i(TAG, "attachSurfaceToPlayer: surface attached, isPlaying=" + mp.isPlaying()
                     + " pos=" + mp.getCurrentPosition() + " dur=" + mp.getDuration()
                     + " w=" + mp.getVideoWidth() + " h=" + mp.getVideoHeight());
@@ -534,6 +380,7 @@ public final class GpuiVideoPlayer {
             }
         } catch (Exception e) {
             android.util.Log.e(TAG, "attachSurfaceToPlayer failed", e);
+        }
         }
     }
 

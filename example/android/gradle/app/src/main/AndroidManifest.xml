@@ -20,13 +20,27 @@
       immersive experience.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries><package android:name="com.android.vending" /></queries>
 
     <!-- Network / connectivity permissions -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
+    <!-- Foreground location; runtime authorization remains application-owned. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
     <!-- Vibration permission -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- Notification permission (required on Android 13+ / API 33+) -->
@@ -47,6 +61,13 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+
+    <!-- Existing permission_handler Settings branches; these do not grant or request access. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
 
     <!-- Camera feature (optional — app works without camera) -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -86,6 +107,28 @@
         android:supportsRtl="true"
         android:theme="@style/GpuiTheme"
     >
+
+        <meta-data android:name="com.google.android.geo.API_KEY" android:value="${mapsApiKey}" />
+        <service android:name="dev.gpui.mobile.GpuiLocationService"
+            android:exported="false" android:foregroundServiceType="location" />
+        <service android:name="org.gpui.mobile.ble.BleConnectionService"
+            android:exported="false" android:foregroundServiceType="connectedDevice" />
+
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.gpui.picker.files"
+            android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/gpui_picker_paths" />
+        </provider>
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.gpui.clipboard.files"
+            android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/gpui_clipboard_paths" />
+        </provider>
+        <activity android:name="dev.gpui.mobile.GpuiNotificationActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <!--
           GpuiActivity extends NativeActivity and integrates the AndroidX
