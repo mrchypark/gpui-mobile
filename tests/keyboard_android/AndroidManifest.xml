@@ -1,0 +1,7 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.gpui.mobile.keyboardregression">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+    <application android:theme="@android:style/Theme.Material.Light.NoActionBar" android:extractNativeLibs="true">
+        <activity android:name="dev.gpui.mobile.KeyboardRegression$Host" android:exported="false" />
+    </application>
+    <instrumentation android:name="dev.gpui.mobile.KeyboardRegression" android:targetPackage="dev.gpui.mobile.keyboardregression" />
+</manifest>

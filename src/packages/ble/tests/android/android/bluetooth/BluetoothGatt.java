@@ -7,9 +7,13 @@ public class BluetoothGatt {
     public BluetoothGattDescriptor descriptor;
     public boolean enabled;
     public int closeCount;
+    public boolean closeDenied;
     public int disconnectCount;
     public void disconnect() { disconnectCount++; }
-    public void close() { closeCount++; }
+    public void close() {
+        closeCount++;
+        if (closeDenied) throw new SecurityException("test permission revoked");
+    }
     public List<BluetoothGattService> getServices() { return services; }
     public BluetoothGattService getService(UUID id) { return services.stream().filter(s -> s.getUuid().equals(id)).findFirst().orElse(null); }
     public boolean readCharacteristic(BluetoothGattCharacteristic c) { read = c; return true; }

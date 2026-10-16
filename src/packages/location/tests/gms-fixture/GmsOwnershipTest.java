@@ -83,6 +83,56 @@ public final class GmsOwnershipTest implements GpuiGmsLocation.Listener {
         LocationServices.client.callback.onLocationResult(new LocationResult(1));check(t.fixes.isEmpty());
         LocationServices.client.removals.get(1).finish(null);
         check(!GpuiGmsLocation.cleanupPending()&&t.closed==1);
+        // Production replacement admission runs before Rust's queued old-token
+        // stop. It must retire the predecessor now, not wait for that stop.
+        java.lang.reflect.Method prepare=host.getDeclaredMethod("prepareStart",long.class,long.class);prepare.setAccessible(true);
+        t=create(true);LocationServices.settings.task.finish(null);LocationServices.client.registration.finish(null);
+        s=constructor.newInstance(new android.app.Activity(),78L,3,0.0,false,false);
+        gms.set(s,t.owner);map.put(78L,s);
+        check(!(boolean)prepare.invoke(null,79L,78L));
+        check(GpuiGmsLocation.RETIRED.containsKey(t.owner)&&LocationServices.client.starts==1);
+        LocationServices.client.callback.onLocationResult(new LocationResult(9));check(t.fixes.isEmpty());
+        LocationServices.client.removals.get(0).finish(new RuntimeException());
+        check(!(boolean)prepare.invoke(null,79L,78L));
+        check(LocationServices.client.starts==1&&LocationServices.client.removals.size()==2);
+        LocationServices.client.removals.get(1).finish(null);
+        // Production Listener.closed clears Subscription.gms; this fixture's
+        // listener counts calls instead, so mirror that boundary explicitly.
+        gms.set(s,null);
+        check((boolean)prepare.invoke(null,79L,78L));
+        check(!GpuiGmsLocation.cleanupPending()&&t.closed==1);
+        map.remove(78L);
+        android.os.Handler.delayed.clear();
+        // A platform-only predecessor does not get stopped/release its FGS
+        // lease before replacement admission. Rust's subsequent Drop does that.
+        s=constructor.newInstance(new android.app.Activity(),80L,3,0.0,false,false);
+        map.put(80L,s);
+        check((boolean)prepare.invoke(null,81L,80L)&&map.containsKey(80L));map.remove(80L);
+        java.lang.reflect.Method changed=subscription.getDeclaredMethod("onLocationChanged",Location.class);changed.setAccessible(true);
+        java.lang.reflect.Method power=subscription.getDeclaredMethod("logPowerState",String.class);power.setAccessible(true);
+        java.lang.reflect.Field lastFix=subscription.getDeclaredField("lastFix");lastFix.setAccessible(true);
+        for (boolean debug : new boolean[]{false,true}) {
+            android.content.pm.ApplicationInfo.testFlags=debug ? android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE : 0;
+            s=constructor.newInstance(new android.app.Activity(),82L,3,0.0,false,false);
+            android.util.Log.messages.clear();
+            power.invoke(s,"test");
+            boolean nativeBoundary=false;
+            try { changed.invoke(s,new Location(101)); }
+            catch (java.lang.reflect.InvocationTargetException error) {
+                // No native library is loaded: reaching the real JNI event call
+                // is the boundary assertion, not a claim of Rust/device delivery.
+                if (!(error.getCause() instanceof UnsatisfiedLinkError)) throw error;
+                nativeBoundary=true;
+            }
+            check(nativeBoundary&&lastFix.getLong(s)==101);
+            check(android.util.Log.messages.stream().anyMatch(m->m.startsWith("live_fix "))==debug);
+            check(android.util.Log.messages.stream().anyMatch(m->m.startsWith("power_state "))==debug);
+            check(android.util.Log.messages.stream().anyMatch(m->m.startsWith("callback_entry "))==debug);
+            if (!debug) check(android.util.Log.messages.isEmpty());
+        }
+        android.content.pm.ApplicationInfo.testFlags=0;
         System.out.println("PASS production GMS adapter: pending settings/registration cancel, both completion orders, early callback, ordered batch, coarse/settings/security, cleanup retry");
+        System.out.println("PASS replacement admission: pending/failed predecessor removal blocks new token; platform handoff preserved");
+        System.out.println("PASS debug/release diagnostics: accepted fix reaches JNI boundary in both modes; release suppresses per-fix/power logs");
     }
 }

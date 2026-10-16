@@ -49,7 +49,7 @@ pub fn get_last_known_position() -> Result<Option<Position>, String> {
         super::stream::parse_position(&helpers::get_string(env, &value)).map(Some)
     })
 }
-pub(super) fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms: u64, background: bool) -> Result<(), String> {
+pub(super) fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms: u64, background: bool, previous: u64) -> Result<(), String> {
     let accuracy = match settings.accuracy {
         LocationAccuracy::Lowest => 0,
         LocationAccuracy::Low => 1,
@@ -64,7 +64,7 @@ pub(super) fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms
         env.call_static_method(
             &cls,
             jni::jni_str!("start"),
-            jni::jni_sig!("(Landroid/app/Activity;JIDZJZ)V"),
+            jni::jni_sig!("(Landroid/app/Activity;JIDZJZJ)V"),
             &[
                 JValue::Object(&activity),
                 JValue::Long(id as i64),
@@ -73,6 +73,7 @@ pub(super) fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms
                 JValue::Bool(once),
                 JValue::Long(timeout_ms as i64),
                 JValue::Bool(background),
+                JValue::Long(previous as i64),
             ],
         )
         .map(|_| ())

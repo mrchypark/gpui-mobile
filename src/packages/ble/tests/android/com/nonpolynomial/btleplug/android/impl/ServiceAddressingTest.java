@@ -120,7 +120,27 @@ public class ServiceAddressingTest {
         result(p.disconnect());
         callback.onConnectionStateChange(fresh, 0, 0);
         check(connectionEvents.size() == 6); // ordinary close plus late callback emits exactly once
-        System.out.println("PASS service addressing, idle cleanup, stalled FIFO abort and fresh-client recovery");
+        check(java.lang.reflect.Modifier.isSynchronized(
+                Peripheral.class.getMethod("isConnected").getModifiers()));
+        BluetoothGatt denied = new BluetoothGatt(); denied.closeDenied = true;
+        synchronized (p) { set(p, "gatt", denied); set(p, "connected", true); }
+        java.util.concurrent.ExecutorService callbackThread = java.util.concurrent.Executors.newSingleThreadExecutor();
+        java.util.concurrent.ExecutorService readerThread = java.util.concurrent.Executors.newSingleThreadExecutor();
+        try {
+            check(readerThread.submit(() -> p.isConnected()).get());
+            callbackThread.submit(() -> callback.onConnectionStateChange(denied, 0, 0)).get();
+            check(!readerThread.submit(() -> p.isConnected()).get());
+            check(denied.closeCount == 1 && get(p, "gatt") == null);
+            check(connectionEvents.size() == 7 && !connectionEvents.get(6));
+            callback.onConnectionStateChange(denied, 0, 0);
+            result(p.disconnect());
+            check(denied.closeCount == 1 && connectionEvents.size() == 7);
+        } finally {
+            callbackThread.shutdownNow(); readerThread.shutdownNow();
+            check(callbackThread.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS));
+            check(readerThread.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS));
+        }
+        System.out.println("PASS service addressing, idle close failure retirement, synchronized connection snapshot, stalled FIFO abort and fresh-client recovery");
     }
     static void interrupted(Object future) throws Exception {
         try { result(future); throw new AssertionError("pending operation not interrupted"); }

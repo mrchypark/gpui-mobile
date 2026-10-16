@@ -12,6 +12,9 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+        manifestPlaceholders["mapsApiKey"] = providers.gradleProperty("mapsApiKey")
+            .orElse(providers.environmentVariable("MAPS_API_KEY"))
+            .getOrElse("")
         buildConfigField("boolean", "BLE_ENABLED", "false")
         ndk { abiFilters += "arm64-v8a" }
     }
@@ -29,6 +32,9 @@ android {
     packaging.jniLibs.keepDebugSymbols += "**/libgpui_mobile_ely_integration.so"
 }
 dependencies {
+    implementation("com.google.android.gms:play-services-location:21.4.0")
+    implementation("com.google.android.gms:play-services-maps:20.0.0")
+    implementation("com.google.android.play:review:2.0.2")
     implementation("androidx.core:core:1.12.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
     implementation("androidx.biometric:biometric:1.1.0")
