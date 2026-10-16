@@ -36,6 +36,13 @@ pub fn platform_view_element(handle: Arc<PlatformViewHandle>) -> gpui::Div {
             move |bounds, _window, _cx| bounds,
             // Paint: synchronize native view position
             move |_bounds, prepaint_bounds, _window, _cx| {
+                #[cfg(target_os = "ios")]
+                if let Err(error) =
+                    crate::ios::platform_view::attach_to_paint_window(handle.id(), _window)
+                {
+                    log::error!("Platform view attachment failed: {error}");
+                    return;
+                }
                 let logical_bounds = PlatformViewBounds {
                     x: prepaint_bounds.origin.x.as_f32(),
                     y: prepaint_bounds.origin.y.as_f32(),

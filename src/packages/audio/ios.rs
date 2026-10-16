@@ -6,10 +6,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
+#[path = "ios_loop.rs"]
+mod ios_loop;
+
 /// Tracks whether each player was explicitly started (to distinguish Paused from Ready).
 struct PlayerEntry {
     player: *mut AnyObject,
     started: bool,
+    speed: f32,
+    looping: bool,
+    loops: ios_loop::Looping,
 }
 
 unsafe impl Send for PlayerEntry {}
@@ -45,6 +51,9 @@ pub fn create() -> Result<u32, String> {
             PlayerEntry {
                 player: std::ptr::null_mut(),
                 started: false,
+                speed: 1.0,
+                looping: false,
+                loops: Default::default(),
             },
         );
     });
@@ -64,29 +73,32 @@ pub fn set_url(id: u32, url: &str) -> Result<Option<u64>, String> {
         }
 
         // Create or replace AVPlayer
-        let player = with_player(id, |entry| {
+        let duration = with_player(id, |entry| {
+            entry.loops.clear();
+            entry.started = false;
             if !entry.player.is_null() {
                 // Replace the current item
+                let _: () = msg_send![entry.player, removeAllItems];
                 let _: () = msg_send![entry.player, replaceCurrentItemWithPlayerItem: player_item];
-                Ok(entry.player)
             } else {
                 let p: *mut AnyObject =
-                    msg_send![class!(AVPlayer), playerWithPlayerItem: player_item];
+                    msg_send![class!(AVQueuePlayer), playerWithPlayerItem: player_item];
                 if p.is_null() {
                     return Err("Failed to create AVPlayer".into());
                 }
                 // playerWithPlayerItem: returns an autoreleased object; retain it
                 // since it will be stored across run-loop iterations.
-                let _: () = msg_send![p, retain];
+                let _: *mut AnyObject = msg_send![p, retain];
                 entry.player = p;
                 entry.started = false;
-                Ok(p)
             }
+            let _: () = msg_send![entry.player, setActionAtItemEnd: 1isize];
+            if entry.looping { entry.loops.configure(entry.player, true)?; }
+            Ok(get_duration_from_player(entry.player))
         })?;
 
         // Try to get the duration. AVPlayerItem may need time to load,
         // so the duration might not be available immediately.
-        let duration = get_duration_from_player(player);
         Ok(if duration > 0 { Some(duration) } else { None })
     }
 }
@@ -106,26 +118,29 @@ pub fn set_file_path(id: u32, path: &str) -> Result<Option<u64>, String> {
             return Err("Failed to create AVPlayerItem".into());
         }
 
-        let player = with_player(id, |entry| {
+        let duration = with_player(id, |entry| {
+            entry.loops.clear();
+            entry.started = false;
             if !entry.player.is_null() {
+                let _: () = msg_send![entry.player, removeAllItems];
                 let _: () = msg_send![entry.player, replaceCurrentItemWithPlayerItem: player_item];
-                Ok(entry.player)
             } else {
                 let p: *mut AnyObject =
-                    msg_send![class!(AVPlayer), playerWithPlayerItem: player_item];
+                    msg_send![class!(AVQueuePlayer), playerWithPlayerItem: player_item];
                 if p.is_null() {
                     return Err("Failed to create AVPlayer".into());
                 }
                 // playerWithPlayerItem: returns an autoreleased object; retain it
                 // since it will be stored across run-loop iterations.
-                let _: () = msg_send![p, retain];
+                let _: *mut AnyObject = msg_send![p, retain];
                 entry.player = p;
                 entry.started = false;
-                Ok(p)
             }
+            let _: () = msg_send![entry.player, setActionAtItemEnd: 1isize];
+            if entry.looping { entry.loops.configure(entry.player, true)?; }
+            Ok(get_duration_from_player(entry.player))
         })?;
 
-        let duration = get_duration_from_player(player);
         Ok(if duration > 0 { Some(duration) } else { None })
     }
 }
@@ -136,7 +151,8 @@ pub fn play(id: u32) -> Result<(), String> {
             return Err("No audio source set".into());
         }
         unsafe {
-            let _: () = msg_send![entry.player, play];
+            ios_loop::require_playable(entry.player)?;
+            let _: () = msg_send![entry.player, setRate: entry.speed];
         }
         entry.started = true;
         Ok(())
@@ -202,41 +218,23 @@ pub fn set_speed(id: u32, speed: f32) -> Result<(), String> {
             return Err("No audio source set".into());
         }
         unsafe {
-            let _: () = msg_send![entry.player, setRate: speed];
+            let rate: f32 = msg_send![entry.player, rate];
+            entry.speed = speed;
+            if rate != 0.0 { let _: () = msg_send![entry.player, setRate: speed]; }
         }
         Ok(())
     })
 }
 
 pub fn set_loop_mode(id: u32, mode: LoopMode) -> Result<(), String> {
-    with_player(id, |entry| {
-        if entry.player.is_null() {
-            return Err("No audio source set".into());
-        }
-        unsafe {
-            // AVPlayer does not have a built-in loop property.
-            // For looping, we set actionAtItemEnd to .none so it doesn't
-            // advance, then rely on the caller to observe completion if needed.
-            // AVPlayerActionAtItemEnd: .none = 2, .pause = 1
-            let action: i64 = match mode {
-                LoopMode::Off => 1,                 // AVPlayerActionAtItemEndPause
-                LoopMode::One | LoopMode::All => 0, // AVPlayerActionAtItemEndNone — we'll handle seek-to-start
-            };
-            let _: () = msg_send![entry.player, setActionAtItemEnd: action];
-
-            // For LoopMode::One, set up a boundary time observer to seek back.
-            // Since we cannot easily manage observers with raw objc, we use a
-            // simpler approach: set numberOfLoops on the current item if it's
-            // an AVPlayerLooper-compatible scenario. For basic looping we rely
-            // on actionAtItemEnd = none and the player naturally looping.
-            // In practice, full looping requires AVPlayerLooper (iOS 10+) or
-            // an NSNotification observer. For simplicity with the raw objc
-            // bridge, we set actionAtItemEnd and document the limitation.
-        }
+    with_player(id, |entry| unsafe {
+        if entry.player.is_null() { return Err("No audio source set".into()); }
+        let enabled = mode != LoopMode::Off;
+        entry.loops.configure(entry.player, enabled)?;
+        entry.looping = enabled;
         Ok(())
     })
 }
-
 pub fn get_position(id: u32) -> Result<u64, String> {
     with_player(id, |entry| {
         if entry.player.is_null() {
@@ -280,6 +278,13 @@ pub fn get_state(id: u32) -> Result<PlayerState, String> {
             return Ok(PlayerState::Idle);
         }
         unsafe {
+            let item: *mut AnyObject = msg_send![entry.player, currentItem];
+            if item.is_null() { return Ok(PlayerState::Idle); }
+            let status: isize = msg_send![item, status];
+            if status == 0 { return Ok(PlayerState::Loading); }
+            if status == 2 { return Err("Native audio item failed".into()); }
+            let control: isize = msg_send![entry.player, timeControlStatus];
+            if control == 1 { return Ok(PlayerState::Loading); }
             let rate: f32 = msg_send![entry.player, rate];
             if rate > 0.0 {
                 return Ok(PlayerState::Playing);
@@ -305,10 +310,12 @@ pub fn get_state(id: u32) -> Result<PlayerState, String> {
 
 pub fn dispose(id: u32) -> Result<(), String> {
     with_players(|map| {
-        if let Some(entry) = map.remove(&id) {
+        if let Some(mut entry) = map.remove(&id) {
             if !entry.player.is_null() {
                 unsafe {
                     let _: () = msg_send![entry.player, pause];
+                    entry.loops.clear();
+                    let _: () = msg_send![entry.player, release];
                 }
             }
         }
@@ -330,7 +337,7 @@ struct CMTime {
 
 unsafe impl Encode for CMTime {
     const ENCODING: Encoding = Encoding::Struct(
-        "CMTime",
+        "?",
         &[
             Encoding::LongLong,
             Encoding::Int,
@@ -360,10 +367,11 @@ fn cmtime_to_ms(time: CMTime) -> i64 {
         return 0;
     }
     // kCMTimeFlags_PositiveInfinity = 4, kCMTimeFlags_NegativeInfinity = 8
-    if time.flags & (4 | 8) != 0 {
+    if time.flags & (4 | 8 | 16) != 0 {
         return 0;
     }
-    (time.value * 1000) / time.timescale as i64
+    ((time.value as i128 * 1000) / time.timescale as i128)
+        .clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 // ── ObjC string/URL helpers ─────────────────────────────────────────────────

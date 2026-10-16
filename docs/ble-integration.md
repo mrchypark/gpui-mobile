@@ -34,7 +34,8 @@ Android wiring is implemented in the example:
   request SCAN/CONNECT at runtime on API 31+, or fine location on API <=30.
   Location permission setup is described in [Location service integration](location-service-integration.md).
 - `src/packages/ble/java` is compiled in both modes; the upstream Java sources
-  are included only in BLE mode. No third-party source is vendored into Git.
+  are included only in BLE mode. The pinned patched backend is checked in under
+  `src/packages/ble/vendor`; preparation must preserve its matching Java ABI.
 
 ## Backend selection and boundaries
 
@@ -106,8 +107,8 @@ permission/radio recovers. Native operation timeouts bound waiting, not OS work.
   `neverForLocation` is deliberately not asserted for the map app: it may filter
   beacon results and is inappropriate without a product-level guarantee.
   No BLE foreground service/background scan/restart-on-boot is implemented.
-- btleplug 0.13.5 Android `ScanCallback` does not forward `onScanFailed`; use an
-  application discovery deadline and report absence/timeout, not scan success.
+- The local Android bridge forwards `onScanFailed` through `scan_errors()`.
+  `scan_for` consumes it alongside events and returns failure, not empty success.
   Some native permission exceptions are `RuntimeError`, not `PermissionDenied`;
   do not determine Android permission state solely by matching the Rust error.
 - Adapter event/notification channels in the dependency are bounded and can drop
@@ -217,3 +218,149 @@ APK signature verification passed. The preserved APK is
 See [compatibility](compatibility.md) for full build commands and evidence paths.
 `adb devices -l` returned no connected targets. No APK installation, Android
 execution, or physical BLE transaction is claimed.
+
+## Current convenience and background contract (2026-10-16)
+
+This section supersedes the historical foreground-only/background-not-implemented
+statements above. Existing API signatures remain available; no dependency pins changed.
+
+- `scan_for(ScanOptions)` subscribes before starting, scans for a finite 1ns–300s
+  window, and attempts stop on both success and error. The operation has separate
+  native start/stop deadlines, so total wall time can exceed the collection window.
+  Results are deduplicated by native ID and refreshed on advertisements/RSSI changes.
+  Service filters are ORed; case-sensitive name-prefix and minimum-RSSI filters
+  are ANDed. Missing required metadata does not match. At most `max_devices`
+  entries (1–4096, default256) are retained. A normal zero-result scan is not peer
+  evidence. Native scan errors, stream closure and radio loss are errors.
+- `connect_and_discover` attempts disconnect on preparation failure and reports
+  cleanup failure alongside the original error. Cancellation still requires
+  explicit `close`; native work is not canceled merely by dropping a future.
+- `characteristic_by_uuid` requires canonical full service AND characteristic UUID
+  strings. `subscribe_values` opens the stream before CCCD subscription and filters
+  both UUIDs. Drop of the stream is not unsubscribe; call `unsubscribe` or `close`.
+  Existing native property/capability validation and service addressing remain.
+- `Ble::Drop` schedules bounded stop/disconnect on its creating Tokio runtime,
+  without blocking UI or creating a second runtime. This is best-effort only:
+  runtime shutdown can cancel the task. Cleanup failures emit fixed diagnostic
+  text without peer information. Await `close` for observable native cleanup.
+
+### Explicit background connection opt-in
+
+While visible, obtain real permission, connect/discover the intended peer, obtain
+notification streams and subscribe as needed, then await
+`enable_background_connected()`. Call `pause()` when entering background and
+`resume(actual_permission)` on foreground return. With valid native context and
+no interrupted operation, pause stops scanning but preserves the connection.
+Without opt-in, pause stops scanning and disconnects as before. Interrupted work,
+permission denial, or lost context requires cleanup. `close()` always stops and
+disconnects, including opted-in sessions. Call `permission_changed` for revocation;
+`resume` alone does not asynchronously clean up a denied connection.
+
+Android requires a visible Activity at opt-in, existing BLUETOOTH_CONNECT grant
+on API31+, declared `FOREGROUND_SERVICE` and (API34+) matching
+`FOREGROUND_SERVICE_CONNECTED_DEVICE`, and this service under application:
+
+```xml
+<service android:name="org.gpui.mobile.ble.BleConnectionService"
+    android:exported="false" android:foregroundServiceType="connectedDevice" />
+```
+
+The service validates configuration before launch, posts an ongoing notification,
+reports actual foreground-start success/failure, and is independently owned from
+GPS. Startup waits at most3seconds; cancellation invalidates the lease so a late
+service start cannot revive it. `START_NOT_STICKY` deliberately avoids creating
+an empty session after process death. Android background-start restrictions still
+apply; no silent grant, settings change, or restart loop is performed. Activity
+recreation does not itself own the service; the application must retain its BLE
+session and forward lifecycle events. Explicit session close ends the service.
+The service does not grant indefinite CPU execution or immunity to OS/user kills.
+See [Android foreground-service types](https://developer.android.com/develop/background-work/services/fgs/service-types).
+
+On iOS, opt-in checks the running bundle for `UIBackgroundModes` containing
+`bluetooth-central`. Add this alongside (not instead of) existing modes and retain
+`NSBluetoothAlwaysUsageDescription`. CoreBluetooth may wake the process for
+connection/notification events; this is not a guarantee that timers or arbitrary
+Rust work run continuously. Scanning remains foreground-only in this API. The
+backend does **not** implement restoration identifiers/delegate state restoration,
+relaunch recovery, or force-quit recovery. Preserve the runtime/session while
+alive and explicitly reconnect after process restart. See
+[Apple background and restoration semantics](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/CoreBluetooth_concepts/CoreBluetoothBackgroundProcessingForIOSApps/PerformingTasksWhileYourAppIsInTheBackground.html).
+
+Background source support is distinct from runtime validation: locked-device
+notification delivery, revocation, service loss and foreground return require
+separate known-peer Android/iOS execution. None is established by the earlier
+Android ten-second zero-discovery scan.
+
+### Dedicated example and safe QCY inspection
+
+`example/src/screens/ble.rs` is a dedicated standard-example screen. Parent wiring:
+feature-gate its module with `ble`, route its `render(router,cx)` explicitly, call
+`on_pause`/`on_resume` on host transitions and `dismiss` on navigation away.
+No shared dispatcher or Ely integration files are modified by this module.
+`ble::demo::Demo` uses one worker/runtime, bounded command submission, no native
+operations on UI, explicit cancellation, and awaited cleanup before worker exit.
+A busy operation is conservatively cancelled/closed on host pause; enable
+background while idle after connection. Merely opening the worker does not scan,
+connect, subscribe or write. The screen has explicit scan, select/connect/discover,
+read, subscribe/unsubscribe, background opt-in and close controls. Peer metadata
+and selected values appear locally, never in application logs. No write button
+is exposed in the peer-inspection screen; the typed worker/API write command is
+for applications with an explicit protocol/payload contract.
+
+`qcy::read_known_values` uses community OpenQCY-Desktop revision
+`ee7e849f2823e164dcf73726bc6ad700a9ce3281` as a **candidate** mapping: service
+`0000a001-0000-1000-8000-00805f9b34fb`, firmware characteristic `00000007-…`,
+battery `00000008-…`. It requires discovered READ flags, performs only those
+service-qualified direct reads, and never sends command queries, initialization,
+settings writes or subscription side effects. Missing capabilities return `None`;
+native errors propagate. See the community
+[UUID definitions](https://github.com/GiorgioRafael/OpenQCY-Desktop/blob/ee7e849f2823e164dcf73726bc6ad700a9ce3281/Protocol/QcyUuids.cs).
+Select the user's exact QCY peer first; matching name/manufacturer is not device
+identity or proof of firmware compatibility. The ignored echo hardware test now
+requires `BLE_ECHO_ID` as well as the service, characteristic and authorized payload;
+it must not be run against earbuds without an agreed echo protocol. QCY reads
+cannot certify GATT writes, notifications or background delivery.
+
+### Review follow-up: navigation and lifecycle wiring
+
+`dismiss()` means **leave the BLE screen**, not explicit close. It stops UI polling
+and cancels ordinary foreground sessions, but retains explicitly opted-in
+background connections. `close()` is the unconditional explicit stop and is also
+appropriate for final application-owner teardown. Do not call it merely because
+the user navigates to GPS: simultaneous GPS and BLE need separate ownership.
+Call `on_pause()` and `on_resume()` for the BLE session regardless of the visible
+screen. Repeated pause/resume notifications are deduplicated. A permission dialog
+pausing the initial open does not cancel that permission request. Resume stores
+the real permission result for processing after an in-flight pause rather
+than losing it to the normal busy-command gate.
+
+Native notifications update total/background counts and last receipt UTC
+milliseconds in the screen snapshot. `BLE_DEMO notification count=… background=…
+background_count=… utc_ms=… elapsed_ms=…` diagnostics contain no address, device
+name or value bytes. Only receipts processed after the worker handles pause count
+as background. Capture these markers together with OS lifecycle timestamps for
+acceptance; setting background mode alone is not notification-delivery evidence.
+
+The optional scan-error side-channel is pending on iOS/non-Android. Regression
+coverage verifies it neither aborts an idle scan nor blocks a live primary event,
+while primary EOF and actual Android failure codes remain errors. Pause now
+preserves a failed native background-context check even if fallback cleanup
+succeeds; independent cleanup errors are returned alongside it.
+
+The demo worker serializes pause and resume in a bounded eight-transition FIFO.
+A quick foreground return cannot overtake a pending pause, and permission denial
+is processed even if permission is subsequently granted. Overflow requests full
+session cleanup rather than silently dropping a transition. Pause during ordinary
+BLE work cancels that work and closes the session; pause/resume cleanup itself is
+allowed to finish in order. These are worker-ordering guarantees, not evidence of
+hardware background delivery.
+
+The standard BLE screen retains the latest scan outcome independently of generic
+worker status: scanning duration, completed matching-device count (including zero),
+native failure, or cancellation reason. A completed zero-result scan means no
+matching advertisements were collected; it does not establish QCY compatibility.
+Accepted commands clear submission text, and worker completion clears a previous
+busy rejection. Navigation restarts repaint polling with a new epoch without
+closing an opted-in background session. Numeric command start/completion counters
+and `BLE_DEMO scan_started`, `scan_completed matching_count=…`, `scan_failed`, and
+`scan_cancelled reason=…` markers support correlation without peer/payload logging.

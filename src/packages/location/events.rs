@@ -18,6 +18,8 @@ struct State {
 struct Mailbox {
     state: Mutex<State>,
     waker: AtomicWaker,
+    #[cfg(test)]
+    pending_polls: AtomicU64,
 }
 fn registry() -> &'static Mutex<HashMap<u64, Arc<Mailbox>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<Mailbox>>>> = OnceLock::new();
@@ -40,6 +42,8 @@ impl Receiver {
                 closed: false,
             }),
             waker: AtomicWaker::new(),
+            #[cfg(test)]
+            pending_polls: AtomicU64::new(0),
         });
         registry().lock().unwrap().insert(id, mailbox.clone());
         Self { id, mailbox }
@@ -68,16 +72,24 @@ impl Stream for Receiver {
         } else if state.closed {
             Poll::Ready(None)
         } else {
+            #[cfg(test)]
+            self.mailbox.pending_polls.fetch_add(1, Ordering::SeqCst);
             Poll::Pending
         }
     }
 }
-pub(super) fn send(id: u64, event: String) {
+#[cfg(test)]
+pub(super) fn pending_polls(id: u64) -> u64 {
+    registry().lock().unwrap().get(&id)
+        .map_or(0, |mailbox| mailbox.pending_polls.load(Ordering::SeqCst))
+}
+/// False means the native producer must stop, even if the consumer never polls again.
+pub(super) fn send(id: u64, event: String) -> bool {
     let mailbox = registry().lock().unwrap().get(&id).cloned();
     if let Some(mailbox) = mailbox {
         let mut state = mailbox.state.lock().unwrap();
         if state.closed {
-            return;
+            return false;
         }
         if state.queue.len() == CAPACITY {
             state.queue.clear();
@@ -90,8 +102,12 @@ pub(super) fn send(id: u64, event: String) {
             state.queue.push_back(event);
             state.closed = terminal;
         }
+        let accepting = !state.closed;
         drop(state);
         mailbox.waker.wake();
+        accepting
+    } else {
+        false
     }
 }
 #[cfg(test)]
@@ -102,15 +118,17 @@ mod tests {
     fn cancellation_rejects_late_callbacks() {
         let mut receiver = Receiver::new();
         receiver.close();
-        send(receiver.id, "late".into());
+        assert!(!send(receiver.id, "late".into()));
         assert_eq!(block_on(receiver.next()), None);
     }
     #[test]
     fn overflow_is_bounded_and_reported() {
         let mut receiver = Receiver::new();
-        for _ in 0..=CAPACITY {
-            send(receiver.id, "sample".into());
+        for _ in 0..CAPACITY {
+            assert!(send(receiver.id, "sample".into()));
         }
+        assert!(!send(receiver.id, "overflow".into()));
+        assert!(!send(receiver.id, "late".into()));
         assert!(block_on(receiver.next())
             .unwrap()
             .starts_with("error|overflow|"));

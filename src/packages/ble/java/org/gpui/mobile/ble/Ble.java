@@ -7,4 +7,7 @@ package org.gpui.mobile.ble;
 public final class Ble {
     private Ble() {}
     public static native void initialize();
+    /** Called by the checksum-pinned Android ScanCallback bridge. */
+    public static void scanFailed(int code) { nativeScanFailed(code); }
+    private static native void nativeScanFailed(int code);
 }

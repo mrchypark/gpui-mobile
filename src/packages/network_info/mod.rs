@@ -20,6 +20,9 @@ pub struct NetworkInfo {
 ///
 /// Note: On iOS 12+ reading the WiFi SSID requires the
 /// "Access WiFi Information" entitlement and location permission.
+/// OS privacy redaction produces absent SSID/BSSID values. Android also requires
+/// ACCESS_WIFI_STATE; location authorization/services may be required for SSID.
+/// Android's current native snapshot reports IPv4; iOS supports IPv4 or IPv6.
 pub fn get_network_info() -> Result<NetworkInfo, String> {
     #[cfg(target_os = "ios")]
     {

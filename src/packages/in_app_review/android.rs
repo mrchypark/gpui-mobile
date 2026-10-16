@@ -25,20 +25,23 @@ pub fn request_review() -> Result<(), String> {
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
-        let success = env
+        let result = env
             .call_static_method(
                 &cls,
                 jni::jni_str!("requestReview"),
-                jni::jni_sig!("(Landroid/app/Activity;)Z"),
+                jni::jni_sig!("(Landroid/app/Activity;)Ljava/lang/String;"),
                 &[JValue::Object(&activity)],
             )
-            .and_then(|v| v.z())
-            .e()?;
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
 
-        if success {
+        if result.is_null() {
             Ok(())
         } else {
-            Err("Failed to launch review flow".into())
+            Err(jni_helpers::get_string(env, &result))
         }
     })
 }

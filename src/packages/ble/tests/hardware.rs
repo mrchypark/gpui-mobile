@@ -20,6 +20,8 @@ fn echo_gatt_reconnect_and_stale_disconnect() {
             let expected = std::env::var("BLE_ECHO_TEXT")
                 .expect("BLE_ECHO_TEXT")
                 .into_bytes();
+            let peer = std::env::var("BLE_ECHO_ID").expect("explicit consenting BLE_ECHO_ID required");
+            assert!(!peer.trim().is_empty(), "BLE_ECHO_ID must not be empty");
             let timeout = Duration::from_secs(20);
             let mut ble = Ble::new(Permission::Granted, timeout).await.unwrap();
             let result: Result<()> = async {
@@ -31,7 +33,7 @@ fn echo_gatt_reconnect_and_stale_disconnect() {
                 let id = deadline(timeout, async {
                     while let Some(event) = events.next().await {
                         if let CentralEvent::DeviceDiscovered(id) = event {
-                            return Ok(id);
+                            if id.to_string() == peer { return Ok(id); }
                         }
                     }
                     Err(Error::DeviceNotFound)

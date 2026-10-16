@@ -75,15 +75,14 @@ pub fn open_directions(
     dest_longitude: f64,
     dest_label: Option<&str>,
 ) -> Result<bool, String> {
-    let dest_label = dest_label.map(|s| s.to_owned());
+    if dest_label.is_some_and(|label| !label.is_empty()) {
+        return Err("Android navigation does not support a custom coordinate label; pass None".into());
+    }
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
 
         // Try Google Maps navigation first
-        let dest = match &dest_label {
-            Some(l) => format!("{}@{},{}", percent_encode(l), dest_latitude, dest_longitude),
-            None => format!("{},{}", dest_latitude, dest_longitude),
-        };
+        let dest = format!("{},{}", dest_latitude, dest_longitude);
         let nav_uri = format!("google.navigation:q={}", dest);
 
         let intent = create_geo_intent(env, &nav_uri)?;
@@ -109,10 +108,10 @@ pub fn open_directions(
             Ok(_) => Ok(true),
             Err(_) => {
                 env.exception_clear();
-                // Fallback to generic geo intent
+                // Preserve directions semantics even when the native Maps app is absent.
                 let fallback_uri = format!(
-                    "geo:{},{}?q={},{}",
-                    dest_latitude, dest_longitude, dest_latitude, dest_longitude
+                    "https://www.google.com/maps/dir/?api=1&destination={},{}&travelmode=driving",
+                    dest_latitude, dest_longitude
                 );
                 let fallback_intent = create_geo_intent(env, &fallback_uri)?;
                 add_new_task_flag(env, &fallback_intent)?;

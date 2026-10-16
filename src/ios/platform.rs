@@ -8,6 +8,14 @@
 //! - Touch-based input instead of mouse
 //! - System keyboard handling differs significantly
 
+use super::util::nsstring as ns_string;
+#[path = "platform_clipboard.rs"]
+mod platform_clipboard;
+#[cfg(feature = "notifications")]
+#[path = "../platform_notifications.rs"]
+mod platform_notifications;
+#[path = "platform_preview.rs"]
+mod platform_preview;
 use super::{IosDispatcher, IosDisplay, IosWindow};
 use anyhow::anyhow;
 use futures::channel::oneshot;
@@ -40,9 +48,7 @@ pub(crate) struct IosPlatformState {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     finish_launching: Option<Box<dyn FnOnce()>>,
-    quit_callback: Option<Box<dyn FnMut() -> bool>>,
-    open_urls_callback: Option<Box<dyn FnMut(Vec<String>)>>,
-    thermal_state_callback: Option<Box<dyn FnMut()>>,
+    observers: std::collections::HashMap<&'static str, objc2::rc::Retained<AnyObject>>,
 }
 
 impl Default for IosPlatform {
@@ -62,10 +68,37 @@ impl IosPlatform {
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system,
             finish_launching: None,
-            quit_callback: None,
-            open_urls_callback: None,
-            thermal_state_callback: None,
+            observers: Default::default(),
         }))
+    }
+
+    fn observe(&self, name: &'static str, mut callback: Box<dyn FnMut()>) {
+        let events = Rc::new(crate::mobile_dispatch::EventQueue::<()>::default());
+        events.set_handler(Some(Box::new(move |_| callback())));
+        unsafe {
+            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+            let queue: *mut AnyObject = msg_send![class!(NSOperationQueue), mainQueue];
+            let block = block2::RcBlock::new(move |_: *mut AnyObject| events.dispatch([()]));
+            let observer: *mut AnyObject = msg_send![center, addObserverForName: ns_string(name),
+                object: std::ptr::null::<AnyObject>(), queue: queue, usingBlock: &*block];
+            if let Some(observer) = objc2::rc::Retained::retain(observer) {
+                let previous = self.0.lock().observers.insert(name, observer);
+                if let Some(previous) = previous {
+                    let _: () = msg_send![center, removeObserver: &*previous];
+                }
+            }
+        }
+    }
+}
+
+impl Drop for IosPlatform {
+    fn drop(&mut self) {
+        unsafe {
+            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+            for (_, observer) in self.0.get_mut().observers.drain() {
+                let _: () = msg_send![center, removeObserver: &*observer];
+            }
+        }
     }
 }
 
@@ -152,6 +185,14 @@ impl Platform for IosPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+        #[cfg(feature = "notifications")]
+        {
+            platform_notifications::start(self.foreground_executor());
+            self.observe(
+                "UIApplicationDidBecomeActiveNotification",
+                Box::new(platform_notifications::poll),
+            );
+        }
         // Store the callback for later invocation via FFI.
         // The callback will be invoked when gpui_ios_did_finish_launching() is called
         // from the iOS app delegate's applicationDidFinishLaunchingWithOptions:.
@@ -214,9 +255,7 @@ impl Platform for IosPlatform {
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        // iOS typically has one active window
-        // This would need to track the current key window
-        None
+        super::ffi::active_window_handle()
     }
 
     fn open_window(
@@ -252,41 +291,73 @@ impl Platform for IosPlatform {
 
     fn open_url(&self, url: &str) {
         unsafe {
-            let url_string: *mut AnyObject =
-                msg_send![class!(NSString), stringWithUTF8String: url.as_ptr()];
+            let url_string = ns_string(url);
             let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: url_string];
+            if url.is_null() {
+                log::warn!("Cannot open malformed URL");
+                return;
+            }
             let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
-            let _: () = msg_send![app, openURL: url, options: std::ptr::null::<AnyObject>(), completionHandler: std::ptr::null::<AnyObject>()];
+            let options: *mut AnyObject = msg_send![class!(NSDictionary), dictionary];
+            let _: () = msg_send![app, openURL: url, options: options, completionHandler: std::ptr::null::<AnyObject>()];
         }
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
-        self.0.lock().open_urls_callback = Some(callback);
+        crate::mobile_events::set_open_urls_handler(callback);
+    }
+
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(gpui::AppLifecyclePhase)>) {
+        crate::mobile_events::set_app_lifecycle_handler(callback);
+    }
+
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        crate::mobile_events::set_memory_warning_handler(callback);
     }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
         // URL schemes on iOS are registered in Info.plist, not programmatically
-        Task::ready(Ok(()))
+        Task::ready(Err(anyhow!("URL schemes must be declared in Info.plist")))
     }
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
-        // iOS uses UIDocumentPickerViewController for file selection
-        // This would need to be implemented with proper UIKit integration
-        let _ = tx.send(Err(anyhow!("File picker not yet implemented for iOS")));
+        #[cfg(feature = "file_selector")]
+        self.foreground_executor()
+            .spawn(async move {
+                let _ = tx.send(
+                    crate::packages::file_selector::prompt_paths(options)
+                        .map_err(anyhow::Error::msg),
+                );
+            })
+            .detach();
+        #[cfg(not(feature = "file_selector"))]
+        {
+            let _ = options;
+            let _ = tx.send(Err(anyhow!("file_selector feature disabled")));
+        }
         rx
     }
 
     fn prompt_for_new_path(
         &self,
-        _directory: &Path,
-        _suggested_name: Option<&str>,
+        directory: &Path,
+        suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Err(anyhow!("Save dialog not yet implemented for iOS")));
+        #[cfg(feature = "file_selector")]
+        let _ = tx.send(
+            crate::packages::file_selector::prompt_new_path(directory, suggested_name)
+                .map_err(anyhow::Error::msg),
+        );
+        #[cfg(not(feature = "file_selector"))]
+        {
+            let _ = (directory, suggested_name);
+            let _ = tx.send(Err(anyhow!("file_selector feature disabled")));
+        }
         rx
     }
 
@@ -294,20 +365,60 @@ impl Platform for IosPlatform {
         false
     }
 
+    #[cfg(feature = "notifications")]
+    fn show_system_notification(&self, notification: gpui::SystemNotification) {
+        self.foreground_executor()
+            .spawn(async move {
+                if let Err(error) =
+                    crate::packages::notifications::show_system_notification(&notification)
+                {
+                    log::warn!("Notification submission failed: {error}");
+                }
+            })
+            .detach();
+    }
+    #[cfg(feature = "notifications")]
+    fn dismiss_system_notification(&self, tag: &str) {
+        if let Err(error) = crate::packages::notifications::dismiss_system_notification(tag) {
+            log::warn!("Notification dismissal failed: {error}");
+        }
+    }
+    #[cfg(feature = "notifications")]
+    fn on_system_notification_response(
+        &self,
+        callback: Box<dyn FnMut(gpui::SystemNotificationResponse)>,
+    ) {
+        platform_notifications::start(self.foreground_executor());
+        platform_notifications::set_handler(callback, self.foreground_executor());
+    }
+
     fn reveal_path(&self, _path: &Path) {
-        // iOS doesn't have a file manager like Finder
+        log::warn!("iOS does not expose desktop file-manager reveal semantics");
     }
 
-    fn open_with_system(&self, _path: &Path) {
-        // Would use UIDocumentInteractionController or UIActivityViewController
+    fn open_with_system(&self, path: &Path) {
+        let path = path.to_owned();
+        self.foreground_executor()
+            .spawn(async move {
+                if let Err(error) = platform_preview::open(&path) {
+                    log::warn!("File preview failed: {error}");
+                }
+            })
+            .detach();
     }
 
-    fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
-        self.0.lock().quit_callback = Some(callback);
+    fn on_quit(&self, mut callback: Box<dyn FnMut() -> bool>) {
+        // UIKit's termination notification cannot be vetoed and is not sent for every kill.
+        self.observe(
+            "UIApplicationWillTerminateNotification",
+            Box::new(move || {
+                let _ = callback();
+            }),
+        );
     }
 
-    fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
-        // iOS handles app reopening through scene lifecycle
+    fn on_reopen(&self, callback: Box<dyn FnMut()>) {
+        self.observe("UIApplicationWillEnterForegroundNotification", callback);
     }
 
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
@@ -344,9 +455,10 @@ impl Platform for IosPlatform {
         }
     }
 
-    fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
-        let app_path = self.app_path()?;
-        Ok(app_path.join(name))
+    fn path_for_auxiliary_executable(&self, _name: &str) -> Result<PathBuf> {
+        Err(anyhow!(
+            "Launching auxiliary executables is not supported on iOS"
+        ))
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
@@ -362,59 +474,123 @@ impl Platform for IosPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        unsafe {
-            let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
-            if let Some(text) = item.text() {
-                let ns_string: *mut AnyObject =
-                    msg_send![class!(NSString), stringWithUTF8String: text.as_ptr()];
-                let _: () = msg_send![pasteboard, setString: ns_string];
-            }
+        if let Err(error) = platform_clipboard::write(&item) {
+            log::warn!("Clipboard publication failed: {error}");
         }
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        unsafe {
-            let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
-            let string: *mut AnyObject = msg_send![pasteboard, string];
-            if string.is_null() {
-                return None;
-            }
-            let utf8: *const i8 = msg_send![string, UTF8String];
-            if utf8.is_null() {
-                return None;
-            }
-            let text = std::ffi::CStr::from_ptr(utf8).to_str().ok()?;
-            Some(ClipboardItem::new_string(text.to_string()))
-        }
+        platform_clipboard::read().unwrap_or_else(|error| {
+            log::warn!("Clipboard read failed: {error}");
+            None
+        })
     }
 
-    fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
-        // Would use iOS Keychain Services
-        Task::ready(Err(anyhow!("Keychain not yet implemented for iOS")))
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<std::result::Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        self.foreground_executor().spawn(async {
+            platform_clipboard::read_async().await.map_err(|error| {
+                log::warn!("Clipboard read failed: {error}");
+                error
+                    .downcast_ref::<gpui::ClipboardReadError>()
+                    .cloned()
+                    .unwrap_or(gpui::ClipboardReadError::UnsupportedContent)
+            })
+        })
     }
 
-    fn read_credentials(&self, _url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        Task::ready(Err(anyhow!("Keychain not yet implemented for iOS")))
+    fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
+        let (url, username, password) = (url.to_owned(), username.to_owned(), password.to_vec());
+        self.background_executor().spawn(async move {
+            objc2::rc::autoreleasepool(|_| unsafe {
+                let query = credential_query(&url);
+                let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), dictionary];
+                let mut payload = credential_payload::encode(&username, &password)?;
+                let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: payload.as_ptr().cast::<std::ffi::c_void>(), length: payload.len()];
+                payload.fill(0);
+                let _: () = msg_send![attributes, setObject: data, forKey: kSecValueData];
+                let status = SecItemUpdate(query, attributes);
+                if status != -25300 { return keychain_status(status); }
+                let _: () = msg_send![query, addEntriesFromDictionary: attributes];
+                let _: () = msg_send![query, setObject: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, forKey: kSecAttrAccessible];
+                let status = SecItemAdd(query, std::ptr::null_mut());
+                // Another process may have inserted this service after our update.
+                keychain_status(if status == -25299 {
+                    SecItemUpdate(credential_query(&url), attributes)
+                } else { status })
+            })
+        })
     }
 
-    fn delete_credentials(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Err(anyhow!("Keychain not yet implemented for iOS")))
+    fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
+        let url = url.to_owned();
+        self.background_executor().spawn(async move {
+            objc2::rc::autoreleasepool(|_| unsafe {
+                let query = credential_query(&url);
+                let yes: *mut AnyObject =
+                    msg_send![class!(NSNumber), numberWithBool: objc2::runtime::Bool::YES];
+                let _: () = msg_send![query, setObject: yes, forKey: kSecReturnData];
+                let _: () = msg_send![query, setObject: kSecMatchLimitOne, forKey: kSecMatchLimit];
+                let mut result = std::ptr::null_mut();
+                let status = SecItemCopyMatching(query, &mut result);
+                if status == -25300 {
+                    return Ok(None);
+                }
+                keychain_status(status)?;
+                let result = objc2::rc::Retained::<AnyObject>::from_raw(result)
+                    .ok_or_else(|| anyhow!("Keychain returned no item"))?;
+                let data = &*result;
+                let bytes: *const std::ffi::c_void = msg_send![data, bytes];
+                let length: usize = msg_send![data, length];
+                let mut payload = if length == 0 {
+                    Vec::new()
+                } else {
+                    if bytes.is_null() {
+                        return Err(anyhow!("Keychain data is missing bytes"));
+                    }
+                    std::slice::from_raw_parts(bytes.cast(), length).to_vec()
+                };
+                let decoded = credential_payload::decode(&payload);
+                payload.fill(0);
+                Ok(Some(decoded?))
+            })
+        })
     }
 
-    fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {
-        // iOS handles keyboard layout changes differently
+    fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
+        let url = url.to_owned();
+        self.background_executor().spawn(async move {
+            objc2::rc::autoreleasepool(|_| unsafe {
+                let status = SecItemDelete(credential_query(&url));
+                if status == -25300 {
+                    Ok(())
+                } else {
+                    keychain_status(status)
+                }
+            })
+        })
+    }
+
+    fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>) {
+        self.observe("UITextInputCurrentInputModeDidChangeNotification", callback);
     }
 
     fn thermal_state(&self) -> ThermalState {
-        // iOS provides thermal state via ProcessInfo
-        // For now, return nominal
-        ThermalState::Nominal
+        unsafe {
+            let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+            let state: isize = msg_send![info, thermalState];
+            match state {
+                1 => ThermalState::Fair,
+                2 => ThermalState::Serious,
+                3 => ThermalState::Critical,
+                _ => ThermalState::Nominal,
+            }
+        }
     }
 
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>) {
-        self.0.lock().thermal_state_callback = Some(callback);
-        // In a full implementation, we would register for
-        // NSProcessInfoThermalStateDidChangeNotification
+        crate::mobile_events::set_thermal_change_handler(callback);
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -423,5 +599,158 @@ impl Platform for IosPlatform {
 
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
         Rc::new(DummyKeyboardMapper)
+    }
+}
+
+#[path = "../credential_payload.rs"]
+mod credential_payload;
+
+#[link(name = "Security", kind = "framework")]
+unsafe extern "C" {
+    static kSecClass: *mut AnyObject;
+    static kSecClassGenericPassword: *mut AnyObject;
+    static kSecAttrService: *mut AnyObject;
+    static kSecAttrAccount: *mut AnyObject;
+    static kSecValueData: *mut AnyObject;
+    static kSecReturnData: *mut AnyObject;
+    #[cfg(test)]
+    static kSecMatchLimitAll: *mut AnyObject;
+    static kSecMatchLimit: *mut AnyObject;
+    static kSecMatchLimitOne: *mut AnyObject;
+    static kSecAttrAccessible: *mut AnyObject;
+    static kSecAttrAccessibleWhenUnlockedThisDeviceOnly: *mut AnyObject;
+    fn SecItemAdd(query: *mut AnyObject, result: *mut *mut AnyObject) -> i32;
+    fn SecItemUpdate(query: *mut AnyObject, attributes: *mut AnyObject) -> i32;
+    fn SecItemCopyMatching(query: *mut AnyObject, result: *mut *mut AnyObject) -> i32;
+    fn SecItemDelete(query: *mut AnyObject) -> i32;
+}
+
+unsafe fn credential_query(service: &str) -> *mut AnyObject {
+    unsafe {
+        let query: *mut AnyObject = msg_send![class!(NSMutableDictionary), dictionary];
+        let _: () = msg_send![query, setObject: kSecClassGenericPassword, forKey: kSecClass];
+        let _: () = msg_send![query, setObject: ns_string(service), forKey: kSecAttrService];
+        let _: () = msg_send![query, setObject: ns_string("dev.gpui.platform.credentials.v1"), forKey: kSecAttrAccount];
+        query
+    }
+}
+
+fn keychain_status(status: i32) -> Result<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!("Keychain operation failed (OSStatus {status})"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keychain_errors_are_not_success_or_absence() {
+        assert!(keychain_status(0).is_ok());
+        assert!(keychain_status(-25300).is_err());
+        assert!(keychain_status(-25293).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires an entitled unlocked iOS Keychain host"]
+    fn concurrent_first_writes_keep_one_record_and_replace_serially() {
+        let platform = IosPlatform::new();
+        let service = format!("gpui-race-{:?}", std::time::SystemTime::now());
+        let result: Result<()> = futures::executor::block_on(async {
+            for second in ["first", "different"] {
+                for _ in 0..16 {
+                    platform.delete_credentials(&service).await?;
+                    let a = platform.write_credentials(&service, "first", b"one");
+                    let b = platform.write_credentials(&service, second, b"two");
+                    let (a, b) = futures::join!(a, b);
+                    a?;
+                    b?;
+                    let stored = platform.read_credentials(&service).await?;
+                    if stored != Some(("first".into(), b"one".to_vec()))
+                        && stored != Some((second.into(), b"two".to_vec()))
+                    {
+                        return Err(anyhow!("Concurrent write produced a torn credential"));
+                    }
+                    objc2::rc::autoreleasepool(|_| unsafe {
+                        let query = credential_query(&service);
+                        // Count all accounts for this unique service, not just our fixed account.
+                        let _: () = msg_send![query, removeObjectForKey: kSecAttrAccount];
+                        let yes: *mut AnyObject =
+                            msg_send![class!(NSNumber), numberWithBool: objc2::runtime::Bool::YES];
+                        let _: () = msg_send![query, setObject: yes, forKey: kSecReturnData];
+                        let _: () =
+                            msg_send![query, setObject: kSecMatchLimitAll, forKey: kSecMatchLimit];
+                        let mut result = std::ptr::null_mut();
+                        keychain_status(SecItemCopyMatching(query, &mut result))?;
+                        let result = objc2::rc::Retained::<AnyObject>::from_raw(result)
+                            .ok_or_else(|| anyhow!("Missing Keychain result"))?;
+                        let count: usize = msg_send![&*result, count];
+                        if count != 1 {
+                            return Err(anyhow!("Expected one credential, got {count}"));
+                        }
+                        Ok(())
+                    })?;
+                    platform
+                        .write_credentials(&service, "last", b"last")
+                        .await?;
+                    if platform.read_credentials(&service).await?
+                        != Some(("last".into(), b"last".to_vec()))
+                    {
+                        return Err(anyhow!("Serialized replacement failed"));
+                    }
+                }
+            }
+            Ok(())
+        });
+        let cleanup = futures::executor::block_on(platform.delete_credentials(&service));
+        cleanup.unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an iOS host with Keychain entitlement and an unlocked device"]
+    fn credentials_persist_and_replace_username() {
+        let platform = IosPlatform::new();
+        let service = format!("gpui-platform-test-{:?}", std::time::SystemTime::now());
+        let result: Result<()> = futures::executor::block_on(async {
+            platform
+                .write_credentials(&service, "first", b"\0secret")
+                .await?;
+            let first = platform.read_credentials(&service).await?;
+            if first != Some(("first".into(), b"\0secret".to_vec())) {
+                return Err(anyhow!("credential round trip mismatch"));
+            }
+            platform
+                .write_credentials(&service, "second\0한", b"")
+                .await?;
+            if platform.read_credentials(&service).await? != Some(("second\0한".into(), Vec::new()))
+            {
+                return Err(anyhow!("credential replacement mismatch"));
+            }
+            Ok(())
+        });
+        futures::executor::block_on(platform.delete_credentials(&service)).unwrap();
+        result.unwrap();
+        assert!(
+            futures::executor::block_on(platform.read_credentials(&service))
+                .unwrap()
+                .is_none()
+        );
+        futures::executor::block_on(platform.delete_credentials(&service)).unwrap();
+    }
+
+    #[test]
+    fn native_string_preserves_embedded_nul_and_unicode() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let text = "a\0한😀";
+            let string = ns_string(text);
+            let length: usize = msg_send![string, length];
+            assert_eq!(length, text.encode_utf16().count());
+            let nul: u16 = msg_send![string, characterAtIndex: 1usize];
+            assert_eq!(nul, 0);
+        });
     }
 }

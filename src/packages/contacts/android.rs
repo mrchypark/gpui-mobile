@@ -4,6 +4,9 @@ use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiContacts";
 
+#[path = "wire.rs"]
+mod wire;
+
 pub fn get_contacts() -> Result<Vec<Contact>, String> {
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
@@ -23,7 +26,7 @@ pub fn get_contacts() -> Result<Vec<Contact>, String> {
             })?;
 
         if result.is_null() {
-            return Ok(Vec::new());
+            return Err("Contacts provider returned no result".into());
         }
 
         let raw = get_string(env, &result);
@@ -53,7 +56,7 @@ pub fn search_contacts(query: &str) -> Result<Vec<Contact>, String> {
             })?;
 
         if result.is_null() {
-            return Ok(Vec::new());
+            return Err("Contacts provider returned no search result".into());
         }
 
         let raw = get_string(env, &result);
@@ -83,7 +86,7 @@ pub fn get_contact(id: &str) -> Result<Option<Contact>, String> {
             })?;
 
         if result.is_null() {
-            return Ok(None);
+            return Err("Contacts provider returned no lookup result".into());
         }
 
         let raw = get_string(env, &result);
@@ -118,9 +121,9 @@ fn parse_contacts(raw: &str) -> Vec<Contact> {
         }
 
         let id = parts[0].to_owned();
-        let display_name = parts[1].to_owned();
-        let given_name = parts[2].to_owned();
-        let family_name = parts[3].to_owned();
+        let display_name = wire::decode(parts[1]);
+        let given_name = wire::decode(parts[2]);
+        let family_name = wire::decode(parts[3]);
 
         let phones = if parts[4].is_empty() {
             Vec::new()
@@ -129,8 +132,8 @@ fn parse_contacts(raw: &str) -> Vec<Contact> {
                 .split(',')
                 .filter_map(|entry| {
                     let mut split = entry.splitn(2, ':');
-                    let number = split.next()?.to_owned();
-                    let label = split.next().unwrap_or("other").to_owned();
+                    let number = wire::decode(split.next()?);
+                    let label = wire::decode(split.next().unwrap_or("other"));
                     Some(PhoneNumber { number, label })
                 })
                 .collect()
@@ -143,8 +146,8 @@ fn parse_contacts(raw: &str) -> Vec<Contact> {
                 .split(',')
                 .filter_map(|entry| {
                     let mut split = entry.splitn(2, ':');
-                    let address = split.next()?.to_owned();
-                    let label = split.next().unwrap_or("other").to_owned();
+                    let address = wire::decode(split.next()?);
+                    let label = wire::decode(split.next().unwrap_or("other"));
                     Some(EmailAddress { address, label })
                 })
                 .collect()

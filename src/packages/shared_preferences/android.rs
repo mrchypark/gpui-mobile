@@ -13,7 +13,10 @@ impl AndroidSharedPreferences {
         jni_helpers::with_env(|env| {
             let prefs = get_default_prefs(env).ok_or_else(|| "Failed to get prefs".to_string())?;
 
-            let jkey = env.new_string(&key).map_err(|e| e.to_string())?;
+            let jkey = env.new_string(&key).map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
             let result = env
                 .call_method(
                     &prefs,
@@ -22,7 +25,10 @@ impl AndroidSharedPreferences {
                     &[JValue::Object(&jkey), JValue::Object(&JObject::null())],
                 )
                 .and_then(|v| v.l())
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    env.exception_clear();
+                    e.to_string()
+                })?;
 
             if result.is_null() {
                 Ok(None)
@@ -38,12 +44,12 @@ impl AndroidSharedPreferences {
         with_editor(|env, editor| {
             let jkey = env.new_string(key).e()?;
             let jval = env.new_string(value).e()?;
-            let _ = env.call_method(
+            env.call_method(
                 editor,
                 jni::jni_str!("putString"),
                 jni::jni_sig!("(Ljava/lang/String;Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;"),
                 &[JValue::Object(&jkey), JValue::Object(&jval)],
-            );
+            ).map_err(|e| { env.exception_clear(); e.to_string() })?;
             Ok(())
         })
     }
@@ -56,7 +62,10 @@ impl AndroidSharedPreferences {
             if !self.contains_key_jni(env, &prefs, &key) {
                 return Ok(None);
             }
-            let jkey = env.new_string(&key).map_err(|e| e.to_string())?;
+            let jkey = env.new_string(&key).map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
             let val = env
                 .call_method(
                     &prefs,
@@ -65,7 +74,10 @@ impl AndroidSharedPreferences {
                     &[JValue::Object(&jkey), JValue::Long(0)],
                 )
                 .and_then(|v| v.j())
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    env.exception_clear();
+                    e.to_string()
+                })?;
             Ok(Some(val))
         })
         .ok()
@@ -75,12 +87,16 @@ impl AndroidSharedPreferences {
     pub fn set_int(&self, key: &str, value: i64) -> Result<(), String> {
         with_editor(|env, editor| {
             let jkey = env.new_string(key).e()?;
-            let _ = env.call_method(
+            env.call_method(
                 editor,
                 jni::jni_str!("putLong"),
                 jni::jni_sig!("(Ljava/lang/String;J)Landroid/content/SharedPreferences$Editor;"),
                 &[JValue::Object(&jkey), JValue::Long(value)],
-            );
+            )
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
             Ok(())
         })
     }
@@ -93,7 +109,10 @@ impl AndroidSharedPreferences {
             if !self.contains_key_jni(env, &prefs, &key) {
                 return Ok(None);
             }
-            let jkey = env.new_string(&key).map_err(|e| e.to_string())?;
+            let jkey = env.new_string(&key).map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
             let val = env
                 .call_method(
                     &prefs,
@@ -102,7 +121,10 @@ impl AndroidSharedPreferences {
                     &[JValue::Object(&jkey), JValue::Bool(false)],
                 )
                 .and_then(|v| v.z())
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    env.exception_clear();
+                    e.to_string()
+                })?;
             Ok(Some(val))
         })
         .ok()
@@ -112,12 +134,16 @@ impl AndroidSharedPreferences {
     pub fn set_bool(&self, key: &str, value: bool) -> Result<(), String> {
         with_editor(|env, editor| {
             let jkey = env.new_string(key).e()?;
-            let _ = env.call_method(
+            env.call_method(
                 editor,
                 jni::jni_str!("putBoolean"),
                 jni::jni_sig!("(Ljava/lang/String;Z)Landroid/content/SharedPreferences$Editor;"),
                 &[JValue::Object(&jkey), JValue::Bool(value)],
-            );
+            )
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
             Ok(())
         })
     }
@@ -125,24 +151,32 @@ impl AndroidSharedPreferences {
     pub fn remove(&self, key: &str) -> Result<(), String> {
         with_editor(|env, editor| {
             let jkey = env.new_string(key).e()?;
-            let _ = env.call_method(
+            env.call_method(
                 editor,
                 jni::jni_str!("remove"),
                 jni::jni_sig!("(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;"),
                 &[JValue::Object(&jkey)],
-            );
+            )
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
             Ok(())
         })
     }
 
     pub fn clear(&self) -> Result<(), String> {
         with_editor(|env, editor| {
-            let _ = env.call_method(
+            env.call_method(
                 editor,
                 jni::jni_str!("clear"),
                 jni::jni_sig!("()Landroid/content/SharedPreferences$Editor;"),
                 &[],
-            );
+            )
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
             Ok(())
         })
     }
@@ -159,7 +193,10 @@ impl AndroidSharedPreferences {
     fn contains_key_jni(&self, env: &mut jni::Env<'_>, prefs: &JObject<'_>, key: &str) -> bool {
         let jkey = match env.new_string(key) {
             Ok(k) => k,
-            Err(_) => return false,
+            Err(_) => {
+                env.exception_clear();
+                return false;
+            }
         };
         env.call_method(
             prefs,
@@ -168,6 +205,10 @@ impl AndroidSharedPreferences {
             &[JValue::Object(&jkey)],
         )
         .and_then(|v| v.z())
+        .map_err(|e| {
+            env.exception_clear();
+            e
+        })
         .unwrap_or(false)
     }
 }
@@ -183,6 +224,10 @@ fn get_default_prefs<'local>(env: &mut jni::Env<'local>) -> Option<JObject<'loca
             &[JValue::Object(&activity)],
         )
         .and_then(|v| v.l())
+        .map_err(|e| {
+            env.exception_clear();
+            e
+        })
         .ok()?;
     if prefs.is_null() {
         None
@@ -196,26 +241,42 @@ fn with_editor(
     f: impl FnOnce(&mut jni::Env<'_>, &JObject<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     jni_helpers::with_env(|env| {
-        let prefs =
-            get_default_prefs(env).ok_or_else(|| "Failed to get SharedPreferences".to_string())?;
+        let result = (|| {
+            let prefs = get_default_prefs(env)
+                .ok_or_else(|| "Failed to get SharedPreferences".to_string())?;
 
-        let editor = env
-            .call_method(
-                &prefs,
-                jni::jni_str!("edit"),
-                jni::jni_sig!("()Landroid/content/SharedPreferences$Editor;"),
-                &[],
-            )
-            .and_then(|v| v.l())
-            .e()?;
-        if editor.is_null() {
-            return Err("edit() returned null".into());
+            let editor = env
+                .call_method(
+                    &prefs,
+                    jni::jni_str!("edit"),
+                    jni::jni_sig!("()Landroid/content/SharedPreferences$Editor;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .e()?;
+            if editor.is_null() {
+                return Err("edit() returned null".into());
+            }
+
+            f(env, &editor)?;
+
+            // Commit
+            let committed = env
+                .call_method(&editor, jni::jni_str!("commit"), jni::jni_sig!("()Z"), &[])
+                .and_then(|v| v.z())
+                .map_err(|e| {
+                    env.exception_clear();
+                    e.to_string()
+                })?;
+            if committed {
+                Ok(())
+            } else {
+                Err("SharedPreferences commit failed".into())
+            }
+        })();
+        if result.is_err() {
+            env.exception_clear();
         }
-
-        f(env, &editor)?;
-
-        // Commit
-        let _ = env.call_method(&editor, jni::jni_str!("commit"), jni::jni_sig!("()Z"), &[]);
-        Ok(())
+        result
     })
 }

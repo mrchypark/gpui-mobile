@@ -2,6 +2,11 @@
 # Service-only checks, independent of GPUI and its renderer dependencies.
 set -eu
 location_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+case "${1:-all}" in
+    --android-only) exec sh "$location_dir/tests/android.sh" ;;
+    all) sh "$location_dir/tests/android.sh" ;;
+    *) echo 'Usage: check.sh [--android-only]' >&2; exit 2 ;;
+esac
 scratch=$(mktemp -d /private/tmp/gpui-location-check.XXXXXX)
 trap 'rm -rf "$scratch"' EXIT HUP INT TERM
 ln -s "$location_dir" "$scratch/location"

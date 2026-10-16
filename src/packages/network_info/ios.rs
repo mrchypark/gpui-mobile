@@ -23,6 +23,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                     if !ssid_value.is_null() {
                         info.wifi_name = cfstring_to_string(ssid_value as _);
                     }
+                    CFRelease(ssid_key);
 
                     // Extract BSSID
                     let bssid_key = cfstring_from_static(b"BSSID\0");
@@ -30,6 +31,7 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
                     if !bssid_value.is_null() {
                         info.wifi_bssid = cfstring_to_string(bssid_value as _);
                     }
+                    CFRelease(bssid_key);
 
                     CFRelease(network_info as _);
                     break; // Use first interface
@@ -40,42 +42,46 @@ pub fn get_network_info() -> Result<NetworkInfo, String> {
     }
 
     // Get IP address via getifaddrs
-    info.wifi_ip = get_wifi_ip_address();
+    info.wifi_ip = get_wifi_ip_address()?;
 
     Ok(info)
 }
 
-fn get_wifi_ip_address() -> Option<String> {
+fn get_wifi_ip_address() -> Result<Option<String>, String> {
     unsafe {
         let mut ifaddr: *mut ifaddrs = std::ptr::null_mut();
         if getifaddrs(&mut ifaddr) != 0 {
-            return None;
+            return Err(std::io::Error::last_os_error().to_string());
         }
 
         let mut result = None;
         let mut current = ifaddr;
         while !current.is_null() {
             let ifa = &*current;
-            if !ifa.ifa_addr.is_null() {
+            if !ifa.ifa_addr.is_null() && !ifa.ifa_name.is_null() && ifa.ifa_flags & 1 != 0 {
                 let family = (*ifa.ifa_addr).sa_family as i32;
                 // AF_INET = 2 (IPv4)
-                if family == 2 {
+                if family == 2 || family == 30 {
                     let name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
                     // en0 is typically WiFi on iOS
                     if name == "en0" {
-                        let addr = ifa.ifa_addr as *const sockaddr_in;
-                        let ip = (*addr).sin_addr;
-                        let _bytes = ip.to_be_bytes();
-                        // Network byte order to dotted-quad
-                        let ip_str = format!(
-                            "{}.{}.{}.{}",
-                            ip & 0xFF,
-                            (ip >> 8) & 0xFF,
-                            (ip >> 16) & 0xFF,
-                            (ip >> 24) & 0xFF,
-                        );
-                        result = Some(ip_str);
-                        break;
+                        let mut host = [0i8; 1025];
+                        if getnameinfo(
+                            ifa.ifa_addr,
+                            (*ifa.ifa_addr).sa_len as u32,
+                            host.as_mut_ptr(),
+                            host.len() as u32,
+                            std::ptr::null_mut(),
+                            0,
+                            2,
+                        ) == 0
+                        {
+                            result =
+                                Some(CStr::from_ptr(host.as_ptr()).to_string_lossy().into_owned());
+                            if family == 2 {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -83,7 +89,7 @@ fn get_wifi_ip_address() -> Option<String> {
         }
 
         freeifaddrs(ifaddr);
-        result
+        Ok(result)
     }
 }
 
@@ -160,15 +166,6 @@ struct sockaddr {
 }
 
 #[repr(C)]
-struct sockaddr_in {
-    sin_len: u8,
-    sin_family: u8,
-    sin_port: u16,
-    sin_addr: u32,
-    sin_zero: [i8; 8],
-}
-
-#[repr(C)]
 struct ifaddrs {
     ifa_next: *mut ifaddrs,
     ifa_name: *const i8,
@@ -180,6 +177,15 @@ struct ifaddrs {
 }
 
 extern "C" {
+    fn getnameinfo(
+        address: *const sockaddr,
+        length: u32,
+        host: *mut i8,
+        host_length: u32,
+        service: *mut i8,
+        service_length: u32,
+        flags: i32,
+    ) -> i32;
     fn getifaddrs(ifap: *mut *mut ifaddrs) -> i32;
     fn freeifaddrs(ifa: *mut ifaddrs);
 }

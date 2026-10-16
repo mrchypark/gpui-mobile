@@ -50,6 +50,12 @@ pub(crate) fn windows() -> Vec<std::rc::Rc<super::window::IosWindowInner>> {
     WINDOWS.with(|registry| registry.snapshot())
 }
 
+pub(crate) fn active_window_handle() -> Option<gpui::AnyWindowHandle> {
+    windows()
+        .into_iter()
+        .find_map(|window| window.active_handle())
+}
+
 pub(crate) fn window_for_handle(id: usize) -> Option<std::rc::Rc<super::window::IosWindowInner>> {
     WINDOWS
         .with(|registry| registry.get(id))
@@ -94,7 +100,34 @@ pub extern "C" fn gpui_ios_initialize() -> *mut c_void {
 /// # Safety
 /// This must only be called from the main thread.
 pub(crate) fn register_window(window: &std::rc::Rc<super::window::IosWindowInner>) -> usize {
+    install_platform_observers();
     WINDOWS.with(|registry| registry.insert(window))
+}
+
+fn install_platform_observers() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| unsafe {
+        use objc2::{class, msg_send, runtime::AnyObject};
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let queue: *mut AnyObject = msg_send![class!(NSOperationQueue), mainQueue];
+        // Process-lifetime observers capture no window or platform object.
+        for (name, callback) in [
+            (
+                c"UIApplicationDidReceiveMemoryWarningNotification",
+                crate::mobile_events::dispatch_memory_warning as fn(),
+            ),
+            (
+                c"NSProcessInfoThermalStateDidChangeNotification",
+                crate::mobile_events::dispatch_thermal_change as fn(),
+            ),
+        ] {
+            let name: *mut AnyObject =
+                msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];
+            let block = block2::RcBlock::new(move |_notification: *mut AnyObject| callback());
+            let _: *mut AnyObject = msg_send![center, addObserverForName: name,
+                object: std::ptr::null::<AnyObject>(), queue: queue, usingBlock: &*block];
+        }
+    });
 }
 
 /// Get the most recently created window pointer.
@@ -155,6 +188,7 @@ pub extern "C" fn gpui_ios_did_finish_launching(_app_ptr: *mut c_void) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_will_enter_foreground(_app_ptr: *mut c_void) {
     log::info!("GPUI iOS: Will enter foreground");
+    crate::mobile_events::dispatch_app_lifecycle(gpui::AppLifecyclePhase::Foreground);
 
     // Notify all windows that they're becoming active
     for window in windows() {
@@ -171,6 +205,7 @@ pub extern "C" fn gpui_ios_will_enter_foreground(_app_ptr: *mut c_void) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_did_become_active(_app_ptr: *mut c_void) {
     log::info!("GPUI iOS: Did become active");
+    crate::mobile_events::dispatch_app_lifecycle(gpui::AppLifecyclePhase::Active);
 
     // App is now fully active - windows should be notified
     for window in windows() {
@@ -187,6 +222,7 @@ pub extern "C" fn gpui_ios_did_become_active(_app_ptr: *mut c_void) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_will_resign_active(_app_ptr: *mut c_void) {
     log::info!("GPUI iOS: Will resign active");
+    crate::mobile_events::dispatch_app_lifecycle(gpui::AppLifecyclePhase::Inactive);
 
     // App is about to become inactive
     for window in windows() {
@@ -204,6 +240,7 @@ pub extern "C" fn gpui_ios_will_resign_active(_app_ptr: *mut c_void) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_did_enter_background(_app_ptr: *mut c_void) {
     log::info!("GPUI iOS: Did enter background");
+    crate::mobile_events::dispatch_app_lifecycle(gpui::AppLifecyclePhase::Background);
 
     // Notify windows they're no longer visible
     for window in windows() {
@@ -384,6 +421,28 @@ pub extern "C" fn gpui_ios_handle_key_event(
 }
 
 /// Called from ObjC when the app receives a URL to open.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_record_initial_url(url_ptr: *mut c_void) {
+    #[cfg(feature = "deeplink")]
+    {
+        let url = if url_ptr.is_null() { None } else { unsafe {
+            use objc2::msg_send;
+            let string = url_ptr as *mut objc2::runtime::AnyObject;
+            let bytes: *const u8 = msg_send![string, UTF8String];
+            let length: usize = msg_send![string, lengthOfBytesUsingEncoding: 4usize];
+            if bytes.is_null() { return; }
+            match std::str::from_utf8(std::slice::from_raw_parts(bytes, length)) {
+                Ok(url) => Some(url.to_owned()),
+                Err(_) => return,
+            }
+        }};
+        crate::packages::deeplink::ios::record_initial_link(url);
+    }
+    #[cfg(not(feature = "deeplink"))]
+    let _ = url_ptr;
+}
+
+/// Called from ObjC when the app receives a URL to open.
 ///
 /// Parameters:
 /// - url_ptr: Pointer to an NSString containing the URL
@@ -406,6 +465,7 @@ pub extern "C" fn gpui_ios_handle_open_url(url_ptr: *mut c_void) {
     };
 
     log::info!("GPUI iOS: Received deep link: {}", url_string);
+    crate::mobile_events::dispatch_open_urls(vec![url_string.clone()]);
 
     #[cfg(feature = "deeplink")]
     {

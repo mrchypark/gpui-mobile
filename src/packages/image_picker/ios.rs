@@ -1,7 +1,16 @@
 use super::{CameraDevice, ImagePickerOptions, ImageSource, PickedFile};
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
-use std::sync::{mpsc, Mutex, Once};
+use std::sync::{mpsc, Once};
+
+#[path = "../permission_handler/ios_completion.rs"]
+mod completion;
+#[path = "../file_selector/ios_delegate.rs"]
+mod delegate;
+#[path = "ios_image.rs"]
+mod image;
+#[path = "../file_selector/request.rs"]
+mod request;
 
 #[link(name = "PhotosUI", kind = "framework")]
 extern "C" {}
@@ -14,18 +23,14 @@ extern "C" {}
 
 // ── Result channel ──────────────────────────────────────────────────────────
 
-static RESULT_TX: Mutex<Option<mpsc::Sender<Vec<String>>>> = Mutex::new(None);
+static REQUEST: request::Slot = request::Slot::new();
 
-fn set_result_channel() -> mpsc::Receiver<Vec<String>> {
-    let (tx, rx) = mpsc::channel();
-    *RESULT_TX.lock().unwrap() = Some(tx);
-    rx
-}
-
-fn send_result(paths: Vec<String>) {
-    if let Some(tx) = RESULT_TX.lock().unwrap().take() {
-        let _ = tx.send(paths);
+fn set_result_channel() -> Result<request::Request<'static>, String> {
+    let main: Bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+    if !main.as_bool() {
+        return Err("Call the iOS image picker on the main thread".into());
     }
+    REQUEST.begin()
 }
 
 // ── PHPicker delegate (iOS 14+ gallery picker) ─────────────────────────────
@@ -39,6 +44,7 @@ fn phpicker_delegate_class() -> &'static AnyClass {
         let mut decl = ClassBuilder::new(c"GpuiPHPickerDelegate", superclass).unwrap();
 
         unsafe {
+            delegate::register(&mut decl);
             decl.add_method(
                 sel!(picker:didFinishPicking:),
                 phpicker_did_finish
@@ -52,80 +58,85 @@ fn phpicker_delegate_class() -> &'static AnyClass {
 }
 
 extern "C" fn phpicker_did_finish(
-    _this: *mut AnyObject,
-    _sel: Sel,
+    this: *mut AnyObject,
+    _: Sel,
     picker: *mut AnyObject,
     results: *mut AnyObject,
 ) {
     unsafe {
-        // Dismiss the picker
-        let _: () = msg_send![picker, dismissViewControllerAnimated: true, completion: std::ptr::null::<AnyObject>()];
-
-        let count: usize = msg_send![results, count];
-        if count == 0 {
-            send_result(vec![]);
+        let Some(token) = delegate::token(this) else {
+            return;
+        };
+        if !token.claim() {
             return;
         }
-
-        // Process results asynchronously — save each to temp dir
-        let tmp_dir = std::env::temp_dir();
-        let mut paths = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let result: *mut AnyObject = msg_send![results, objectAtIndex: i];
-            let item_provider: *mut AnyObject = msg_send![result, itemProvider];
-
-            // Check if it can load as UIImage
-            let image_class = class!(UIImage);
-            let can_load: Bool = msg_send![item_provider, canLoadObjectOfClass: image_class];
-
-            if can_load.as_bool() {
-                // Use a synchronous approach: save to temp file
-                let uuid_str = uuid::Uuid::new_v4().to_string();
-                let file_name = format!("picked_image_{}.jpg", uuid_str);
-                let file_path = tmp_dir.join(&file_name);
-                let file_path_str = file_path.to_string_lossy().to_string();
-
-                // Create a latch for this item
-                let (item_tx, item_rx) = mpsc::channel::<Option<String>>();
-
-                // Load the file representation
-                let ns_uti = nsstring("public.image");
-                let path_copy = file_path_str.clone();
-
-                // Use loadFileRepresentationForTypeIdentifier to get a temp file URL
-                let block = block2::RcBlock::new(
-                    move |url: *mut AnyObject, _error: *mut AnyObject| {
-                        if url.is_null() {
-                            let _ = item_tx.send(None);
+        let result = (|| -> Result<Vec<String>, String> {
+            let count: usize = msg_send![results, count];
+            let mut imported = request::Imports::new();
+            for index in 0..count {
+                let result: *mut AnyObject = msg_send![results, objectAtIndex: index];
+                let provider: *mut AnyObject = msg_send![result, itemProvider];
+                let movie: Bool = msg_send![provider, hasItemConformingToTypeIdentifier: nsstring("public.movie")];
+                let uti = nsstring(if movie.as_bool() {
+                    "public.movie"
+                } else {
+                    "public.image"
+                });
+                let supported: Bool = msg_send![provider, hasItemConformingToTypeIdentifier: uti];
+                if !supported.as_bool() {
+                    return Err(
+                        "Selected item has no supported image or video representation".into(),
+                    );
+                }
+                let (sender, receiver) = mpsc::channel::<Result<request::Imports, String>>();
+                let sender = std::sync::Mutex::new(Some(sender));
+                let block =
+                    block2::RcBlock::new(move |url: *mut AnyObject, error: *mut AnyObject| {
+                        // Provider completions are independently one-shot, before any file creation.
+                        let Some(sender) = sender.lock().ok().and_then(|mut sender| sender.take())
+                        else {
                             return;
-                        }
-                        // Copy the file to our temp directory
-                        let file_mgr: *mut AnyObject =
-                            msg_send![class!(NSFileManager), defaultManager];
-                        let dest_url: *mut AnyObject =
-                            msg_send![class!(NSURL), fileURLWithPath: nsstring(&path_copy)];
-                        let ok: Bool = msg_send![file_mgr, copyItemAtURL: url, toURL: dest_url, error: std::ptr::null_mut::<*mut AnyObject>()];
-                        if ok.as_bool() {
-                            let _ = item_tx.send(Some(path_copy.clone()));
-                        } else {
-                            let _ = item_tx.send(None);
-                        }
-                    },
-                );
-
-                let _: *mut AnyObject = msg_send![item_provider,
-                    loadFileRepresentationForTypeIdentifier: ns_uti,
-                    completionHandler: &*block
-                ];
-
-                if let Ok(Some(path)) = item_rx.recv() {
-                    paths.push(path);
+                        };
+                        let result = (|| -> Result<request::Imports, String> {
+                            if !error.is_null() {
+                                return Err(completion::error_message(error));
+                            }
+                            if url.is_null() {
+                                return Err("Photo provider returned no file URL".into());
+                            }
+                            let value: *mut AnyObject = msg_send![url, path];
+                            if value.is_null() {
+                                return Err("Photo provider returned no path".into());
+                            }
+                            let bytes: *const std::ffi::c_char = msg_send![value, UTF8String];
+                            if bytes.is_null() {
+                                return Err("Photo provider returned an unreadable path".into());
+                            }
+                            let source = std::ffi::CStr::from_ptr(bytes).to_string_lossy();
+                            // Copy before returning: the provider owns the temporary URL lifetime.
+                            let path =
+                                completion::import_file(std::path::Path::new(source.as_ref()))?;
+                            let mut imported = request::Imports::new();
+                            imported.push(path);
+                            Ok(imported)
+                        })();
+                        // Both a failed send and an unread queued value retain RAII cleanup.
+                        let _ = sender.send(result);
+                    });
+                let progress: *mut AnyObject = msg_send![provider, loadFileRepresentationForTypeIdentifier: uti, completionHandler: &*block];
+                let _: () = msg_send![progress, retain];
+                let result = completion::wait_cancellable(&receiver, || token.is_open());
+                if result.is_err() {
+                    let _: () = msg_send![progress, cancel];
+                }
+                let _: () = msg_send![progress, release];
+                for path in result??.take() {
+                    imported.push(path);
                 }
             }
-        }
-
-        send_result(paths);
+            Ok(imported.take())
+        })();
+        delegate::dismiss(picker, token, result);
     }
 }
 
@@ -140,6 +151,7 @@ fn uipicker_delegate_class() -> &'static AnyClass {
         let mut decl = ClassBuilder::new(c"GpuiUIImagePickerDelegate", superclass).unwrap();
 
         unsafe {
+            delegate::register(&mut decl);
             decl.add_method(
                 sel!(imagePickerController:didFinishPickingMediaWithInfo:),
                 uipicker_did_finish
@@ -157,61 +169,62 @@ fn uipicker_delegate_class() -> &'static AnyClass {
 }
 
 unsafe extern "C" fn uipicker_did_finish(
-    _this: *mut AnyObject,
-    _sel: Sel,
+    this: *mut AnyObject,
+    _: Sel,
     controller: *mut AnyObject,
     info: *mut AnyObject,
 ) {
-    let _: () = msg_send![controller, dismissViewControllerAnimated: true, completion: std::ptr::null::<AnyObject>()];
-
-    // Try to get the image URL first (for videos or saved photos)
-    let media_url_key = nsstring("UIImagePickerControllerMediaURL");
-    let media_url: *mut AnyObject = msg_send![info, objectForKey: media_url_key];
-
-    if !media_url.is_null() {
-        let abs_string: *mut AnyObject = msg_send![media_url, absoluteString];
-        let cstr: *const std::ffi::c_char = msg_send![abs_string, UTF8String];
-        if !cstr.is_null() {
-            let path = std::ffi::CStr::from_ptr(cstr)
-                .to_string_lossy()
-                .into_owned();
-            let path = path.strip_prefix("file://").unwrap_or(&path).to_string();
-            send_result(vec![path]);
-            return;
-        }
+    let Some(token) = delegate::token(this) else {
+        return;
+    };
+    if !token.claim() {
+        return;
     }
-
-    // Fall back to getting the UIImage and saving it
-    let image_key = nsstring("UIImagePickerControllerOriginalImage");
-    let image: *mut AnyObject = msg_send![info, objectForKey: image_key];
-
-    if !image.is_null() {
-        // Convert to JPEG data
-        // Use UIImageJPEGRepresentation C function
-        let jpeg_data = uiimage_jpeg_representation(image, 0.9);
-        if !jpeg_data.is_null() {
-            let uuid_str = uuid::Uuid::new_v4().to_string();
-            let file_name = format!("captured_{}.jpg", uuid_str);
-            let file_path = std::env::temp_dir().join(file_name);
-            let ns_path = nsstring(&file_path.to_string_lossy());
-            let wrote: Bool = msg_send![jpeg_data, writeToFile: ns_path, atomically: true];
-            if wrote.as_bool() {
-                send_result(vec![file_path.to_string_lossy().into_owned()]);
-                return;
+    let result = (|| -> Result<Vec<String>, String> {
+        let media_url: *mut AnyObject =
+            msg_send![info, objectForKey: nsstring("UIImagePickerControllerMediaURL")];
+        if !media_url.is_null() {
+            let value: *mut AnyObject = msg_send![media_url, path];
+            let bytes: *const std::ffi::c_char = msg_send![value, UTF8String];
+            if bytes.is_null() {
+                return Err("Camera returned an unreadable media path".into());
             }
+            let path = std::ffi::CStr::from_ptr(bytes).to_string_lossy();
+            return completion::import_file(std::path::Path::new(path.as_ref()))
+                .map(|path| vec![path]);
         }
-    }
-
-    send_result(vec![]);
+        let image: *mut AnyObject =
+            msg_send![info, objectForKey: nsstring("UIImagePickerControllerOriginalImage")];
+        if image.is_null() {
+            return Err("Camera returned no readable media".into());
+        }
+        let data = uiimage_jpeg_representation(image, 1.0);
+        if data.is_null() {
+            return Err("Cannot encode camera image".into());
+        }
+        let directory = completion::private_import_directory()?;
+        let path = directory
+            .join("captured.jpg")
+            .to_string_lossy()
+            .into_owned();
+        let mut imported = request::Imports::new();
+        imported.push(path.clone()); // RAII reclaims partial file and directory on every error.
+        let wrote: Bool = msg_send![data, writeToFile: nsstring(&path), atomically: true];
+        if !wrote.as_bool() {
+            return Err("Cannot save camera image".into());
+        }
+        Ok(imported.take())
+    })();
+    delegate::dismiss(controller, token, result);
 }
 
-unsafe extern "C" fn uipicker_did_cancel(
-    _this: *mut AnyObject,
-    _sel: Sel,
-    controller: *mut AnyObject,
-) {
-    let _: () = msg_send![controller, dismissViewControllerAnimated: true, completion: std::ptr::null::<AnyObject>()];
-    send_result(vec![]);
+unsafe extern "C" fn uipicker_did_cancel(this: *mut AnyObject, _: Sel, controller: *mut AnyObject) {
+    let Some(token) = delegate::token(this) else {
+        return;
+    };
+    if token.claim() {
+        delegate::dismiss(controller, token, Ok(vec![]));
+    }
 }
 
 // UIImageJPEGRepresentation is a C function, not an ObjC method
@@ -236,6 +249,10 @@ unsafe fn present_vc(vc: *mut AnyObject) -> Result<(), String> {
     let root_vc: *mut AnyObject = msg_send![key_window, rootViewController];
     if root_vc.is_null() {
         return Err("No root view controller".into());
+    }
+    let presented: *mut AnyObject = msg_send![root_vc, presentedViewController];
+    if !presented.is_null() {
+        return Err("Another view controller is already presented".into());
     }
     let _: () = msg_send![root_vc,
         presentViewController: vc,
@@ -297,10 +314,10 @@ pub fn pick_video(
 }
 
 fn pick_image_from_gallery(
-    _options: &ImagePickerOptions,
+    options: &ImagePickerOptions,
     allow_multi: bool,
 ) -> Result<Vec<PickedFile>, String> {
-    let rx = set_result_channel();
+    let rx = set_result_channel()?;
 
     unsafe {
         // PHPickerConfiguration
@@ -320,6 +337,7 @@ fn pick_image_from_gallery(
         // Create PHPickerViewController
         let picker: *mut AnyObject = msg_send![class!(PHPickerViewController), alloc];
         let picker: *mut AnyObject = msg_send![picker, initWithConfiguration: config];
+        let _: () = msg_send![config, release];
         if picker.is_null() {
             return Err("Failed to create PHPickerViewController".into());
         }
@@ -328,19 +346,28 @@ fn pick_image_from_gallery(
         let delegate_cls = phpicker_delegate_class();
         let delegate: *mut AnyObject = msg_send![delegate_cls, alloc];
         let delegate: *mut AnyObject = msg_send![delegate, init];
-        let _: () = msg_send![picker, setDelegate: delegate];
+        delegate::bind(picker, delegate, rx.token.clone())?;
 
-        present_vc(picker)?;
+        let presented = present_vc(picker);
+        let _: () = msg_send![picker, release];
+        presented?;
     }
 
-    match rx.recv() {
-        Ok(paths) => Ok(paths.iter().map(|p| path_to_picked_file(p)).collect()),
-        Err(_) => Ok(vec![]),
+    match completion::wait(&rx.receiver)? {
+        Ok(paths) if !allow_multi && paths.len() > 1 => {
+            request::discard(&paths);
+            Err("Single image picker returned multiple files".into())
+        }
+        Ok(paths) => Ok(image::process(paths, options)?
+            .iter()
+            .map(|p| path_to_picked_file(p))
+            .collect()),
+        Err(error) => Err(error),
     }
 }
 
 fn pick_video_from_gallery() -> Result<Option<PickedFile>, String> {
-    let rx = set_result_channel();
+    let rx = set_result_channel()?;
 
     unsafe {
         // PHPickerConfiguration
@@ -354,6 +381,7 @@ fn pick_video_from_gallery() -> Result<Option<PickedFile>, String> {
 
         let picker: *mut AnyObject = msg_send![class!(PHPickerViewController), alloc];
         let picker: *mut AnyObject = msg_send![picker, initWithConfiguration: config];
+        let _: () = msg_send![config, release];
         if picker.is_null() {
             return Err("Failed to create PHPickerViewController".into());
         }
@@ -361,15 +389,21 @@ fn pick_video_from_gallery() -> Result<Option<PickedFile>, String> {
         let delegate_cls = phpicker_delegate_class();
         let delegate: *mut AnyObject = msg_send![delegate_cls, alloc];
         let delegate: *mut AnyObject = msg_send![delegate, init];
-        let _: () = msg_send![picker, setDelegate: delegate];
+        delegate::bind(picker, delegate, rx.token.clone())?;
 
-        present_vc(picker)?;
+        let presented = present_vc(picker);
+        let _: () = msg_send![picker, release];
+        presented?;
     }
 
-    match rx.recv() {
+    match completion::wait(&rx.receiver)? {
         Ok(paths) if paths.is_empty() => Ok(None),
+        Ok(paths) if paths.len() != 1 => {
+            request::discard(&paths);
+            Err("Single video picker returned multiple files".into())
+        }
         Ok(paths) => Ok(Some(path_to_picked_file(&paths[0]))),
-        Err(_) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -377,7 +411,7 @@ fn pick_from_camera(
     options: &ImagePickerOptions,
     video: bool,
 ) -> Result<Option<PickedFile>, String> {
-    let rx = set_result_channel();
+    let rx = set_result_channel()?;
 
     unsafe {
         // Check if camera is available
@@ -414,14 +448,27 @@ fn pick_from_camera(
         let delegate_cls = uipicker_delegate_class();
         let delegate: *mut AnyObject = msg_send![delegate_cls, alloc];
         let delegate: *mut AnyObject = msg_send![delegate, init];
-        let _: () = msg_send![picker, setDelegate: delegate];
+        delegate::bind(picker, delegate, rx.token.clone())?;
 
-        present_vc(picker)?;
+        let presented = present_vc(picker);
+        let _: () = msg_send![picker, release];
+        presented?;
     }
 
-    match rx.recv() {
+    match completion::wait(&rx.receiver)? {
         Ok(paths) if paths.is_empty() => Ok(None),
-        Ok(paths) => Ok(Some(path_to_picked_file(&paths[0]))),
-        Err(_) => Ok(None),
+        Ok(paths) if paths.len() != 1 => {
+            request::discard(&paths);
+            Err("Camera returned multiple files".into())
+        }
+        Ok(paths) => {
+            let paths = if video {
+                paths
+            } else {
+                image::process(paths, options)?
+            };
+            Ok(paths.first().map(|path| path_to_picked_file(path)))
+        }
+        Err(error) => Err(error),
     }
 }

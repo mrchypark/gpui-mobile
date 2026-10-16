@@ -1,5 +1,5 @@
-use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
+#[path = "../url_launcher/ios.rs"]
+mod launcher;
 
 pub fn open_coordinates(
     latitude: f64,
@@ -44,42 +44,10 @@ pub fn open_directions(
 }
 
 pub fn is_available() -> Result<bool, String> {
-    // Apple Maps is always available on iOS.
-    Ok(true)
+    launcher::can_launch_url("maps://")
 }
 
-fn open_url(url_string: &str) -> Result<bool, String> {
-    unsafe {
-        let nsurl = nsurl_from_str(url_string)?;
-        let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
-        if app.is_null() {
-            return Err("Failed to get UIApplication.sharedApplication".into());
-        }
-        let can_open: bool = msg_send![app, canOpenURL: nsurl];
-        if can_open {
-            let _: () = msg_send![app, openURL: nsurl];
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-}
-
-unsafe fn nsurl_from_str(url: &str) -> Result<*mut AnyObject, String> {
-    let ns_string: *mut AnyObject = msg_send![class!(NSString), alloc];
-    let ns_string: *mut AnyObject = msg_send![ns_string, initWithBytes: url.as_ptr(),
-                                                       length: url.len(),
-                                                       encoding: 4u64];
-    if ns_string.is_null() {
-        return Err("Failed to create NSString from URL".into());
-    }
-    let nsurl: *mut AnyObject = msg_send![class!(NSURL), URLWithString: ns_string];
-    if nsurl.is_null() {
-        return Err(format!("Failed to parse URL: {url}"));
-    }
-    Ok(nsurl)
-}
-
+fn open_url(url: &str) -> Result<bool, String> { launcher::launch_url(url) }
 /// Simple percent-encoding for URL query parameters.
 fn percent_encode(input: &str) -> String {
     let mut result = String::with_capacity(input.len() * 2);

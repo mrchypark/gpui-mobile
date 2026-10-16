@@ -4,6 +4,9 @@ use jni::objects::JValue;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiCalendar";
 
+#[path = "../contacts/wire.rs"]
+mod wire;
+
 pub fn get_calendars() -> Result<Vec<Calendar>, String> {
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
@@ -23,7 +26,7 @@ pub fn get_calendars() -> Result<Vec<Calendar>, String> {
             })?;
 
         if result.is_null() {
-            return Ok(vec![]);
+            return Err("Calendar provider returned no calendar result".into());
         }
 
         let result_str = get_string(env, &result);
@@ -41,7 +44,7 @@ pub fn get_calendars() -> Result<Vec<Calendar>, String> {
                 }
                 Some(Calendar {
                     id: parts[0].to_string(),
-                    name: parts[1].to_string(),
+                    name: wire::decode(parts[1]),
                     is_read_only: parts[2] == "1",
                     color: parts[3].parse::<u64>().unwrap_or(0) as u32,
                 })
@@ -83,7 +86,7 @@ pub fn get_events(
             })?;
 
         if result.is_null() {
-            return Ok(vec![]);
+            return Err("Calendar provider returned no event result".into());
         }
 
         let result_str = get_string(env, &result);
@@ -101,9 +104,9 @@ pub fn get_events(
                 }
                 Some(CalendarEvent {
                     id: parts[0].to_string(),
-                    title: parts[1].to_string(),
-                    description: parts[2].to_string(),
-                    location: parts[3].to_string(),
+                    title: wire::decode(parts[1]),
+                    description: wire::decode(parts[2]),
+                    location: wire::decode(parts[3]),
                     start_ms: parts[4].parse().unwrap_or(0),
                     end_ms: parts[5].parse().unwrap_or(0),
                     all_day: parts[6] == "1",

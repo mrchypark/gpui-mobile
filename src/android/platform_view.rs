@@ -9,6 +9,65 @@ use crate::platform_view::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
+fn encode_parameter(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('|', "%7C")
+        .replace('=', "%3D")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn creation_parameters_preserve_delimiters_and_literal_escapes() {
+        assert_eq!(super::encode_parameter("a|b=c%7C"), "a%7Cb%3Dc%257C");
+        assert_eq!(super::encode_parameter("한국어"), "한국어");
+    }
+}
+
+pub(crate) fn command(id: PlatformViewId, name: &str, args: &[&str]) -> Result<(), String> {
+    use super::jni::{find_app_class, get_string, with_env, JniExt};
+    use jni::objects::JValue;
+    with_env(|env| {
+        let cls = find_app_class(env, "dev.gpui.mobile.GpuiPlatformView")?;
+        let name = env.new_string(name).e()?;
+        let args = env
+            .new_string(
+                args.iter()
+                    .map(|s| encode_parameter(s))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            )
+            .e()?;
+        let result = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("command"),
+                jni::jni_sig!("(JLjava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+                &[
+                    JValue::Long(id.0 as i64),
+                    JValue::Object(&name),
+                    JValue::Object(&args),
+                ],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if result.is_null() {
+            Ok(())
+        } else {
+            let error = get_string(env, &result);
+            Err(if error.is_empty() {
+                "Native command returned an unreadable error".into()
+            } else {
+                error
+            })
+        }
+    })
+}
+
 /// Android implementation of a platform view.
 ///
 /// In hybrid composition mode, this creates a native Android `View` and
@@ -68,7 +127,7 @@ impl AndroidPlatformView {
             let creation_params_str: String = params
                 .creation_params
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{}={}", encode_parameter(k), encode_parameter(v)))
                 .collect::<Vec<_>>()
                 .join("|");
             let creation_params_jstr = env.new_string(&creation_params_str).e()?;
@@ -78,9 +137,9 @@ impl AndroidPlatformView {
             let result = env
                 .call_static_method(
                     &helper_class,
-                    jni::jni_str!("createView"),
+                    jni::jni_str!("createViewChecked"),
                     jni::jni_sig!(
-                        "(Landroid/app/Activity;Ljava/lang/String;JFFFFLjava/lang/String;)Z"
+                        "(Landroid/app/Activity;Ljava/lang/String;JFFFFLjava/lang/String;)Ljava/lang/String;"
                     ),
                     &[
                         JValue::Object(&act),
@@ -98,9 +157,9 @@ impl AndroidPlatformView {
                     format!("createView JNI call failed: {}", e)
                 })?;
 
-            let success = result.z().unwrap_or(false);
-            if !success {
-                return Err("GpuiPlatformView.createView returned false".to_string());
+            let error = result.l().map_err(|e| e.to_string())?;
+            if !error.is_null() {
+                return Err(super::jni::get_string(env, &error));
             }
 
             log::info!(

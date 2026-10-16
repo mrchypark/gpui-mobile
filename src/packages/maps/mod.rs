@@ -12,7 +12,12 @@
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "ios")]
-mod ios;
+pub(crate) mod ios;
+
+#[cfg(target_os = "android")]
+use android as native;
+#[cfg(target_os = "ios")]
+use ios as native;
 
 use crate::platform_view::{
     PlatformViewBounds, PlatformViewHandle, PlatformViewParams, PlatformViewRegistry,
@@ -126,6 +131,8 @@ fn ensure_factory_registered() {
 impl MapView {
     /// Create and display an embedded map view.
     pub fn new(settings: MapSettings) -> Result<Self, String> {
+        validate_coordinate(settings.center)?;
+        validate_zoom(settings.zoom)?;
         ensure_factory_registered();
 
         let mut creation_params = std::collections::HashMap::new();
@@ -175,102 +182,105 @@ impl MapView {
 
     /// Set the map center coordinate.
     pub fn set_center(&mut self, center: LatLng) -> Result<(), String> {
-        self.settings.center = center;
-        #[cfg(target_os = "ios")]
-        {
-            ios::set_center(center)
-        }
-        #[cfg(target_os = "android")]
-        {
-            android::set_center(center)
-        }
+        validate_coordinate(center)?;
+        let id = self.active_id()?;
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        native::set_center(id, center)?;
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        return Err(format!("Maps are unavailable on this platform ({id})"));
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         {
+            self.settings.center = center;
             Ok(())
         }
     }
 
     /// Set the zoom level.
     pub fn set_zoom(&mut self, zoom: f64) -> Result<(), String> {
-        self.settings.zoom = zoom;
-        #[cfg(target_os = "ios")]
-        {
-            ios::set_zoom(zoom)
-        }
-        #[cfg(target_os = "android")]
-        {
-            android::set_zoom(zoom)
-        }
+        validate_zoom(zoom)?;
+        let id = self.active_id()?;
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        native::set_zoom(id, zoom)?;
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        return Err(format!("Maps are unavailable on this platform ({id})"));
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         {
+            self.settings.zoom = zoom;
             Ok(())
         }
     }
 
     /// Set the map type/style.
     pub fn set_map_type(&mut self, map_type: MapType) -> Result<(), String> {
-        self.settings.map_type = map_type;
-        #[cfg(target_os = "ios")]
-        {
-            ios::set_map_type(map_type)
-        }
-        #[cfg(target_os = "android")]
-        {
-            android::set_map_type(map_type)
-        }
+        let id = self.active_id()?;
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        native::set_map_type(id, map_type)?;
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
+            let _ = map_type;
+            return Err(format!("Maps are unavailable on this platform ({id})"));
+        }
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        {
+            self.settings.map_type = map_type;
             Ok(())
         }
     }
 
     /// Add a marker to the map.
     pub fn add_marker(&self, marker: &MapMarker) -> Result<(), String> {
+        validate_coordinate(marker.position)?;
+        if marker.id.is_empty() {
+            return Err("Marker ID must not be empty".into());
+        }
+        let id = self.active_id()?;
         #[cfg(target_os = "ios")]
         {
-            ios::add_marker(marker)
+            ios::add_marker(id, marker)
         }
         #[cfg(target_os = "android")]
         {
-            android::add_marker(marker)
+            android::add_marker(id, marker)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
             let _ = marker;
-            Ok(())
+            Err(format!("Maps are unavailable on this platform ({id})"))
         }
     }
 
     /// Remove a marker by ID.
     pub fn remove_marker(&self, marker_id: &str) -> Result<(), String> {
+        let id = self.active_id()?;
         #[cfg(target_os = "ios")]
         {
-            ios::remove_marker(marker_id)
+            ios::remove_marker(id, marker_id)
         }
         #[cfg(target_os = "android")]
         {
-            android::remove_marker(marker_id)
+            android::remove_marker(id, marker_id)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
             let _ = marker_id;
-            Ok(())
+            Err(format!("Maps are unavailable on this platform ({id})"))
         }
     }
 
     /// Remove all markers from the map.
     pub fn clear_markers(&self) -> Result<(), String> {
+        let id = self.active_id()?;
         #[cfg(target_os = "ios")]
         {
-            ios::clear_markers()
+            ios::clear_markers(id)
         }
         #[cfg(target_os = "android")]
         {
-            android::clear_markers()
+            android::clear_markers(id)
         }
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
-            Ok(())
+            Err(format!("Maps are unavailable on this platform ({id})"))
         }
     }
 
@@ -279,6 +289,74 @@ impl MapView {
         if let Some(h) = self.platform_handle.take() {
             h.dispose();
         }
+    }
+
+    fn active_id(&self) -> Result<crate::platform_view::PlatformViewId, String> {
+        let handle = self.platform_handle.as_ref().ok_or("Map is disposed")?;
+        if handle.inner().is_disposed() || handle.view_type() != "map" {
+            return Err("No active map instance".into());
+        }
+        Ok(handle.id())
+    }
+}
+
+fn validate_coordinate(value: LatLng) -> Result<(), String> {
+    if !value.latitude.is_finite()
+        || !value.longitude.is_finite()
+        || !(-90.0..=90.0).contains(&value.latitude)
+        || !(-180.0..=180.0).contains(&value.longitude)
+    {
+        return Err("Coordinate must be finite, latitude -90..90 and longitude -180..180".into());
+    }
+    Ok(())
+}
+
+fn validate_zoom(value: f64) -> Result<(), String> {
+    if !value.is_finite() || !(0.0..=20.0).contains(&value) {
+        return Err("Zoom must be finite and within 0..20".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_camera_values_are_rejected() {
+        assert!(validate_zoom(f64::NAN).is_err());
+        assert!(validate_zoom(21.0).is_err());
+        assert!(validate_zoom(0.0).is_ok());
+        assert!(validate_coordinate(LatLng {
+            latitude: 91.0,
+            longitude: 0.0
+        })
+        .is_err());
+        assert!(validate_coordinate(LatLng {
+            latitude: 0.0,
+            longitude: f64::INFINITY
+        })
+        .is_err());
+    }
+    #[test]
+    fn disposed_map_rejects_every_control() {
+        let mut map = MapView {
+            platform_handle: None,
+            settings: MapSettings::default(),
+        };
+        assert!(map.set_center(map.settings.center).is_err());
+        assert!(map.set_zoom(1.0).is_err());
+        assert_eq!(map.settings.zoom, 12.0);
+        assert!(map.set_map_type(MapType::Hybrid).is_err());
+        assert!(map.remove_marker("id").is_err());
+        assert!(map.clear_markers().is_err());
+        assert!(map
+            .add_marker(&MapMarker {
+                id: "id".into(),
+                position: map.settings.center,
+                title: None,
+                snippet: None
+            })
+            .is_err());
     }
 }
 

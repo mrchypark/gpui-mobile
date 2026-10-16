@@ -8,6 +8,11 @@ import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
@@ -36,6 +41,70 @@ public class GpuiMediaSession {
     private static MediaSessionCompat sSession;
     private static NotificationManager sNotificationManager;
     private static Activity sActivity;
+    private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private static final class MainOperation<T> implements Runnable {
+        final Callable<T> operation;
+        final CountDownLatch done = new CountDownLatch(1);
+        boolean abandoned;
+        boolean finished;
+        T value;
+        Throwable failure;
+        MainOperation(Callable<T> operation) { this.operation = operation; }
+        @Override public void run() {
+            synchronized (this) {
+                if (abandoned) return; // Cancellation wins before start.
+            }
+            T result = null;
+            Throwable error = null;
+            try { result = operation.call(); }
+            catch (Throwable caught) { error = caught; }
+            boolean cleanup;
+            synchronized (this) {
+                // Completion and abandonment have one linearization point.
+                // A late init/mutation must not leave a live orphan session.
+                cleanup = abandoned;
+                value = result;
+                failure = error;
+                finished = true;
+            }
+            try { if (cleanup) releaseMain(); }
+            catch (RuntimeException cleanupError) {
+                Log.e(TAG, "Failed to release abandoned media operation", cleanupError);
+            }
+            finally { done.countDown(); }
+        }
+        synchronized T resultOrAbandon(boolean interrupted) {
+            if (!finished) {
+                abandoned = true;
+                mainHandler.removeCallbacks(this);
+                throw new IllegalStateException(interrupted
+                        ? "Media operation interrupted; late work will be released"
+                        : "Media operation timed out; late work will be released");
+            }
+            if (failure != null) throw new IllegalStateException(failure);
+            return value;
+        }
+    }
+
+    // Synchronous JNI contract. Never wait indefinitely while NativeActivity's
+    // main thread may itself be waiting for a native lifecycle acknowledgement.
+    private static <T> T onMain(Callable<T> operation) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try { return operation.call(); }
+            catch (RuntimeException error) { throw error; }
+            catch (Exception error) { throw new IllegalStateException(error); }
+        }
+        MainOperation<T> task = new MainOperation<>(operation);
+        if (!mainHandler.post(task)) throw new IllegalStateException("Main queue unavailable");
+        boolean interrupted = false;
+        try { task.done.await(2, TimeUnit.SECONDS); }
+        catch (InterruptedException error) {
+            interrupted = true;
+            Thread.currentThread().interrupt();
+        }
+        return task.resultOrAbandon(interrupted);
+    }
 
     /**
      * Initialize the media session. Call once when playback starts.
@@ -43,9 +112,15 @@ public class GpuiMediaSession {
      * @param activity The current Activity.
      */
     public static void init(Activity activity) {
+        onMain(() -> { initMain(activity); return null; });
+    }
+
+    private static void initMain(Activity activity) {
         if (sSession != null) return;
+        if (activity.isFinishing() || activity.isDestroyed()) throw new IllegalStateException("Activity unavailable");
         sActivity = activity;
 
+        try {
         sSession = new MediaSessionCompat(activity, "GpuiMediaSession");
         sSession.setFlags(
                 MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS |
@@ -88,7 +163,7 @@ public class GpuiMediaSession {
                 Log.i(TAG, "MediaSession callback: onSeekTo " + pos);
                 nativeMediaSeek(pos);
             }
-        });
+        }, mainHandler);
 
         sSession.setActive(true);
 
@@ -106,6 +181,10 @@ public class GpuiMediaSession {
         }
 
         Log.i(TAG, "MediaSession initialized");
+        } catch (RuntimeException error) {
+            releaseMain();
+            throw error;
+        }
     }
 
     /**
@@ -116,7 +195,10 @@ public class GpuiMediaSession {
      * @param durationMs Duration in milliseconds.
      */
     public static void setMetadata(String title, String artist, long durationMs) {
-        if (sSession == null) return;
+        onMain(() -> { setMetadataMain(title, artist, durationMs); return null; });
+    }
+    private static void setMetadataMain(String title, String artist, long durationMs) {
+        if (sSession == null) throw new IllegalStateException("Media session not initialized");
 
         MediaMetadataCompat.Builder builder = new MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title != null ? title : "Unknown")
@@ -135,7 +217,10 @@ public class GpuiMediaSession {
      * @param speed      Playback speed (1.0 = normal).
      */
     public static void setPlaybackState(boolean isPlaying, long positionMs, float speed) {
-        if (sSession == null) return;
+        onMain(() -> { setPlaybackStateMain(isPlaying, positionMs, speed); return null; });
+    }
+    private static void setPlaybackStateMain(boolean isPlaying, long positionMs, float speed) {
+        if (sSession == null) throw new IllegalStateException("Media session not initialized");
 
         int state = isPlaying
                 ? PlaybackStateCompat.STATE_PLAYING
@@ -227,16 +312,24 @@ public class GpuiMediaSession {
      * Release the media session and dismiss the notification.
      */
     public static void release() {
-        if (sSession != null) {
-            sSession.setActive(false);
-            sSession.release();
-            sSession = null;
-        }
-        if (sNotificationManager != null) {
-            sNotificationManager.cancel(NOTIFICATION_ID);
-            sNotificationManager = null;
-        }
+        onMain(() -> { releaseMain(); return null; });
+    }
+    private static void releaseMain() {
+        MediaSessionCompat session = sSession;
+        NotificationManager notifications = sNotificationManager;
+        sSession = null;
+        sNotificationManager = null;
         sActivity = null;
+        try {
+            if (session != null) {
+                try {
+                    session.setCallback(null, mainHandler);
+                    session.setActive(false);
+                } finally { session.release(); }
+            }
+        } finally {
+            if (notifications != null) notifications.cancel(NOTIFICATION_ID);
+        }
         Log.i(TAG, "MediaSession released");
     }
 
@@ -245,7 +338,7 @@ public class GpuiMediaSession {
      * Returns null if not initialized.
      */
     public static MediaSessionCompat.Token getSessionToken() {
-        return sSession != null ? sSession.getSessionToken() : null;
+        return onMain(() -> sSession != null ? sSession.getSessionToken() : null);
     }
 
     /**

@@ -5,9 +5,79 @@ use std::{
     rc::{Rc, Weak},
 };
 
+/// Shared production ordering for IME characters and control keys. Every user
+/// callback may change focus, so revalidate the captured owner between calls.
+pub(crate) fn deliver_ime_key(
+    input: crate::mobile_events::ImeInput,
+    current: impl Fn() -> bool,
+    mut legacy: impl FnMut(&str) -> bool,
+    mut dispatch: impl FnMut(gpui::PlatformInput) -> gpui::DispatchEventResult,
+    mut replace: impl FnMut(&str),
+) {
+    use crate::mobile_events::ImeInput;
+    if !current() {
+        return;
+    }
+    let (key, text, prefer_character_input): (String, String, bool) = match input {
+        ImeInput::Commit(text) => {
+            // Native IME commits are already text, not printable key events.
+            // GPUI key dispatch takes/restores the handler while probing bindings.
+            if !legacy(&text) && current() {
+                replace(&text);
+            }
+            return;
+        }
+        ImeInput::Enter => ("enter".into(), "\n".into(), false),
+        ImeInput::Backspace => ("backspace".into(), "\x08".into(), false),
+        ImeInput::DeleteBefore { .. } | ImeInput::Compose { .. } | ImeInput::FinishComposition => return,
+    };
+    if prefer_character_input && legacy(&text) {
+        return;
+    }
+    if !current() {
+        return;
+    }
+    let result = dispatch(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+        keystroke: gpui::Keystroke {
+            modifiers: gpui::Modifiers::default(),
+            key,
+            key_char: prefer_character_input.then(|| text.clone()),
+        },
+        is_held: false,
+        prefer_character_input,
+    }));
+    if !result.propagate || result.default_prevented || !current() {
+        return;
+    }
+    if !prefer_character_input && legacy(&text) {
+        return;
+    }
+    if current() && text != "\x08" {
+        replace(&text);
+    }
+}
+
 pub(crate) struct Registry<T> {
     next: Cell<usize>,
     entries: RefCell<BTreeMap<usize, Weak<T>>>,
+}
+
+/// Keep native-view ownership for the whole Android motion sequence.
+#[derive(Default)]
+pub(crate) struct NativeTouchRoute {
+    native: bool,
+}
+impl NativeTouchRoute {
+    pub fn route(&mut self, down: bool, terminal: bool, hit_test: impl FnOnce() -> bool) -> bool {
+        if down {
+            self.native = hit_test();
+        }
+        let native = self.native;
+        if terminal {
+            self.native = false;
+        }
+        native
+    }
 }
 impl<T> Default for Registry<T> {
     fn default() -> Self {
@@ -55,6 +125,7 @@ impl<T> Default for Callback<T> {
     }
 }
 impl<T> Callback<T> {
+    pub fn generation(&self) -> u64 { self.generation.get() }
     pub fn take(&self) -> Option<T> {
         self.generation.set(self.generation.get().wrapping_add(1));
         self.value.borrow_mut().take()
@@ -123,9 +194,11 @@ impl<E> EventQueue<E> {
 thread_local! {
     static TEXT: EventQueue<String> = EventQueue::default();
     static TEXT_REGISTERED: Cell<bool> = const { Cell::new(false) };
+    static TEXT_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn set_text_handler(handler: Option<Box<dyn FnMut(&str)>>) {
+    TEXT_GENERATION.set(TEXT_GENERATION.get().wrapping_add(1));
     TEXT_REGISTERED.set(handler.is_some());
     TEXT.with(|queue| {
         queue.set_handler(handler.map(|mut handler| {
@@ -142,9 +215,189 @@ pub(crate) fn dispatch_text(text: &str) -> bool {
     true
 }
 
+pub(crate) fn has_text_handler() -> bool {
+    TEXT_REGISTERED.get()
+}
+
+pub(crate) fn text_handler_generation() -> u64 {
+    TEXT_GENERATION.get()
+}
+
+/// Clamp UIKit's UTF-16 selection to the composing string without splitting a scalar.
+pub(crate) fn composing_selection(
+    text: &str,
+    location: usize,
+    length: usize,
+) -> std::ops::Range<usize> {
+    let mut boundaries = std::iter::once(0).chain(text.chars().scan(0, |offset, character| {
+        *offset += character.len_utf16();
+        Some(*offset)
+    }));
+    let end_limit = location.saturating_add(length);
+    let mut start = 0;
+    let mut end = 0;
+    for offset in &mut boundaries {
+        if offset <= location {
+            start = offset;
+        }
+        if offset <= end_limit {
+            end = offset;
+        }
+    }
+    start..end.max(start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ime_legacy_single_delete_is_a_backspace_command_not_a_range() {
+        for codepoints in [false, true] {
+            let input =
+                crate::mobile_events::ime_delete_request(1, codepoints, false, true).unwrap();
+            let value = RefCell::new("123".to_owned());
+            deliver_ime_key(
+                input,
+                || true,
+                |text| {
+                    assert_eq!(text, "\x08");
+                    value.borrow_mut().pop();
+                    true
+                },
+                |event| {
+                    let gpui::PlatformInput::KeyDown(event) = event else {
+                        panic!("expected key")
+                    };
+                    assert_eq!(event.keystroke.key, "backspace");
+                    gpui::DispatchEventResult {
+                        propagate: true,
+                        default_prevented: false,
+                    }
+                },
+                |_| panic!("legacy backspace must not replace a guessed range"),
+            );
+            assert_eq!(&*value.borrow(), "12");
+            assert!(crate::mobile_events::ime_delete_request(2, codepoints, false, true).is_none());
+        }
+    }
+
+    #[test]
+    fn ime_commit_revalidates_after_legacy_callback_changes_session() {
+        let active = Cell::new(true);
+        deliver_ime_key(
+            crate::mobile_events::ImeInput::Commit("old".into()),
+            || active.get(),
+            |_| {
+                active.set(false);
+                false
+            },
+            |_| panic!("unexpected key dispatch"),
+            |_| panic!("stale commit after legacy focus change"),
+        );
+    }
+
+    #[test]
+    fn ime_commit_reaches_replacement_once_without_synthetic_key_dispatch() {
+        let received = RefCell::new(Vec::new());
+        deliver_ime_key(
+            crate::mobile_events::ImeInput::Commit("한🦀".into()),
+            || true,
+            |_| false,
+            |_| panic!("native commit must not enter GPUI printable-key dispatch"),
+            |text| received.borrow_mut().push(text.to_owned()),
+        );
+        assert_eq!(*received.borrow(), vec!["한🦀"]);
+    }
+
+    #[test]
+    fn ime_enter_binding_precedes_legacy_and_newline_fallback() {
+        for prevent in [false, true] {
+            let trace = RefCell::new(Vec::new());
+            deliver_ime_key(
+                crate::mobile_events::ImeInput::Enter,
+                || true,
+                |_| {
+                    trace.borrow_mut().push("legacy");
+                    false
+                },
+                |event| {
+                    let gpui::PlatformInput::KeyDown(event) = event else {
+                        panic!("expected key")
+                    };
+                    assert_eq!(event.keystroke.key, "enter");
+                    assert!(!event.prefer_character_input);
+                    assert_eq!(event.keystroke.key_char, None);
+                    trace.borrow_mut().push("binding");
+                    gpui::DispatchEventResult {
+                        propagate: true,
+                        default_prevented: prevent,
+                    }
+                },
+                |text| {
+                    assert_eq!(text, "\n");
+                    trace.borrow_mut().push("replace");
+                },
+            );
+            assert_eq!(
+                *trace.borrow(),
+                if prevent {
+                    vec!["binding"]
+                } else {
+                    vec!["binding", "legacy", "replace"]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ime_owner_change_during_dispatch_does_not_insert_into_replacement() {
+        let editor = Cell::new(1);
+        deliver_ime_key(
+            crate::mobile_events::ImeInput::Enter,
+            || editor.get() == 1,
+            |_| false,
+            |_| {
+                editor.set(2);
+                gpui::DispatchEventResult {
+                    propagate: true,
+                    default_prevented: false,
+                }
+            },
+            |_| panic!("stale input reached replacement field"),
+        );
+    }
+
+    #[test]
+    fn ime_consumed_legacy_commit_has_no_duplicate_dispatch_or_replacement() {
+        deliver_ime_key(
+            crate::mobile_events::ImeInput::Commit("x".into()),
+            || true,
+            |_| true,
+            |_| panic!("duplicate dispatch"),
+            |_| panic!("duplicate insertion"),
+        );
+    }
+
+    #[test]
+    fn composing_selection_preserves_utf16_scalar_boundaries() {
+        assert_eq!(composing_selection("a🦀한", 1, 2), 1..3);
+        assert_eq!(composing_selection("a🦀한", 2, 0), 1..1);
+        assert_eq!(composing_selection("a🦀한", 3, usize::MAX), 3..4);
+        assert_eq!(composing_selection("", usize::MAX, usize::MAX), 0..0);
+    }
+    #[test]
+    fn native_view_ownership_survives_boundary_crossing_and_extra_pointers() {
+        let mut route = NativeTouchRoute::default();
+        assert!(!route.route(true, false, || false));
+        for terminal in [false, false, true] {
+            assert!(!route.route(false, terminal, || panic!("only first down hit-tests")));
+        }
+        assert!(route.route(true, false, || true));
+        assert!(route.route(false, false, || false));
+        assert!(route.route(false, true, || false));
+        assert!(!route.route(true, false, || false));
+    }
     #[test]
     fn text_dispatch_can_clear_replace_and_queue_owned_text() {
         let seen = Rc::new(RefCell::new(Vec::new()));
