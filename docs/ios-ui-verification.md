@@ -107,3 +107,23 @@ Handoff: **빌드·화면 조작 종료**. No build or UI work remains active; p
 9.2 GiB free at handoff. The generated target is retained for inexpensive
 reproduction. No additional tests or target cleanup were performed.
 
+## Individual hardware-key follow-up — 2026-10-16
+
+**PASS for CUA individual key delivery:** the parent cleared the field with 25
+`app.pressKey('BackSpace')` calls, then separately pressed `a`, `b`, `c`, `1`,
+`2`, `3`. The field shows exact `abc123` in
+`outputs/ios-ui-verification/09-hardware-abc123.png` under the enclosing task
+directory. This verifies tool-driven individual hardware-key input in Simulator;
+it is not a claim of human typing on a physical keyboard.
+
+The same persisted native executable was used: SHA-256
+`f92a7178ea3810d5605803f9300a91bfe0f48f1becf90fe07993a55e6e53d961`;
+local focus-fix commit `a08990b`, remote baseline `7253295`. No rebuild was needed.
+
+Bulk `app.typeText('abc123')` still produced `å∫ç123`. Its cause remains unresolved,
+but the difference from successful individual keys and software-keyboard AX input
+points to the bulk tool/Simulator path. Source inspection found that UIKit's
+`insertText:` string is passed unchanged to Ely. No backend change is justified by
+the bulk result alone. This supersedes only the earlier exact-hardware-entry gap;
+the other dated verification limits above remain unchanged.
+
