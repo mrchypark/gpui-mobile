@@ -23,11 +23,12 @@ xcrun --sdk iphonesimulator clang -target arm64-apple-ios16.0-simulator -isysroo
   -Wl,-force_load,"$CARGO_TARGET_DIR/aarch64-apple-ios-sim/debug/libgpui_mobile_ely_integration.a" \
   -lc++ -liconv -lresolv -lz -framework UIKit -framework Metal -framework MetalKit \
   -framework QuartzCore -framework CoreGraphics -framework CoreText -framework CoreFoundation \
-  -framework Foundation -framework Security -framework SystemConfiguration -framework AudioToolbox \
+  -framework Foundation -framework Security -framework SystemConfiguration -framework Network -framework AudioToolbox \
   -framework WebKit -framework CoreMedia -framework AVFoundation -framework LocalAuthentication \
-  -framework Contacts -framework EventKit -framework StoreKit -framework CoreMotion \
+  -framework QuickLook -framework ImageIO -framework UniformTypeIdentifiers -framework Speech -framework AppTrackingTransparency \
+  -framework Contacts -framework EventKit -framework StoreKit -framework CoreMotion -framework MediaPlayer -framework MapKit \
   -framework CoreLocation -framework Photos -framework PhotosUI -framework CoreVideo \
-  -framework CoreBluetooth -ObjC -o "$app/ElyIntegration"
+  -framework CoreBluetooth -framework CoreHaptics -framework UserNotifications -ObjC -o "$app/ElyIntegration"
 codesign --force --sign - "$app"
 if [ "${1:-}" != "--no-run" ]; then
   simulator=${SIMULATOR_UDID:-booted}

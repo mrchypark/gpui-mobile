@@ -1,7 +1,13 @@
 # btleplug 0.13.5 local Android ABI fix
 
-This is the unmodified crates.io 0.13.5 archive except the four files in
-../patches/android-service-addressing.patch. Version and all dependencies remain
+This is the crates.io 0.13.5 archive with three ordered patches in ../patches:
+
+1. android-service-addressing.patch: service-qualified GATT identity and scan callbacks.
+2. android-idle-disconnect.patch: idle client retirement, reported close failures,
+   and synchronized connection-state reads.
+3. android-abort-disconnect.patch: immediate cleanup of stalled commands and retries.
+
+Together they change four upstream files. Version and all dependencies remain
 unchanged. Upstream license and crate metadata are retained.
 
 Archive SHA-256: 3d836502de731602ea87cbb307065e8feaed4fd10f0855a75b0b87944ee011dc.

@@ -114,6 +114,29 @@ int main(void) {
         assert(subscriptions[@1] == replacement);
         [replacement stop];
 
+        // Independent managers may report an older buffered fix after a newer
+        // one. Once both stop, the process cache must retain the newest sample.
+        lastPosition = nil;
+        lastPositionTime = nil;
+        TestManager *olderManager = [TestManager new];
+        GpuiLocationSubscription *newerOwner = make(6, manager);
+        GpuiLocationSubscription *olderOwner = make(7, olderManager);
+        NSDate *newerTime = [NSDate dateWithTimeIntervalSinceNow:-1];
+        NSDate *olderTime = [newerTime dateByAddingTimeInterval:-10];
+        [newerOwner locationManager:(CLLocationManager *)manager didUpdateLocations:@[sample(newerTime)]];
+        NSString *newestCache = lastPosition;
+        [olderOwner locationManager:(CLLocationManager *)olderManager didUpdateLocations:@[sample(olderTime)]];
+        [newerOwner stop];
+        [olderOwner stop];
+        manager.location = nil;
+        olderManager.location = nil;
+        readNativeCache((CLLocationManager *)manager);
+        readNativeCache((CLLocationManager *)olderManager);
+        assert([lastPosition isEqual:newestCache] && [lastPositionTime isEqual:newerTime]);
+        olderManager.location = sample(olderTime);
+        readNativeCache((CLLocationManager *)olderManager);
+        assert([lastPosition isEqual:newestCache]);
+
         GpuiLocationSubscription *backgroundWatch = make(4, manager);
         backgroundWatch.backgroundTracking = YES;
         manager.authorizationStatus = kCLAuthorizationStatusAuthorizedWhenInUse;

@@ -47,6 +47,15 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Admission must precede disconnect/retrieval: background opt-in protects
+    /// only an uninterrupted connection, and disconnect releases that lease.
+    pub fn admit_connection(&self, in_background: bool) -> Result<()> {
+        self.allowed()?;
+        if in_background {
+            return Err(Error::NotSupported("Connecting requires foreground use".into()));
+        }
+        Ok(())
+    }
     pub async fn operation<T>(
         &mut self,
         timeout: std::time::Duration,
@@ -114,6 +123,25 @@ pub(super) fn validate_characteristic(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn background_connection_admission_preserves_uninterrupted_session() {
+        // Opted-in pause deliberately leaves paused=false. Recovery may also
+        // be required after disconnect; neither permits background connection.
+        let mut state = super::State::new(super::Permission::Granted);
+        for recovery in [false, true] {
+            state.recovery_needed = recovery;
+            assert!(matches!(state.admit_connection(true), Err(super::Error::NotSupported(_))));
+            assert!(!state.paused);
+            assert_eq!(state.recovery_needed, recovery);
+            // Resume permits reconnect even when interruption requires recovery.
+            assert!(state.admit_connection(false).is_ok());
+        }
+        state.paused = true;
+        assert!(state.admit_connection(false).is_err());
+        state.paused = false;
+        state.permission = super::Permission::Denied;
+        assert!(matches!(state.admit_connection(false), Err(super::Error::PermissionDenied)));
+    }
     use super::*;
     #[test]
     fn lost_background_context_survives_successful_and_failed_cleanup() {

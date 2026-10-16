@@ -38,6 +38,16 @@ static NSString *serialize(CLLocation *location) {
         (unsigned long long)(location.timestamp.timeIntervalSince1970 * 1000.0)];
 }
 
+static void cacheLocation(CLLocation *location) {
+    if (!validLocation(location)) return;
+    @synchronized(CLLocationManager.class) {
+        if (!lastPositionTime || [location.timestamp compare:lastPositionTime] == NSOrderedDescending) {
+            lastPosition = serialize(location);
+            lastPositionTime = location.timestamp;
+        }
+    }
+}
+
 @interface GpuiLocationSubscription : NSObject <CLLocationManagerDelegate>
 @property(nonatomic) uint64_t token;
 @property(nonatomic) BOOL once;
@@ -126,7 +136,7 @@ static NSString *serialize(CLLocation *location) {
         if (!self.active || self.suspended || !validLocation(location)) continue;
         if (self.once && [location.timestamp compare:self.requestedAt] == NSOrderedAscending) continue;
         NSString *value = serialize(location);
-        @synchronized(GpuiLocationSubscription.class) { lastPosition = value; lastPositionTime = location.timestamp; }
+        cacheLocation(location);
         [self emit:[@"position|" stringByAppendingString:value]];
         if (self.once) { [self finish:@"completed"]; break; }
     }
@@ -218,14 +228,7 @@ bool gpui_location_subscription_active(uint64_t token) {
     return active;
 }
 static void readNativeCache(CLLocationManager *manager) {
-    CLLocation *location = manager.location;
-    if (!validLocation(location)) return;
-    @synchronized(GpuiLocationSubscription.class) {
-        if (!lastPositionTime || [location.timestamp compare:lastPositionTime] == NSOrderedDescending) {
-            lastPosition = serialize(location);
-            lastPositionTime = location.timestamp;
-        }
-    }
+    cacheLocation(manager.location);
 }
 bool gpui_location_last(char *buffer, size_t capacity) {
     void (^query)(void) = ^{
@@ -235,7 +238,7 @@ bool gpui_location_last(char *buffer, size_t capacity) {
     };
     if ([NSThread isMainThread]) query();
     else dispatch_sync(dispatch_get_main_queue(), query);
-    @synchronized(GpuiLocationSubscription.class) {
+    @synchronized(CLLocationManager.class) {
         if (!lastPosition || strlen(lastPosition.UTF8String) + 1 > capacity) return false;
         strcpy(buffer, lastPosition.UTF8String);
         return true;

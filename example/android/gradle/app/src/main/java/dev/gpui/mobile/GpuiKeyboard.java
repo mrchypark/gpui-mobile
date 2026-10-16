@@ -140,21 +140,14 @@ public final class GpuiKeyboard extends View {
             }
             @Override public boolean deleteSurroundingText(int before, int after) {
                 if (!current()) return false;
-                if (getEditable().length() > 0) {
-                    boolean result = super.deleteSurroundingText(before, after);
-                    if (result && logicalOwner) publishComposition();
-                    return result;
-                }
+                // This proxy holds only composition, not the surrounding document.
+                if (composing || getEditable().length() > 0) return false;
                 if (before < 0 || after != 0) return false;
                 return deleteBefore(connectionSession, editorEpoch(), before, false);
             }
             @Override public boolean deleteSurroundingTextInCodePoints(int before, int after) {
                 if (!current()) return false;
-                if (getEditable().length() > 0) {
-                    boolean result = super.deleteSurroundingTextInCodePoints(before, after);
-                    if (result && logicalOwner) publishComposition();
-                    return result;
-                }
+                if (composing || getEditable().length() > 0) return false;
                 if (before < 0 || after != 0) return false;
                 return deleteBefore(connectionSession, editorEpoch(), before, true);
             }
@@ -168,9 +161,15 @@ public final class GpuiKeyboard extends View {
                 if (event.getAction() != KeyEvent.ACTION_DOWN) return true;
                 if (event.getKeyCode() == KeyEvent.KEYCODE_DEL) committed(connectionSession, editorEpoch(), 2, "");
                 else if (event.getKeyCode() == KeyEvent.KEYCODE_ENTER) committed(connectionSession, editorEpoch(), 1, "");
-                else if (event.getUnicodeChar() != 0)
-                    committed(connectionSession, editorEpoch(), 0, new String(Character.toChars(event.getUnicodeChar())));
-                else return super.sendKeyEvent(event);
+                else {
+                    int unicode = event.getUnicodeChar();
+                    // Dead-key values carry a flag, not a Unicode scalar. Let the IME
+                    // handle unsupported dead keys rather than claiming a committed accent.
+                    if ((unicode & android.view.KeyCharacterMap.COMBINING_ACCENT) != 0)
+                        return false;
+                    if (unicode == 0) return super.sendKeyEvent(event);
+                    committed(connectionSession, editorEpoch(), 0, new String(Character.toChars(unicode)));
+                }
                 return true;
             }
         };

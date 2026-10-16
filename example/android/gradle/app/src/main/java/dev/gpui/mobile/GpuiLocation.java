@@ -137,8 +137,14 @@ public final class GpuiLocation {
         return manager != null && (manager.isProviderEnabled(LocationManager.GPS_PROVIDER)
             || manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER));
     }
-    public static void start(Activity activity, long id, int accuracy, double distance, boolean once, long timeoutMs, boolean background) {
+    public static void start(Activity activity, long id, int accuracy, double distance, boolean once, long timeoutMs, boolean background, long previous) {
         MAIN.post(() -> {
+            if (!Double.isFinite(distance) || distance < 0 || distance > Float.MAX_VALUE
+                || (once && (timeoutMs < 1 || timeoutMs > 86_400_000))) {
+                nativeEvent(id, "error|configuration|Invalid distance filter or timeout");
+                nativeEvent(id, "end|configuration");
+                return;
+            }
             Subscription existing = SUBSCRIPTIONS.get(id);
             if (existing != null && existing.background && background) { existing.resume(); return; }
             if (activity.isDestroyed() || activity.isFinishing()) {
@@ -146,16 +152,9 @@ public final class GpuiLocation {
                 nativeEvent(id, "end|owner_destroyed");
                 return;
             }
-            stopOnMain(id);
-            if (GpuiGmsLocation.cleanupPending()) {
+            if (!prepareStart(id, previous)) {
                 nativeEvent(id, "error|cleanup_pending|Previous GMS listener cleanup is pending; retry after cleanup");
                 nativeEvent(id, "end|cleanup_pending");
-                return;
-            }
-            if (!Double.isFinite(distance) || distance < 0 || distance > Float.MAX_VALUE
-                || (once && (timeoutMs < 1 || timeoutMs > 86_400_000))) {
-                nativeEvent(id, "error|configuration|Invalid distance filter or timeout");
-                nativeEvent(id, "end|configuration");
                 return;
             }
             if (background && !HostState.resumed(activity) && !GpuiLocationService.isReady()) {
@@ -185,6 +184,17 @@ public final class GpuiLocation {
         });
     }
     public static void stop(long id) { MAIN.post(() -> stopOnMain(id)); }
+    private static boolean prepareStart(long id, long previous) {
+        stopOnMain(id);
+        Subscription predecessor = previous == id ? null : SUBSCRIPTIONS.get(previous);
+        if (predecessor != null && predecessor.gms != null) {
+            // Rust posts replacement start before dropping its old mailbox. Fence
+            // that exact native owner before admission, including failed removal.
+            // Its logical lease is released by the already-scheduled old-token Stop.
+            GpuiGmsLocation.retire(predecessor.gms);
+        }
+        return !GpuiGmsLocation.cleanupPending();
+    }
     // Called only by the DEBUG host probe. Snapshot is read on main, never by
     // racing the native worker against the subscription/retirement maps.
     static final class ProbeBackend {
@@ -450,6 +460,7 @@ public final class GpuiLocation {
             } catch (IllegalArgumentException error) { suspend(); emit("error|native|" + error.getMessage()); }
         }
         void logPowerState(String phase) {
+            if (!debug) return;
             // Diagnostic only. A failed status query must not alter listener ownership.
             try {
                 android.os.PowerManager power = application.getSystemService(android.os.PowerManager.class);
@@ -481,7 +492,7 @@ public final class GpuiLocation {
             if (!Fix.valid(location.getLatitude(), location.getLongitude(), location.hasAccuracy(),
                 location.getAccuracy(), location.getTime())) return;
             boolean resumed = HostState.resumed(activity.get());
-            if (background && lockedReceipt.pending() && !resumed) {
+            if (debug && background && lockedReceipt.pending() && !resumed) {
                 android.os.PowerManager power = application.getSystemService(android.os.PowerManager.class);
                 android.app.KeyguardManager keyguard = application.getSystemService(android.app.KeyguardManager.class);
                 if (power != null && keyguard != null) {
@@ -494,12 +505,12 @@ public final class GpuiLocation {
                     }
                 }
             }
-            if (!loggedFirstFix) {
+            if (debug && !loggedFirstFix) {
                 loggedFirstFix = true;
                 android.util.Log.i("GpuiLocation", "first_valid_fix background=" + background);
             }
             long receipt = SystemClock.elapsedRealtime();
-            android.util.Log.i("GpuiLocation", "live_fix provider=" + location.getProvider()
+            if (debug) android.util.Log.i("GpuiLocation", "live_fix provider=" + location.getProvider()
                 + " backend=" + backend
                 + " registration_elapsed_ms=" + (receipt - registeredAt)
                 + " cadence_ms=" + (lastReceipt == 0 ? -1 : receipt - lastReceipt)

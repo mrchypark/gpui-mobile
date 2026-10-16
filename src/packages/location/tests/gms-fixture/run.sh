@@ -8,7 +8,7 @@ trap 'rm -rf "$scratch"; test ! -e "$scratch" && echo CLEANUP-fixture-removed' E
 cd "$scratch"
 mkdir -p android/content/pm android/app android/location android/os com/google/android/gms/common/api com/google/android/gms/location dev/gpui/mobile
 cat > android/content/pm/ApplicationInfo.java <<'JAVA'
-package android.content.pm;public class ApplicationInfo {public static final int FLAG_DEBUGGABLE=2;public int flags;}
+package android.content.pm;public class ApplicationInfo {public static final int FLAG_DEBUGGABLE=2;public static int testFlags;public int flags=testFlags;}
 JAVA
 cat > android/app/Application.java <<'JAVA'
 package android.app;public class Application extends android.content.Context {public interface ActivityLifecycleCallbacks {} public void unregisterActivityLifecycleCallbacks(ActivityLifecycleCallbacks c){}}
@@ -20,7 +20,7 @@ cat > android/os/SystemClock.java <<'JAVA'
 package android.os;public class SystemClock {public static long elapsedRealtimeNanos(){return 100;}public static long elapsedRealtime(){return 0;}}
 JAVA
 cat > android/content/Context.java <<'JAVA'
-package android.content; public class Context { public static final String LOCATION_SERVICE="location"; public Object getSystemService(String s){return null;} public android.content.pm.ApplicationInfo getApplicationInfo(){return new android.content.pm.ApplicationInfo();} }
+package android.content; public class Context { public static final String LOCATION_SERVICE="location"; public Object getSystemService(String s){return null;} public <T> T getSystemService(Class<T> type){return null;} public android.content.pm.ApplicationInfo getApplicationInfo(){return new android.content.pm.ApplicationInfo();} }
 JAVA
 cat > android/os/Handler.java <<'JAVA'
 package android.os; public class Handler {public static java.util.List<Runnable> delayed=new java.util.ArrayList<>();public Handler(Looper l){}public boolean post(Runnable r){r.run();return true;}public boolean postDelayed(Runnable r,long d){delayed.add(r);return true;}public void removeCallbacks(Runnable r){delayed.remove(r);}}
@@ -29,7 +29,7 @@ cat > android/os/Looper.java <<'JAVA'
 package android.os; public class Looper {public static Looper getMainLooper(){return new Looper();}}
 JAVA
 cat > android/location/Location.java <<'JAVA'
-package android.location; public class Location {final long time; public Location(long t){time=t;} public long getElapsedRealtimeNanos(){return time;}}
+package android.location; public class Location {final long time; public Location(long t){time=t;} public long getElapsedRealtimeNanos(){return time;} public double getLatitude(){return 1;}public double getLongitude(){return 2;}public boolean hasAccuracy(){return true;}public float getAccuracy(){return 3;}public long getTime(){return time;}public String getProvider(){return "test";}public boolean hasAltitude(){return false;}public double getAltitude(){return 0;}public boolean hasSpeed(){return false;}public float getSpeed(){return 0;}public boolean hasSpeedAccuracy(){return false;}public float getSpeedAccuracyMetersPerSecond(){return 0;}public boolean hasBearing(){return false;}public float getBearing(){return 0;}public boolean hasBearingAccuracy(){return false;}public float getBearingAccuracyDegrees(){return 0;}}
 JAVA
 cat > com/google/android/gms/common/ConnectionResult.java <<'JAVA'
 package com.google.android.gms.common; public class ConnectionResult {public static final int SUCCESS=0;}
@@ -39,7 +39,7 @@ package com.google.android.gms.common; public class GoogleApiAvailability {publi
 JAVA
 mkdir -p android/util
 cat > android/util/Log.java <<'JAVA'
-package android.util;public class Log {public static int i(String t,String m){return 0;}}
+package android.util;public class Log {public static final java.util.List<String> messages=new java.util.ArrayList<>();public static int i(String t,String m){messages.add(m);return 0;}}
 JAVA
 cat > com/google/android/gms/common/api/ApiException.java <<'JAVA'
 package com.google.android.gms.common.api;public class ApiException extends Exception {public int getStatusCode(){return 6;}}

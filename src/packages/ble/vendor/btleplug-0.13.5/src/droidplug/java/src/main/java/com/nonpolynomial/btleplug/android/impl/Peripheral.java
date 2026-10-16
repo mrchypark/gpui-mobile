@@ -214,7 +214,7 @@ class Peripheral {
         return future;
     }
 
-    public boolean isConnected() {
+    public synchronized boolean isConnected() {
         return this.connected;
     }
 
@@ -655,7 +655,10 @@ class Peripheral {
                     // Clear identity first, so duplicate/late callbacks cannot
                     // close this client twice or affect a replacement client.
                     Peripheral.this.gatt = null;
-                    gatt.close();
+                    try { gatt.close(); }
+                    catch (Throwable error) {
+                        Log.e(TAG, "Unable to close retired idle GATT client", error);
+                    }
                 }
                 suppressDisconnectNotification = Peripheral.this.suppressDisconnectNotification;
                 // A failed connect closes the gatt and clears `connected` even if the state was CONNECTED.

@@ -151,8 +151,7 @@ fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms: u64, back
     }
     #[cfg(target_os = "android")]
     {
-        let _ = previous;
-        return super::android::start(id, settings, once, timeout_ms, background);
+        return super::android::start(id, settings, once, timeout_ms, background, previous);
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {

@@ -177,6 +177,7 @@ impl Ble {
     /// Connect is separate from discovery. A timeout requires explicit disconnect
     /// or reconnect; dropping a future alone does not cancel native GATT requests.
     pub async fn connect(&mut self, id: &PeripheralId) -> Result<()> {
+        self.state.admit_connection(self.in_background)?;
         self.ready().await?;
         if self.peripheral.is_some() {
             return Err(Error::NotSupported(
@@ -298,7 +299,7 @@ impl Ble {
     /// The caller retains the target across retrieval errors or cancellation,
     /// even after this session's old peripheral handle has been cleared.
     pub async fn reconnect(&mut self, id: &PeripheralId) -> Result<BTreeSet<Service>> {
-        self.state.allowed()?;
+        self.state.admit_connection(self.in_background)?;
         self.disconnect().await?;
         #[cfg(target_vendor = "apple")]
         {

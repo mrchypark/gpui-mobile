@@ -203,7 +203,7 @@
          }
      }
  
-@@ -675,6 +678,7 @@
+@@ -678,6 +681,7 @@
          @Override
          public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
              synchronized (Peripheral.this) {
@@ -211,7 +211,7 @@
                  if (Peripheral.this.commandCallback != null) {
                      Peripheral.this.dispatchToCommandCallback("onCharacteristicRead",
                              () -> Peripheral.this.commandCallback.onCharacteristicRead(gatt, characteristic, status));
-@@ -685,6 +689,7 @@
+@@ -688,6 +692,7 @@
          @Override
          public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
              synchronized (Peripheral.this) {
@@ -219,7 +219,7 @@
                  if (Peripheral.this.commandCallback != null) {
                      Peripheral.this.dispatchToCommandCallback("onCharacteristicWrite",
                              () -> Peripheral.this.commandCallback.onCharacteristicWrite(gatt, characteristic, status));
-@@ -695,6 +700,7 @@
+@@ -698,6 +703,7 @@
          @Override
          public void onServicesDiscovered(BluetoothGatt gatt, int status) {
              synchronized (Peripheral.this) {
@@ -227,7 +227,7 @@
                  if (Peripheral.this.commandCallback != null) {
                      Peripheral.this.dispatchToCommandCallback("onServicesDiscovered",
                              () -> Peripheral.this.commandCallback.onServicesDiscovered(gatt, status));
-@@ -711,6 +717,7 @@
+@@ -714,6 +720,7 @@
              if (service == null) return;
              new BluetoothGattService(service.getUuid(), service.getType()).addCharacteristic(characteristic2);
              synchronized (Peripheral.this) {
@@ -235,7 +235,7 @@
                  for (WeakReference<QueueStream<BluetoothGattCharacteristic>> ref : Peripheral.this.notificationStreams) {
                      QueueStream<BluetoothGattCharacteristic> stream = ref.get();
                      if (stream != null) {
-@@ -723,6 +730,7 @@
+@@ -726,6 +733,7 @@
          @Override
          public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
              synchronized (Peripheral.this) {
@@ -243,7 +243,7 @@
                  if (Peripheral.this.commandCallback != null) {
                      Peripheral.this.dispatchToCommandCallback("onDescriptorRead",
                              () -> Peripheral.this.commandCallback.onDescriptorRead(gatt, descriptor, status));
-@@ -733,6 +741,7 @@
+@@ -736,6 +744,7 @@
          @Override
          public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
              synchronized (Peripheral.this) {
@@ -251,7 +251,7 @@
                  if (Peripheral.this.commandCallback != null) {
                      Peripheral.this.dispatchToCommandCallback("onDescriptorWrite",
                              () -> Peripheral.this.commandCallback.onDescriptorWrite(gatt, descriptor, status));
-@@ -743,6 +752,7 @@
+@@ -746,6 +755,7 @@
          @Override
          public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
              synchronized (Peripheral.this) {
@@ -259,7 +259,7 @@
                  if (Peripheral.this.commandCallback != null) {
                      Peripheral.this.dispatchToCommandCallback("onMtuChanged",
                              () -> Peripheral.this.commandCallback.onMtuChanged(gatt, mtu, status));
-@@ -753,6 +763,7 @@
+@@ -756,6 +766,7 @@
          @Override
          public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
              synchronized (Peripheral.this) {
@@ -267,7 +267,7 @@
                  if (Peripheral.this.commandCallback != null) {
                      Peripheral.this.dispatchToCommandCallback("onReadRemoteRssi",
                              () -> Peripheral.this.commandCallback.onReadRemoteRssi(gatt, rssi, status));
-@@ -764,6 +775,7 @@
+@@ -767,6 +778,7 @@
          public void onConnectionUpdated(BluetoothGatt gatt, int interval, int latency, int timeout, int status) {
              if (status == BluetoothGatt.GATT_SUCCESS) {
                  synchronized (Peripheral.this) {
