@@ -9,6 +9,7 @@ mod ios;
 ///
 /// Returns `Ok(true)` if the URL was opened successfully, `Ok(false)` if the
 /// system could not handle the URL scheme.
+/// On iOS this blocking API requires a worker thread to await native completion.
 pub fn launch_url(url: &str) -> Result<bool, String> {
     #[cfg(target_os = "ios")]
     {

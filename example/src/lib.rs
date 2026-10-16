@@ -213,6 +213,10 @@ pub fn ios_main() {
 /// the router starts on the corresponding screen.
 #[cfg(any(target_os = "ios", target_os = "android"))]
 fn open_main_window(cx: &mut App) {
+    // One standard-app observer. This observes lifecycle without consuming GPUI input.
+    gpui_mobile::mobile_events::set_mobile_event_handler(Some(Box::new(|_, event| {
+        screens::on_mobile_event(event);
+    })));
     // Set up HTTP client so gpui::img() can fetch remote images (e.g. picsum.photos).
     // The rustls-tls feature supplies WebPKI roots, including on iOS.
     log::info!("Setting up HTTP client for image loading...");

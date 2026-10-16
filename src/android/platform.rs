@@ -26,12 +26,6 @@
 //! 4. `APP_CMD_TERM_WINDOW` → `window.term_window()`.
 //! 5. `quit()` sets the shutdown flag; the main loop exits on the next tick.
 //!
-//! ## No GPUI workspace dependency
-//!
-//! All GPUI trait / type references are **stubbed out** locally so this file
-//! compiles in isolation.  Replace the stub section with `use gpui::*` when
-//! building inside the full workspace.
-
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
@@ -48,74 +42,272 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
 };
 
 use super::{
+    AndroidBackend,
     dispatcher::AndroidDispatcher,
     display::{AndroidDisplay, DisplayList},
     window::{AndroidWindow, WindowList},
-    AndroidBackend,
 };
 use gpui_wgpu::GpuContext;
 
-// ── stub: clipboard ───────────────────────────────────────────────────────────
+#[path = "platform_clipboard.rs"]
+mod platform_clipboard;
+#[path = "platform_credentials.rs"]
+mod platform_credentials;
+#[cfg(feature = "notifications")]
+#[path = "../platform_notifications.rs"]
+mod platform_notifications;
+
+fn java_main_task<T: Send + 'static>(
+    executor: BackgroundExecutor,
+    work: impl FnOnce(&mut jni::Env) -> std::result::Result<T, String> + Send + 'static,
+) -> Task<Result<T>> {
+    let Some(app) = super::jni::android_app() else {
+        return Task::ready(Err(anyhow::anyhow!("Android Activity is unavailable")));
+    };
+    let (tx, rx) = oneshot::channel();
+    app.run_on_java_main_thread(Box::new(move || {
+        let result = super::jni::with_env(|env| {
+            let result = work(env);
+            if result.is_err() {
+                let _ = env.exception_clear();
+            }
+            result
+        })
+        .map_err(anyhow::Error::msg);
+        if let Err(error) = &result {
+            log::warn!("Android UI operation failed: {error}");
+        }
+        let _ = tx.send(result);
+    }));
+    executor.spawn(async move {
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Android UI operation was cancelled"))?
+    })
+}
+
+thread_local! {
+    static IDLE_SLEEP: RefCell<(usize, bool)> = const { RefCell::new((0, false)) };
+}
+
+fn idle_sleep(env: &mut jni::Env, acquire: bool) -> std::result::Result<(), String> {
+    use crate::android::jni::{self as bridge, JniExt};
+    use jni::objects::JValue;
+    IDLE_SLEEP.with(|state| {
+        let mut state = state.borrow_mut();
+        if acquire && state.0 > 0 {
+            state.0 += 1;
+            return Ok(());
+        }
+        if !acquire {
+            if state.0 == 0 {
+                return Err("Unbalanced idle sleep guard".into());
+            }
+            state.0 -= 1;
+            if state.0 > 0 || state.1 {
+                return Ok(());
+            }
+        }
+        let activity = bridge::activity(env)?;
+        let window = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getWindow"),
+                jni::jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )
+            .e()?
+            .l()
+            .e()?;
+        if acquire {
+            let attributes = env
+                .call_method(
+                    &window,
+                    jni::jni_str!("getAttributes"),
+                    jni::jni_sig!("()Landroid/view/WindowManager$LayoutParams;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            state.1 = env
+                .get_field(&attributes, jni::jni_str!("flags"), jni::jni_sig!("I"))
+                .e()?
+                .i()
+                .e()?
+                & 128
+                != 0;
+            env.call_method(
+                &window,
+                jni::jni_str!("addFlags"),
+                jni::jni_sig!("(I)V"),
+                &[JValue::Int(128)],
+            )
+            .e()?;
+            state.0 = 1;
+        } else {
+            env.call_method(
+                &window,
+                jni::jni_str!("clearFlags"),
+                jni::jni_sig!("(I)V"),
+                &[JValue::Int(128)],
+            )
+            .e()?;
+        }
+        Ok(())
+    })
+}
 
 /// Android clipboard (thin wrapper over `ClipboardManager` via JNI).
-///
-/// A real implementation would call into Java via `jni-rs`; for now we use
-/// an in-process string store so the rest of the platform compiles.
 #[derive(Default)]
-pub struct AndroidClipboard {
-    contents: Option<String>,
-}
+pub struct AndroidClipboard;
 
 impl AndroidClipboard {
     pub fn read(&self) -> Option<String> {
-        self.contents.clone()
+        clipboard_access(None).unwrap_or_else(|error| {
+            log::warn!("Clipboard read failed: {error}");
+            None
+        })
     }
 
     pub fn write(&mut self, text: String) {
-        self.contents = Some(text);
+        if let Err(error) = clipboard_access(Some(&text)) {
+            log::warn!("Clipboard write failed: {error}");
+        }
     }
 
     pub fn clear(&mut self) {
-        self.contents = None;
+        // Empty text also works before clearPrimaryClip was added in API 28.
+        self.write(String::new());
     }
 }
 
-// ── stub: credential store ────────────────────────────────────────────────────
-
-/// Android credential store backed by the Android Keystore system.
-///
-/// Stubbed with an in-memory map; replace with a real JNI implementation.
-#[derive(Default)]
-pub struct AndroidCredentialStore {
-    store: std::collections::HashMap<(String, String), Vec<u8>>,
+fn clipboard_access(write: Option<&str>) -> std::result::Result<Option<String>, String> {
+    use crate::android::jni::{self as bridge, JniExt};
+    use jni::objects::JValue;
+    bridge::with_env(|env| {
+        let result = (|| {
+            let activity = bridge::activity(env)?;
+            let name = env.new_string("clipboard").e()?;
+            let manager = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getSystemService"),
+                    jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+                    &[JValue::Object(&name)],
+                )
+                .e()?
+                .l()
+                .e()?;
+            if manager.is_null() {
+                return Err("ClipboardManager unavailable".into());
+            }
+            if let Some(text) = write {
+                let text = env.new_string(text).e()?;
+                let clip = env.call_static_method(jni::jni_str!("android/content/ClipData"), jni::jni_str!("newPlainText"),
+                    jni::jni_sig!("(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Landroid/content/ClipData;"),
+                    &[JValue::Object(&name), JValue::Object(&text)]).e()?.l().e()?;
+                env.call_method(
+                    &manager,
+                    jni::jni_str!("setPrimaryClip"),
+                    jni::jni_sig!("(Landroid/content/ClipData;)V"),
+                    &[JValue::Object(&clip)],
+                )
+                .e()?;
+                return Ok(None);
+            }
+            let clip = env
+                .call_method(
+                    &manager,
+                    jni::jni_str!("getPrimaryClip"),
+                    jni::jni_sig!("()Landroid/content/ClipData;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            if clip.is_null() {
+                return Ok(None);
+            }
+            let count = env
+                .call_method(
+                    &clip,
+                    jni::jni_str!("getItemCount"),
+                    jni::jni_sig!("()I"),
+                    &[],
+                )
+                .e()?
+                .i()
+                .e()?;
+            if count == 0 {
+                return Ok(None);
+            }
+            let item = env
+                .call_method(
+                    &clip,
+                    jni::jni_str!("getItemAt"),
+                    jni::jni_sig!("(I)Landroid/content/ClipData$Item;"),
+                    &[JValue::Int(0)],
+                )
+                .e()?
+                .l()
+                .e()?;
+            let text = env
+                .call_method(
+                    &item,
+                    jni::jni_str!("coerceToText"),
+                    jni::jni_sig!("(Landroid/content/Context;)Ljava/lang/CharSequence;"),
+                    &[JValue::Object(&activity)],
+                )
+                .e()?
+                .l()
+                .e()?;
+            if text.is_null() {
+                return Ok(None);
+            }
+            let text = env
+                .call_method(
+                    &text,
+                    jni::jni_str!("toString"),
+                    jni::jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            Ok(Some(bridge::get_string(env, &text)))
+        })();
+        if result.is_err() {
+            let _ = env.exception_clear();
+        }
+        result
+    })
 }
+
+// ── credential store ──────────────────────────────────────────────────────────
+
+/// One encrypted credential per service, protected by Android Keystore.
+#[derive(Default)]
+pub struct AndroidCredentialStore;
 
 impl AndroidCredentialStore {
     pub fn write(&mut self, service: &str, username: &str, password: &[u8]) -> Result<()> {
-        self.store.insert(
-            (service.to_string(), username.to_string()),
-            password.to_vec(),
-        );
-        Ok(())
+        platform_credentials::write(service, username, password)
     }
 
     pub fn read(&self, service: &str, username: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .store
-            .get(&(service.to_string(), username.to_string()))
-            .cloned())
+        Ok(platform_credentials::read(service)?
+            .filter(|(account, _)| account == username)
+            .map(|(_, password)| password))
     }
 
     pub fn delete(&mut self, service: &str, username: &str) -> Result<()> {
-        self.store
-            .remove(&(service.to_string(), username.to_string()));
-        Ok(())
+        platform_credentials::delete_account(service, Some(username))
     }
 }
 
@@ -149,6 +341,9 @@ struct AndroidPlatformState {
     quit_callback: Option<Box<dyn FnMut() -> bool + Send>>,
     sleep_callback: Option<Box<dyn FnMut() + Send>>,
     wake_callback: Option<Box<dyn FnMut() + Send>>,
+    thermal_callback: Option<Box<dyn FnMut() + Send>>,
+    thermal_status: i32,
+    thermal_generation: i64,
 
     /// Called when the app is re-opened (e.g. tapped in the recents screen
     /// while already running).
@@ -197,6 +392,7 @@ unsafe impl Send for AndroidPlatformState {}
 /// expectation that the platform is single-threaded at the Rc level.
 pub struct AndroidPlatform {
     state: Mutex<AndroidPlatformState>,
+    thermal_registration: Arc<AtomicI64>,
     /// Set to `true` when `quit()` is called; the main loop checks this.
     should_quit: AtomicBool,
 }
@@ -401,6 +597,7 @@ impl AndroidPlatform {
         log::info!("AndroidPlatform::new — headless={headless}");
 
         Self {
+            thermal_registration: Arc::new(AtomicI64::new(0)),
             state: Mutex::new(AndroidPlatformState {
                 dispatcher,
                 gpu_context: Rc::new(RefCell::new(None)),
@@ -413,6 +610,9 @@ impl AndroidPlatform {
                 quit_callback: None,
                 sleep_callback: None,
                 wake_callback: None,
+                thermal_callback: None,
+                thermal_status: -1,
+                thermal_generation: 0,
                 reopen_callback: None,
                 open_urls_callback: None,
                 keyboard_layout_callback: None,
@@ -539,6 +739,8 @@ impl AndroidPlatform {
     pub fn did_become_active(&self) {
         log::debug!("AndroidPlatform::did_become_active");
         self.state.lock().is_active = true;
+        #[cfg(feature = "notifications")]
+        platform_notifications::poll();
     }
 
     /// Called by the app delegate when the app moves to the background.
@@ -550,22 +752,28 @@ impl AndroidPlatform {
     /// Deliver URLs from an implicit or explicit intent.
     pub fn deliver_open_urls(&self, urls: Vec<String>) {
         log::debug!("AndroidPlatform: delivering {} URL(s)", urls.len());
-        if let Some(cb) = self.state.lock().open_urls_callback.as_mut() {
+        let callback = self.state.lock().open_urls_callback.take();
+        if let Some(mut cb) = callback {
             cb(urls);
+            self.state.lock().open_urls_callback.get_or_insert(cb);
         }
     }
 
     /// Notify the platform that the keyboard layout has changed.
     pub fn notify_keyboard_layout_change(&self) {
-        if let Some(cb) = self.state.lock().keyboard_layout_callback.as_mut() {
+        let callback = self.state.lock().keyboard_layout_callback.take();
+        if let Some(mut cb) = callback {
             cb();
+            self.state.lock().keyboard_layout_callback.get_or_insert(cb);
         }
     }
 
     /// Deliver a "reopen" event (app tapped in recents while already running).
     pub fn deliver_reopen(&self) {
-        if let Some(cb) = self.state.lock().reopen_callback.as_mut() {
+        let callback = self.state.lock().reopen_callback.take();
+        if let Some(mut cb) = callback {
             cb();
+            self.state.lock().reopen_callback.get_or_insert(cb);
         }
     }
 
@@ -692,11 +900,28 @@ impl AndroidPlatform {
 
     /// The path to the current executable / APK.
     ///
-    /// On Android this resolves to `/proc/self/exe` (symlink to the process
-    /// binary) or falls back to an empty path.
+    /// Returns the installed APK path reported by the Activity.
     pub fn app_path(&self) -> Result<PathBuf> {
-        let exe = std::fs::read_link("/proc/self/exe").unwrap_or_else(|_| PathBuf::from(""));
-        Ok(exe)
+        use crate::android::jni::{self as bridge, JniExt};
+        bridge::with_env(|env| {
+            let activity = bridge::activity(env)?;
+            let path = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getPackageCodePath"),
+                    jni::jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            let path = bridge::get_string(env, &path);
+            if path.is_empty() {
+                return Err("APK path unavailable".into());
+            }
+            Ok(PathBuf::from(path))
+        })
+        .map_err(anyhow::Error::msg)
     }
 
     /// Android apps do not have auxiliary executables.
@@ -789,34 +1014,64 @@ impl AndroidPlatform {
         .flatten()
     }
 
-    /// Register a thermal status listener via JNI using PowerManager.
-    ///
-    /// On Android 29+ (API Q), calls:
-    /// ```java
-    /// PowerManager pm = (PowerManager) activity.getSystemService(Context.POWER_SERVICE);
-    /// pm.addThermalStatusListener(executor, listener);
-    /// ```
-    ///
-    /// For simplicity, we poll the thermal status periodically from the main
-    /// loop tick rather than setting up a full JNI callback bridge.  The
-    /// callback is stored and invoked when the thermal state changes.
+    /// Register API29+ native events; delivery is on the native owner, not Java main.
     fn register_thermal_listener(&self, callback: Box<dyn FnMut()>) {
-        // Store the callback — it will be invoked from `check_thermal_state`
-        // which is called periodically from the tick/poll loop.
-        //
-        // The actual thermal state query happens in `query_thermal_status_via_jni`.
-        // We store the callback and the last-known state; on each tick we
-        // re-query and fire the callback if the state changed.
-        //
-        // Note: A fully async approach would use `PowerManager.addThermalStatusListener`
-        // with a JNI callback proxy.  The polling approach is simpler and avoids
-        // the complexity of bridging Java→Rust callbacks.
+        let generation = super::jni::begin_thermal_listener();
+        assert!(generation > 0, "Thermal generation exhausted");
+        self.thermal_registration.store(generation, Ordering::Release);
+        let registration = self.thermal_registration.clone();
         let send_callback: Box<dyn FnMut() + Send> =
             unsafe { std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback) };
-        // For now we store it but the periodic check is not yet wired into
-        // the main tick.  The infrastructure is in place for future wiring.
-        let _ = send_callback;
-        log::debug!("register_thermal_listener: callback stored (polling not yet wired into tick)");
+        {
+            let mut state = self.state.lock();
+            state.thermal_callback = Some(send_callback);
+            state.thermal_status = -1;
+            state.thermal_generation = generation;
+        }
+        java_main_task(<Self as Platform>::background_executor(self), move |env| {
+            if registration.load(Ordering::Acquire) != generation { return Ok(()); }
+            use crate::android::jni::{self as bridge, JniExt};
+            use jni::objects::JValue;
+            let activity = bridge::activity(env)?;
+            let class = bridge::find_app_class(env, "dev.gpui.mobile.GpuiThermal")?;
+            let started = env.call_static_method(&class, jni::jni_str!("register"),
+                jni::jni_sig!("(Landroid/app/Activity;J)Z"),
+                &[JValue::Object(&activity), JValue::Long(generation)]).e()?.z().e()?;
+            if !started {
+                bridge::end_thermal_listener(generation);
+                log::debug!("Thermal listener unavailable (API<29, stale registration, or inactive host)");
+            }
+            Ok(())
+        }).detach();
+    }
+
+    /// Volta's JNI queue calls this on the native owner after releasing queue locks.
+    pub(crate) fn deliver_thermal_status(&self, generation: i64, status: i32) {
+        let mut callback = {
+            let mut state = self.state.lock();
+            if generation != state.thermal_generation || generation <= 0
+                || !(0..=6).contains(&status) || state.thermal_status == status { return; }
+            state.thermal_status = status;
+            state.thermal_callback.take()
+        };
+        if let Some(callback) = callback.as_mut() { callback(); }
+        let mut state = self.state.lock();
+        if state.thermal_generation == generation && state.thermal_callback.is_none() {
+            state.thermal_callback = callback;
+        }
+    }
+
+    /// Native-owner teardown; Java host also calls GpuiThermal.unregister(Activity).
+    pub(crate) fn on_thermal_host_destroyed(&self) {
+        let generation = self.thermal_registration.swap(0, Ordering::AcqRel);
+        super::jni::end_thermal_listener(generation);
+        let callback = {
+            let mut state = self.state.lock();
+            state.thermal_generation = 0;
+            state.thermal_status = -1;
+            state.thermal_callback.take()
+        };
+        drop(callback);
     }
 
     /// Query the current thermal status via JNI.
@@ -832,55 +1087,20 @@ impl AndroidPlatform {
     /// - 6 = THERMAL_STATUS_SHUTDOWN
     ///
     /// Returns -1 on failure (JNI unavailable, API < 29, etc.).
-    #[allow(dead_code)]
     fn query_thermal_status_via_jni(&self) -> i32 {
-        use crate::android::jni as jni_helpers;
+        use crate::android::jni::{self as bridge, JniExt};
         use jni::objects::JValue;
-
-        jni_helpers::with_env(|env| {
-            let activity = jni_helpers::activity(env)?;
-
-            // activity.getSystemService("power")
-            let service_name = env.new_string("power").map_err(|e| e.to_string())?;
-            let pm = match env
-                .call_method(
-                    &activity,
-                    jni::jni_str!("getSystemService"),
-                    jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
-                    &[JValue::Object(&service_name)],
-                )
-                .and_then(|v| v.l())
-            {
-                Ok(o) if !o.is_null() => o,
-                _ => {
-                    env.exception_clear();
-                    return Err("getSystemService(power) failed or returned null".to_string());
-                }
-            };
-
-            // pm.getCurrentThermalStatus() — API 29+
-            let status = match env
-                .call_method(
-                    &pm,
-                    jni::jni_str!("getCurrentThermalStatus"),
-                    jni::jni_sig!("()I"),
-                    &[],
-                )
-                .and_then(|v| v.i())
-            {
-                Ok(s) => s,
-                Err(_) => {
-                    env.exception_clear();
-                    return Err("getCurrentThermalStatus() failed".to_string());
-                }
-            };
-
-            log::trace!("query_thermal_status_via_jni: status={}", status);
-            Ok(status)
-        })
-        .unwrap_or(-1)
+        bridge::with_env(|env| {
+            let result = (|| {
+                let activity = bridge::activity(env)?;
+                let class = bridge::find_app_class(env, "dev.gpui.mobile.GpuiThermal")?;
+                env.call_static_method(&class, jni::jni_str!("currentStatus"),
+                    jni::jni_sig!("(Landroid/app/Activity;)I"), &[JValue::Object(&activity)]).e()?.i().e()
+            })();
+            if result.is_err() { let _ = env.exception_clear(); }
+            result
+        }).unwrap_or(-1)
     }
-
     /// Preferred wgpu backend.
     pub fn preferred_backend(&self) -> AndroidBackend {
         self.state.lock().preferred_backend
@@ -932,17 +1152,18 @@ impl AndroidPlatform {
 
     /// Advance the platform's dispatcher by one tick.
     ///
-    /// Should be called from the native-activity main loop on every iteration
-    /// to process delayed background tasks.
+    /// Thermal changes arrive through the JNI event queue, independently of ticks.
     pub fn tick(&self) {
-        self.state.lock().dispatcher.tick();
+        let dispatcher = self.state.lock().dispatcher.clone();
+        dispatcher.tick();
     }
 
     /// Drain all pending main-thread tasks synchronously.
     ///
     /// Useful in headless tests where there is no real ALooper.
     pub fn flush_main_thread_tasks(&self) {
-        self.state.lock().dispatcher.flush_main_thread_tasks();
+        let dispatcher = self.state.lock().dispatcher.clone();
+        dispatcher.flush_main_thread_tasks();
     }
 }
 
@@ -955,6 +1176,14 @@ impl AndroidPlatform {
 // file pickers, etc.) are no-ops or return sensible defaults.
 
 impl Platform for AndroidPlatform {
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(gpui::AppLifecyclePhase)>) {
+        crate::mobile_events::set_app_lifecycle_handler(callback);
+    }
+
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        crate::mobile_events::set_memory_warning_handler(callback);
+    }
+
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
         log::debug!("NativeActivity has no system-power sleep notification; app pause is separate");
         // As with the other Platform callbacks, invocation stays on the native event thread.
@@ -975,10 +1204,25 @@ impl Platform for AndroidPlatform {
     }
 
     fn prevent_idle_sleep(&self, _reason: &str) -> Task<Result<gpui::ActivityGuard>> {
-        // NativeActivity cannot read the existing flag, so do not clear an app-owned inhibitor.
-        Task::ready(Err(anyhow::anyhow!(
-            "Android idle sleep inhibition is not supported by this backend"
-        )))
+        let Some(app) = super::jni::android_app() else {
+            return Task::ready(Err(anyhow::anyhow!("Android Activity is unavailable")));
+        };
+        java_main_task(<Self as Platform>::background_executor(self), move |env| {
+            idle_sleep(env, true)?;
+            Ok(gpui::ActivityGuard::new(move || {
+                app.run_on_java_main_thread(Box::new(|| {
+                    if let Err(error) = super::jni::with_env(|env| {
+                        let result = idle_sleep(env, false);
+                        if result.is_err() {
+                            let _ = env.exception_clear();
+                        }
+                        result
+                    }) {
+                        log::warn!("Could not restore idle sleep: {error}");
+                    }
+                }));
+            }))
+        })
     }
 
     fn background_executor(&self) -> BackgroundExecutor {
@@ -996,6 +1240,8 @@ impl Platform for AndroidPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+        #[cfg(feature = "notifications")]
+        platform_notifications::start(<Self as Platform>::foreground_executor(self));
         // The trait gives us `Box<dyn FnOnce()>` (not Send).  On Android
         // Platform::run is always called on the main native thread, so this
         // transmute is safe in practice.
@@ -1013,11 +1259,85 @@ impl Platform for AndroidPlatform {
     }
 
     fn activate(&self, _ignoring_other_apps: bool) {
-        self.state.lock().is_active = true;
+        #[cfg(feature = "notifications")]
+        platform_notifications::poll();
+        java_main_task(<Self as Platform>::background_executor(self), |env| {
+            use crate::android::jni::{self as bridge, JniExt};
+            use jni::objects::JValue;
+            let activity = bridge::activity(env)?;
+            let package = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getPackageName"),
+                    jni::jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            let manager = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getPackageManager"),
+                    jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            let intent = env
+                .call_method(
+                    &manager,
+                    jni::jni_str!("getLaunchIntentForPackage"),
+                    jni::jni_sig!("(Ljava/lang/String;)Landroid/content/Intent;"),
+                    &[JValue::Object(&package)],
+                )
+                .e()?
+                .l()
+                .e()?;
+            if intent.is_null() {
+                return Err("No launch Activity is registered".into());
+            }
+            env.call_method(
+                &intent,
+                jni::jni_str!("addFlags"),
+                jni::jni_sig!("(I)Landroid/content/Intent;"),
+                &[JValue::Int(0x20020000)],
+            )
+            .e()?;
+            env.call_method(
+                &activity,
+                jni::jni_str!("startActivity"),
+                jni::jni_sig!("(Landroid/content/Intent;)V"),
+                &[JValue::Object(&intent)],
+            )
+            .e()?;
+            Ok(())
+        })
+        .detach();
     }
 
     fn hide(&self) {
-        // No-op: Android apps don't "hide" in the macOS sense.
+        java_main_task(<Self as Platform>::background_executor(self), |env| {
+            use crate::android::jni::{self as bridge, JniExt};
+            let activity = bridge::activity(env)?;
+            let moved = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("moveTaskToBack"),
+                    jni::jni_sig!("(Z)Z"),
+                    &[jni::objects::JValue::Bool(true)],
+                )
+                .e()?
+                .z()
+                .e()?;
+            if moved {
+                Ok(())
+            } else {
+                Err("Android declined to move the task to background".into())
+            }
+        })
+        .detach();
     }
 
     fn hide_other_apps(&self) {
@@ -1047,16 +1367,14 @@ impl Platform for AndroidPlatform {
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        // Android does not have a window-stack concept — there is at most one
-        // active window (the primary window).  GPUI uses `AnyWindowHandle`
-        // which requires an entity id we don't have from the platform layer,
-        // so return `None` and let the GPUI app context track the active window.
-        None
+        self.primary_window()
+            .filter(|window| window.is_active())
+            .and_then(|window| window.gpui_handle())
     }
 
     fn open_window(
         &self,
-        _handle: AnyWindowHandle,
+        handle: AnyWindowHandle,
         _options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         // On Android the native window is created by the system via
@@ -1077,19 +1395,96 @@ impl Platform for AndroidPlatform {
             .primary()
             .map(|d| Rc::new(d.clone()) as Rc<dyn PlatformDisplay>);
 
+        window.set_gpui_handle(handle);
         Ok(Box::new(super::window::AndroidPlatformWindow::new(
             window, display,
         )))
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        WindowAppearance::Dark
+        use crate::android::jni::{self as bridge, JniExt};
+        let mode = bridge::with_env(|env| {
+            let result = (|| {
+                let activity = bridge::activity(env)?;
+                let resources = env
+                    .call_method(
+                        &activity,
+                        jni::jni_str!("getResources"),
+                        jni::jni_sig!("()Landroid/content/res/Resources;"),
+                        &[],
+                    )
+                    .e()?
+                    .l()
+                    .e()?;
+                let config = env
+                    .call_method(
+                        &resources,
+                        jni::jni_str!("getConfiguration"),
+                        jni::jni_sig!("()Landroid/content/res/Configuration;"),
+                        &[],
+                    )
+                    .e()?
+                    .l()
+                    .e()?;
+                env.get_field(&config, jni::jni_str!("uiMode"), jni::jni_sig!("I"))
+                    .e()?
+                    .i()
+                    .e()
+            })();
+            if result.is_err() {
+                let _ = env.exception_clear();
+            }
+            result
+        });
+        if mode.unwrap_or(0) & 0x30 == 0x20 {
+            WindowAppearance::Dark
+        } else {
+            WindowAppearance::Light
+        }
     }
 
     fn open_url(&self, url: &str) {
-        // A full implementation would call startActivity with an ACTION_VIEW
-        // Intent via JNI.  For now, log the request.
-        log::info!("AndroidPlatform::open_url({url}) — Intent launch not yet implemented");
+        use crate::android::jni::{self as bridge, JniExt};
+        use jni::objects::JValue;
+        let result = bridge::with_env(|env| {
+            let result = (|| {
+                let activity = bridge::activity(env)?;
+                let url = env.new_string(url).e()?;
+                let uri = env
+                    .call_static_method(
+                        jni::jni_str!("android/net/Uri"),
+                        jni::jni_str!("parse"),
+                        jni::jni_sig!("(Ljava/lang/String;)Landroid/net/Uri;"),
+                        &[JValue::Object(&url)],
+                    )
+                    .e()?
+                    .l()
+                    .e()?;
+                let action = env.new_string("android.intent.action.VIEW").e()?;
+                let intent = env
+                    .new_object(
+                        jni::jni_str!("android/content/Intent"),
+                        jni::jni_sig!("(Ljava/lang/String;Landroid/net/Uri;)V"),
+                        &[JValue::Object(&action), JValue::Object(&uri)],
+                    )
+                    .e()?;
+                env.call_method(
+                    &activity,
+                    jni::jni_str!("startActivity"),
+                    jni::jni_sig!("(Landroid/content/Intent;)V"),
+                    &[JValue::Object(&intent)],
+                )
+                .e()?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = env.exception_clear();
+            }
+            result
+        });
+        if let Err(error) = result {
+            log::warn!("Could not open URL: {error}");
+        }
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
@@ -1102,25 +1497,49 @@ impl Platform for AndroidPlatform {
     }
 
     fn register_url_scheme(&self, _url: &str) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        Task::ready(Err(anyhow::anyhow!(
+            "URL schemes must be declared in AndroidManifest.xml"
+        )))
     }
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Ok(None));
+        #[cfg(feature = "file_selector")]
+        <Self as Platform>::background_executor(self)
+            .spawn(async move {
+                let _ = tx.send(
+                    crate::packages::file_selector::prompt_paths(options)
+                        .map_err(anyhow::Error::msg),
+                );
+            })
+            .detach();
+        #[cfg(not(feature = "file_selector"))]
+        {
+            let _ = options;
+            let _ = tx.send(Err(anyhow::anyhow!("file_selector feature disabled")));
+        }
         rx
     }
 
     fn prompt_for_new_path(
         &self,
-        _directory: &Path,
-        _suggested_name: Option<&str>,
+        directory: &Path,
+        suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Ok(None));
+        #[cfg(feature = "file_selector")]
+        let _ = tx.send(
+            crate::packages::file_selector::prompt_new_path(directory, suggested_name)
+                .map_err(anyhow::Error::msg),
+        );
+        #[cfg(not(feature = "file_selector"))]
+        {
+            let _ = (directory, suggested_name);
+            let _ = tx.send(Err(anyhow::anyhow!("file_selector feature disabled")));
+        }
         rx
     }
 
@@ -1128,14 +1547,56 @@ impl Platform for AndroidPlatform {
         false
     }
 
+    #[cfg(feature = "notifications")]
+    fn show_system_notification(&self, notification: gpui::SystemNotification) {
+        if let Err(error) = crate::packages::notifications::show_system_notification(&notification)
+        {
+            log::warn!("Notification submission failed: {error}");
+        }
+    }
+    #[cfg(feature = "notifications")]
+    fn dismiss_system_notification(&self, tag: &str) {
+        if let Err(error) = crate::packages::notifications::dismiss_system_notification(tag) {
+            log::warn!("Notification dismissal failed: {error}");
+        }
+    }
+    #[cfg(feature = "notifications")]
+    fn on_system_notification_response(
+        &self,
+        callback: Box<dyn FnMut(gpui::SystemNotificationResponse)>,
+    ) {
+        platform_notifications::start(<Self as Platform>::foreground_executor(self));
+        platform_notifications::set_handler(
+            callback,
+            <Self as Platform>::foreground_executor(self),
+        );
+    }
+
     fn reveal_path(&self, _path: &Path) {
         log::info!("AndroidPlatform::reveal_path — not supported on Android");
     }
 
-    fn open_with_system(&self, _path: &Path) {
-        // A full implementation would call startActivity with an ACTION_VIEW
-        // Intent via JNI.  For now, log the request.
-        log::info!("AndroidPlatform::open_with_system — Intent launch not yet implemented");
+    fn open_with_system(&self, path: &Path) {
+        let Some(path) = path.to_str().map(str::to_owned) else {
+            log::warn!("Cannot open a non-UTF-8 Android path");
+            return;
+        };
+        java_main_task(<Self as Platform>::background_executor(self), move |env| {
+            use crate::android::jni::{self as bridge, JniExt};
+            use jni::objects::JValue;
+            let activity = bridge::activity(env)?;
+            let class = bridge::find_app_class(env, "dev.gpui.mobile.GpuiClipboard")?;
+            let path = env.new_string(path).e()?;
+            env.call_static_method(
+                &class,
+                jni::jni_str!("openFile"),
+                jni::jni_sig!("(Landroid/app/Activity;Ljava/lang/String;)V"),
+                &[JValue::Object(&activity), JValue::Object(&path)],
+            )
+            .e()?;
+            Ok(())
+        })
+        .detach();
     }
 
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
@@ -1173,24 +1634,31 @@ impl Platform for AndroidPlatform {
     }
 
     fn thermal_state(&self) -> ThermalState {
-        ThermalState::Nominal
+        // During queued transition delivery expose that transition, not a newer
+        // sample that could conceal an intervening severe/critical event.
+        let observed = {
+            let state = self.state.lock();
+            if state.thermal_callback.is_none() && state.thermal_generation > 0 {
+                state.thermal_status
+            } else { -1 }
+        };
+        let status = if observed >= 0 { observed } else { self.query_thermal_status_via_jni() };
+        match status {
+            1 => ThermalState::Fair,
+            2 | 3 => ThermalState::Serious,
+            4..=6 => ThermalState::Critical,
+            // GPUI has no Unknown variant. This fallback is not a measurement;
+            // unavailable/invalid samples never generate a nominal callback.
+            _ => ThermalState::Nominal,
+        }
     }
 
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>) {
-        // Subscribe to Android thermal callbacks via PowerManager.
-        //
-        // On Android 29+ (Q), PowerManager provides `addThermalStatusListener`
-        // which delivers callbacks when the thermal state changes.  We spawn a
-        // background thread that registers the listener via JNI and relays the
-        // callback to the main thread via the dispatcher.
-        //
-        // For devices below API 29 this is a silent no-op.
         self.register_thermal_listener(callback);
     }
 
     fn app_path(&self) -> Result<PathBuf> {
-        let exe = std::fs::read_link("/proc/self/exe").unwrap_or_else(|_| PathBuf::from(""));
-        Ok(exe)
+        AndroidPlatform::app_path(self)
     }
 
     fn path_for_auxiliary_executable(&self, _name: &str) -> Result<PathBuf> {
@@ -1201,8 +1669,87 @@ impl Platform for AndroidPlatform {
         // NativeActivity does not expose an until-next-mouse-move cursor API.
     }
 
-    fn set_cursor_style(&self, _style: CursorStyle) {
-        // No-op: Android uses touch, not mouse cursors.
+    fn set_cursor_style(&self, style: CursorStyle) {
+        java_main_task(<Self as Platform>::background_executor(self), move |env| {
+            use crate::android::jni::{self as bridge, JniExt};
+            use jni::objects::JValue;
+            let field = match style {
+                CursorStyle::Arrow => jni::jni_str!("TYPE_ARROW"),
+                CursorStyle::IBeam => jni::jni_str!("TYPE_TEXT"),
+                CursorStyle::Crosshair => jni::jni_str!("TYPE_CROSSHAIR"),
+                CursorStyle::ClosedHand => jni::jni_str!("TYPE_GRABBING"),
+                CursorStyle::OpenHand => jni::jni_str!("TYPE_GRAB"),
+                CursorStyle::PointingHand => jni::jni_str!("TYPE_HAND"),
+                CursorStyle::ResizeLeft
+                | CursorStyle::ResizeRight
+                | CursorStyle::ResizeLeftRight
+                | CursorStyle::ResizeColumn => jni::jni_str!("TYPE_HORIZONTAL_DOUBLE_ARROW"),
+                CursorStyle::ResizeUp
+                | CursorStyle::ResizeDown
+                | CursorStyle::ResizeUpDown
+                | CursorStyle::ResizeRow => jni::jni_str!("TYPE_VERTICAL_DOUBLE_ARROW"),
+                CursorStyle::ResizeUpLeftDownRight => {
+                    jni::jni_str!("TYPE_TOP_LEFT_DIAGONAL_DOUBLE_ARROW")
+                }
+                CursorStyle::ResizeUpRightDownLeft => {
+                    jni::jni_str!("TYPE_TOP_RIGHT_DIAGONAL_DOUBLE_ARROW")
+                }
+                CursorStyle::IBeamCursorForVerticalLayout => jni::jni_str!("TYPE_VERTICAL_TEXT"),
+                CursorStyle::OperationNotAllowed => jni::jni_str!("TYPE_NO_DROP"),
+                CursorStyle::DragLink => jni::jni_str!("TYPE_ALIAS"),
+                CursorStyle::DragCopy => jni::jni_str!("TYPE_COPY"),
+                CursorStyle::ContextualMenu => jni::jni_str!("TYPE_CONTEXT_MENU"),
+            };
+            let kind = env
+                .get_static_field(
+                    jni::jni_str!("android/view/PointerIcon"),
+                    field,
+                    jni::jni_sig!("I"),
+                )
+                .e()?
+                .i()
+                .e()?;
+            let activity = bridge::activity(env)?;
+            let icon = env
+                .call_static_method(
+                    jni::jni_str!("android/view/PointerIcon"),
+                    jni::jni_str!("getSystemIcon"),
+                    jni::jni_sig!("(Landroid/content/Context;I)Landroid/view/PointerIcon;"),
+                    &[JValue::Object(&activity), JValue::Int(kind)],
+                )
+                .e()?
+                .l()
+                .e()?;
+            let window = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getWindow"),
+                    jni::jni_sig!("()Landroid/view/Window;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            let view = env
+                .call_method(
+                    &window,
+                    jni::jni_str!("getDecorView"),
+                    jni::jni_sig!("()Landroid/view/View;"),
+                    &[],
+                )
+                .e()?
+                .l()
+                .e()?;
+            env.call_method(
+                &view,
+                jni::jni_str!("setPointerIcon"),
+                jni::jni_sig!("(Landroid/view/PointerIcon;)V"),
+                &[JValue::Object(&icon)],
+            )
+            .e()?;
+            Ok(())
+        })
+        .detach();
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
@@ -1210,45 +1757,53 @@ impl Platform for AndroidPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        self.state
-            .lock()
-            .clipboard
-            .read()
-            .map(ClipboardItem::new_string)
+        platform_clipboard::read().unwrap_or_else(|error| {
+            log::warn!("Clipboard read failed: {error}");
+            None
+        })
+    }
+
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<std::result::Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        <Self as Platform>::background_executor(self).spawn(async {
+            platform_clipboard::read().map_err(|error| {
+                log::warn!("Clipboard read failed: {error}");
+                error
+                    .downcast_ref::<gpui::ClipboardReadError>()
+                    .cloned()
+                    .unwrap_or(gpui::ClipboardReadError::UnsupportedContent)
+            })
+        })
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        self.state
-            .lock()
-            .clipboard
-            .write(item.text().unwrap_or_default());
+        if let Err(error) = platform_clipboard::write(&item) {
+            log::warn!("Clipboard publication failed: {error}");
+        }
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
-        let result = self.state.lock().credentials.write(url, username, password);
-        Task::ready(result)
+        let (url, username, password) = (url.to_owned(), username.to_owned(), password.to_vec());
+        <Self as Platform>::background_executor(self)
+            .spawn(async move { platform_credentials::write(&url, &username, &password) })
     }
 
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
-        // The credential store is keyed by (service, username) but the
-        // Platform trait only provides `url`.  Use a fixed username for now.
-        let result = self
-            .state
-            .lock()
-            .credentials
-            .read(url, "default")
-            .map(|opt| opt.map(|pw| ("default".to_string(), pw)));
-        Task::ready(result)
+        let url = url.to_owned();
+        <Self as Platform>::background_executor(self)
+            .spawn(async move { platform_credentials::read(&url) })
     }
 
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
-        let result = self.state.lock().credentials.delete(url, "default");
-        Task::ready(result)
+        let url = url.to_owned();
+        <Self as Platform>::background_executor(self)
+            .spawn(async move { platform_credentials::delete(&url) })
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         Box::new(crate::android::keyboard::AndroidKeyboardLayout::new(
-            "en-US",
+            &self.keyboard_layout_id(),
         ))
     }
 
@@ -1314,6 +1869,12 @@ impl SharedPlatform {
 /// so the compiler never accidentally picks the inherent method (which may
 /// have a different return type).
 impl Platform for SharedPlatform {
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(gpui::AppLifecyclePhase)>) {
+        <AndroidPlatform as Platform>::on_app_lifecycle(&self.0, callback)
+    }
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_memory_warning(&self.0, callback)
+    }
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
         <AndroidPlatform as Platform>::on_system_sleep(&self.0, callback)
     }
@@ -1383,6 +1944,21 @@ impl Platform for SharedPlatform {
     }
     fn register_url_scheme(&self, url: &str) -> Task<Result<()>> {
         <AndroidPlatform as Platform>::register_url_scheme(&self.0, url)
+    }
+    #[cfg(feature = "notifications")]
+    fn show_system_notification(&self, notification: gpui::SystemNotification) {
+        <AndroidPlatform as Platform>::show_system_notification(&self.0, notification)
+    }
+    #[cfg(feature = "notifications")]
+    fn dismiss_system_notification(&self, tag: &str) {
+        <AndroidPlatform as Platform>::dismiss_system_notification(&self.0, tag)
+    }
+    #[cfg(feature = "notifications")]
+    fn on_system_notification_response(
+        &self,
+        callback: Box<dyn FnMut(gpui::SystemNotificationResponse)>,
+    ) {
+        <AndroidPlatform as Platform>::on_system_notification_response(&self.0, callback)
     }
     fn prompt_for_paths(
         &self,
@@ -1455,6 +2031,11 @@ impl Platform for SharedPlatform {
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         <AndroidPlatform as Platform>::read_from_clipboard(&self.0)
     }
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<std::result::Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        <AndroidPlatform as Platform>::read_from_clipboard_async(&self.0)
+    }
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
         <AndroidPlatform as Platform>::write_credentials(&self.0, url, username, password)
     }
@@ -1486,6 +2067,49 @@ impl Default for AndroidPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thermal_events_deduplicate_reject_stale_and_unknown_then_invalidate_on_destroy() {
+        let platform = headless();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        {
+            let mut state = platform.state.lock();
+            state.thermal_generation = 7;
+            state.thermal_callback = Some(Box::new(move || { counter.fetch_add(1, Ordering::Relaxed); }));
+        }
+        for (generation, status) in [(6, 3), (7, -1), (7, 7), (7, 3), (7, 3), (7, 0)] {
+            platform.deliver_thermal_status(generation, status);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        platform.on_thermal_host_destroyed();
+        platform.deliver_thermal_status(7, 4);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(platform.state.lock().thermal_status, -1);
+        assert!(platform.state.lock().thermal_callback.is_none());
+    }
+
+    #[test]
+    fn thermal_callback_can_replace_registration_without_lock_or_old_callback_restore() {
+        let platform = Arc::new(headless());
+        let weak = Arc::downgrade(&platform);
+        {
+            let mut state = platform.state.lock();
+            state.thermal_generation = 9;
+            state.thermal_callback = Some(Box::new(move || {
+                let platform = weak.upgrade().unwrap();
+                let mut state = platform.state.try_lock().expect("callback ran under platform lock");
+                assert_eq!(state.thermal_status, 4);
+                state.thermal_generation = 10;
+                state.thermal_callback = Some(Box::new(|| {}));
+            }));
+        }
+        platform.deliver_thermal_status(9, 4);
+        assert_eq!(platform.state.lock().thermal_generation, 10);
+        assert!(platform.state.lock().thermal_callback.is_some());
+        platform.deliver_thermal_status(9, 0);
+        assert_eq!(platform.state.lock().thermal_status, 4);
+    }
 
     fn headless() -> AndroidPlatform {
         AndroidPlatform::new(true)
@@ -1559,44 +2183,56 @@ mod tests {
     #[test]
     fn clipboard_round_trip() {
         let p = headless();
+        if crate::android::jni::with_env(|_| Ok(())).is_ok() {
+            return;
+        }
         assert!(p.read_from_clipboard().is_none());
         p.write_to_clipboard("hello android".to_string());
-        assert_eq!(p.read_from_clipboard().as_deref(), Some("hello android"));
+        assert!(
+            p.read_from_clipboard().is_none(),
+            "no in-memory clipboard fallback"
+        );
     }
 
     #[test]
     fn clipboard_overwrite() {
         let p = headless();
+        if crate::android::jni::with_env(|_| Ok(())).is_ok() {
+            return;
+        }
         p.write_to_clipboard("first".to_string());
         p.write_to_clipboard("second".to_string());
-        assert_eq!(p.read_from_clipboard().as_deref(), Some("second"));
+        assert!(p.read_from_clipboard().is_none());
     }
 
     // ── credentials ───────────────────────────────────────────────────────────
 
     #[test]
-    fn credentials_round_trip() {
+    fn credentials_fail_without_activity() {
+        if crate::android::jni::with_env(|_| Ok(())).is_ok() {
+            return;
+        }
         let p = headless();
-        p.write_credentials("svc", "user", b"pass123").unwrap();
-        let result = p.read_credentials("svc", "user").unwrap();
-        assert_eq!(result.as_deref(), Some(b"pass123".as_slice()));
+        assert!(p.write_credentials("svc", "user", b"pass123").is_err());
+        assert!(p.read_credentials("svc", "user").is_err());
     }
 
     #[test]
     fn credentials_delete() {
+        if crate::android::jni::with_env(|_| Ok(())).is_ok() {
+            return;
+        }
         let p = headless();
-        p.write_credentials("svc", "user", b"pass").unwrap();
-        p.delete_credentials("svc", "user").unwrap();
-        assert!(p.read_credentials("svc", "user").unwrap().is_none());
+        assert!(p.delete_credentials("svc", "user").is_err());
     }
 
     #[test]
-    fn credentials_missing_returns_none() {
+    fn credentials_unavailable_is_not_absence() {
+        if crate::android::jni::with_env(|_| Ok(())).is_ok() {
+            return;
+        }
         let p = headless();
-        assert!(p
-            .read_credentials("no-such-service", "user")
-            .unwrap()
-            .is_none());
+        assert!(p.read_credentials("no-such-service", "user").is_err());
     }
 
     // ── misc platform queries ─────────────────────────────────────────────────

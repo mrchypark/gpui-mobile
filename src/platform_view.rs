@@ -37,7 +37,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Unique identifier for a platform view instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -209,7 +209,7 @@ impl Drop for PlatformViewHandle {
 /// When a GPUI element needs a native view, it looks up the factory
 /// by type string and creates an instance.
 pub struct PlatformViewRegistry {
-    factories: Mutex<HashMap<String, Box<dyn PlatformViewFactory>>>,
+    factories: Mutex<HashMap<String, Arc<dyn PlatformViewFactory>>>,
     views: Mutex<HashMap<PlatformViewId, PlatformViewBounds>>,
 }
 
@@ -234,7 +234,7 @@ impl PlatformViewRegistry {
         self.factories
             .lock()
             .unwrap()
-            .insert(view_type.to_string(), factory);
+            .insert(view_type.to_string(), Arc::from(factory));
     }
 
     /// Unregister a factory for a view type.
@@ -260,9 +260,13 @@ impl PlatformViewRegistry {
         view_type: &str,
         params: PlatformViewParams,
     ) -> Result<PlatformViewHandle, String> {
-        let factories = self.factories.lock().unwrap();
-        let factory = factories
+        // Native factories may synchronously dispatch to the UI thread.
+        let factory = self
+            .factories
+            .lock()
+            .unwrap()
             .get(view_type)
+            .cloned()
             .ok_or_else(|| format!("No factory registered for view type '{}'", view_type))?;
 
         let view = factory.create(&params)?;

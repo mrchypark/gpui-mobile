@@ -61,7 +61,7 @@ log          = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 parking_lot  = "0.12"
 futures      = "0.3"
 raw-window-handle = "0.6"
-btleplug = { version = "=0.13.5", optional = true }
+btleplug = { version = "=0.13.5", path = "src/packages/ble/vendor/btleplug-0.13.5", optional = true }
 tokio = { version = "1.53.1", features = ["rt", "time"], optional = true }
 
 # ── GPUI core crate (provides Platform trait, event types, geometry, etc.) ───

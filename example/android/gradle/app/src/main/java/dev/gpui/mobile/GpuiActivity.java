@@ -39,6 +39,7 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        GpuiDeepLink.captureInitialLink(this);
         // Install the splash screen BEFORE calling super.onCreate().
         // This is required by the AndroidX SplashScreen API.
         SplashScreen splash = SplashScreen.installSplashScreen(this);
@@ -133,9 +134,28 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onDestroy() {
+        GpuiLocation.setHostResumed(this, false);
+        GpuiThermal.unregister(this);
+        GpuiSensors.setHostResumed(this, false);
         // Release media session when activity is destroyed.
         GpuiMediaSession.release();
         super.onDestroy();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        GpuiLocation.setHostResumed(this, true);
+        GpuiSensors.setHostResumed(this, true);
+        GpuiServiceProbe.resumed(this);
+    }
+
+    @Override
+    protected void onPause() {
+        GpuiServiceProbe.paused();
+        GpuiLocation.setHostResumed(this, false);
+        GpuiSensors.setHostResumed(this, false);
+        super.onPause();
     }
 
     /**

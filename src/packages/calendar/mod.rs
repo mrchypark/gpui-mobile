@@ -8,6 +8,8 @@
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(any(target_os = "ios", test))]
+mod authorization;
 #[cfg(target_os = "ios")]
 mod ios;
 
@@ -39,7 +41,8 @@ pub struct CalendarEvent {
     pub start_ms: i64,
     /// End time as Unix timestamp in milliseconds.
     pub end_ms: i64,
-    /// Whether this is an all-day event.
+    /// Whether this is an all-day event. Creation requires UTC-midnight start
+    /// and end timestamps; end is exclusive. No local-time normalization occurs.
     pub all_day: bool,
     /// Calendar ID this event belongs to.
     pub calendar_id: String,
@@ -68,6 +71,9 @@ pub fn get_events(
     start_ms: i64,
     end_ms: i64,
 ) -> Result<Vec<CalendarEvent>, String> {
+    if end_ms <= start_ms {
+        return Err("Calendar range end must follow its start".into());
+    }
     #[cfg(target_os = "ios")]
     {
         ios::get_events(calendar_id, start_ms, end_ms)
@@ -83,8 +89,10 @@ pub fn get_events(
     }
 }
 
-/// Create a new event. Returns the event ID.
+/// Create a new event. Returns the event ID. iOS requires full calendar access
+/// because the selected calendar is looked up by ID (write-only is insufficient).
 pub fn create_event(event: &CalendarEvent) -> Result<String, String> {
+    validate_event_times(event.start_ms, event.end_ms, event.all_day)?;
     #[cfg(target_os = "ios")]
     {
         ios::create_event(event)
@@ -100,7 +108,8 @@ pub fn create_event(event: &CalendarEvent) -> Result<String, String> {
     }
 }
 
-/// Delete an event by ID.
+/// Delete a non-recurring event by ID. Recurring series/occurrences are rejected
+/// because this API has no deletion-scope argument. Never deletes a whole series.
 pub fn delete_event(event_id: &str) -> Result<bool, String> {
     #[cfg(target_os = "ios")]
     {
@@ -114,5 +123,32 @@ pub fn delete_event(event_id: &str) -> Result<bool, String> {
     {
         let _ = event_id;
         Err("calendar is only available on iOS and Android".into())
+    }
+}
+
+fn validate_event_times(start: i64, end: i64, all_day: bool) -> Result<(), String> {
+    if end <= start {
+        return Err("Calendar event end must follow its start".into());
+    }
+    if all_day && (start.rem_euclid(86_400_000) != 0 || end.rem_euclid(86_400_000) != 0) {
+        return Err(
+            "All-day events require UTC-midnight timestamps and an exclusive end day".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_event_times;
+    #[test]
+    fn all_day_boundaries_are_explicit_not_silently_shifted() {
+        assert!(validate_event_times(0, 86_400_000, true).is_ok());
+        assert!(validate_event_times(-86_400_000, 0, true).is_ok());
+        assert!(validate_event_times(1, 86_400_000, true).is_err());
+        assert!(validate_event_times(0, 86_400_001, true).is_err());
+        assert!(validate_event_times(0, 0, true).is_err());
+        assert!(validate_event_times(i64::MIN, i64::MAX, false).is_ok());
+        assert!(validate_event_times(1, 2, false).is_ok());
     }
 }

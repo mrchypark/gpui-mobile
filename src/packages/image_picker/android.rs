@@ -22,11 +22,14 @@ pub fn pick_image(options: &ImagePickerOptions) -> Result<Option<PickedFile>, St
             .call_static_method(
                 &cls,
                 jni::jni_str!("pickImage"),
-                jni::jni_sig!("(Landroid/app/Activity;II)Ljava/lang/String;"),
+                jni::jni_sig!("(Landroid/app/Activity;IIDDI)Ljava/lang/String;"),
                 &[
                     JValue::Object(&activity),
                     JValue::Int(source),
                     JValue::Int(camera_facing),
+                    JValue::Double(options.max_width.unwrap_or(0.0)),
+                    JValue::Double(options.max_height.unwrap_or(0.0)),
+                    JValue::Int(options.image_quality.map(i32::from).unwrap_or(-1)),
                 ],
             )
             .and_then(|v| v.l())
@@ -46,9 +49,9 @@ pub fn pick_image(options: &ImagePickerOptions) -> Result<Option<PickedFile>, St
 }
 
 pub fn pick_multi_image(
-    _max_width: Option<f64>,
-    _max_height: Option<f64>,
-    _image_quality: Option<u8>,
+    max_width: Option<f64>,
+    max_height: Option<f64>,
+    image_quality: Option<u8>,
 ) -> Result<Vec<PickedFile>, String> {
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
@@ -58,8 +61,10 @@ pub fn pick_multi_image(
             .call_static_method(
                 &cls,
                 jni::jni_str!("pickMultiImage"),
-                jni::jni_sig!("(Landroid/app/Activity;)[Ljava/lang/String;"),
-                &[JValue::Object(&activity)],
+                jni::jni_sig!("(Landroid/app/Activity;DDI)[Ljava/lang/String;"),
+                &[JValue::Object(&activity), JValue::Double(max_width.unwrap_or(0.0)),
+                    JValue::Double(max_height.unwrap_or(0.0)),
+                    JValue::Int(image_quality.map(i32::from).unwrap_or(-1))],
             )
             .and_then(|v| v.l())
             .map_err(|e| {

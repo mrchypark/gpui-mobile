@@ -388,6 +388,8 @@ pub fn set_zoom(handle: &CameraHandle, zoom: f64) -> Result<(), String> {
 }
 
 /// Switch to a different camera (e.g. front <-> back).
+/// On Android, run off the UI thread and stop recording before switching. The
+/// existing preview handle is retained; failures attempt to restore the old device.
 pub fn set_camera(handle: &CameraHandle, camera: &CameraDescription) -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {

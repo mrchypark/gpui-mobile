@@ -1,128 +1,92 @@
 package dev.gpui.mobile;
 
 import android.app.Activity;
+import android.content.ClipData;
 import android.content.Intent;
 import android.net.Uri;
-import android.os.Environment;
 import android.provider.MediaStore;
-
+import androidx.core.content.FileProvider;
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
-import java.util.concurrent.CountDownLatch;
 
-/**
- * Image/video picker helper for gallery selection and camera capture.
- *
- * <p>All public methods are static and called from Rust via JNI.
- * They block the calling thread until the user completes or cancels the picker.</p>
- */
 public final class GpuiImagePicker {
-
-    /** Source constants matching Rust's ImageSource enum. */
-    private static final int SOURCE_GALLERY = 0;
-    private static final int SOURCE_CAMERA = 1;
-
-    /** Camera facing constants matching Rust's CameraDevice enum. */
-    private static final int CAMERA_REAR = 0;
-    private static final int CAMERA_FRONT = 1;
-
-    /**
-     * Pick a single image from gallery or camera.
-     *
-     * @param activity    The current Activity.
-     * @param source      0 = gallery, 1 = camera.
-     * @param cameraFacing 0 = rear, 1 = front.
-     * @return The image URI/path as a string, or null if cancelled.
-     */
-    public static String pickImage(final Activity activity, int source, int cameraFacing) {
-        Intent intent;
-        if (source == SOURCE_CAMERA) {
-            intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
-            if (cameraFacing == CAMERA_FRONT) {
-                intent.putExtra("android.intent.extras.CAMERA_FACING", 1);
-                intent.putExtra("android.intent.extras.LENS_FACING_FRONT", 1);
-                intent.putExtra("android.intent.extra.USE_FRONT_CAMERA", true);
-            }
-        } else {
-            intent = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
-            intent.setType("image/*");
-        }
-
-        ArrayList<String> result = launchPicker(activity, intent);
-        if (result != null && !result.isEmpty()) {
-            return result.get(0);
-        }
-        return null;
+    public static String pickImage(Activity activity, int source, int cameraFacing,
+            double maxWidth, double maxHeight, int quality) {
+        validate(maxWidth, maxHeight, quality);
+        ArrayList<String> files = select(activity, source, cameraFacing, false, false);
+        if (files == null || files.isEmpty()) return null;
+        File input = new File(files.get(0));
+        try { return GpuiPickerFiles.transform(input, maxWidth, maxHeight, quality).getAbsolutePath(); }
+        catch (RuntimeException error) { discard(input, error); throw error; }
     }
 
-    /**
-     * Pick multiple images from the gallery.
-     *
-     * @param activity The current Activity.
-     * @return Array of image URIs, or null if cancelled.
-     */
-    public static String[] pickMultiImage(final Activity activity) {
-        Intent intent = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
-        intent.setType("image/*");
-        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-
-        ArrayList<String> result = launchPicker(activity, intent);
-        if (result != null) {
-            return result.toArray(new String[0]);
-        }
-        return null;
-    }
-
-    /**
-     * Pick a video from gallery or camera.
-     *
-     * @param activity    The current Activity.
-     * @param source      0 = gallery, 1 = camera.
-     * @param cameraFacing 0 = rear, 1 = front.
-     * @return The video URI/path as a string, or null if cancelled.
-     */
-    public static String pickVideo(final Activity activity, int source, int cameraFacing) {
-        Intent intent;
-        if (source == SOURCE_CAMERA) {
-            intent = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
-            if (cameraFacing == CAMERA_FRONT) {
-                intent.putExtra("android.intent.extras.CAMERA_FACING", 1);
-                intent.putExtra("android.intent.extras.LENS_FACING_FRONT", 1);
-                intent.putExtra("android.intent.extra.USE_FRONT_CAMERA", true);
-            }
-        } else {
-            intent = new Intent(Intent.ACTION_PICK, MediaStore.Video.Media.EXTERNAL_CONTENT_URI);
-            intent.setType("video/*");
-        }
-
-        ArrayList<String> result = launchPicker(activity, intent);
-        if (result != null && !result.isEmpty()) {
-            return result.get(0);
-        }
-        return null;
-    }
-
-    // ── Internal ─────────────────────────────────────────────────────────
-
-    private static ArrayList<String> launchPicker(Activity activity, Intent intent) {
-        CountDownLatch latch = new CountDownLatch(1);
-        GpuiPickerActivity.sLatch = latch;
-        GpuiPickerActivity.sResult.set(null);
-        GpuiPickerActivity.sPendingIntent = intent;
-
-        Intent proxy = new Intent(activity, GpuiPickerActivity.class);
-        proxy.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(proxy);
-
+    public static String[] pickMultiImage(Activity activity, double maxWidth, double maxHeight, int quality) {
+        validate(maxWidth, maxHeight, quality);
+        ArrayList<String> files = select(activity, 0, 0, false, true);
+        if (files == null) return null;
+        ArrayList<String> outputs = new ArrayList<>();
         try {
-            latch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
+            for (String path : files) outputs.add(GpuiPickerFiles.transform(new File(path), maxWidth, maxHeight, quality).getAbsolutePath());
+            return outputs.toArray(new String[0]);
+        } catch (RuntimeException error) {
+            for (String path : outputs) discard(new File(path), error);
+            for (String path : files) discard(new File(path), error);
+            throw error;
         }
-
-        return GpuiPickerActivity.sResult.get();
     }
 
+    public static String pickVideo(Activity activity, int source, int cameraFacing) {
+        ArrayList<String> files = select(activity, source, cameraFacing, true, false);
+        return files == null || files.isEmpty() ? null : files.get(0);
+    }
+
+    private static void validate(double width, double height, int quality) {
+        GpuiPickerFiles.targetSize(1, 1, width, height);
+        if (quality < -1 || quality > 100) throw new IllegalArgumentException("JPEG quality must be 0..100");
+    }
+
+    private static ArrayList<String> select(Activity activity, int source, int cameraFacing, boolean video, boolean multiple) {
+        Intent intent;
+        File capture = null;
+        try {
+            if (source == 1) {
+                intent = new Intent(video ? MediaStore.ACTION_VIDEO_CAPTURE : MediaStore.ACTION_IMAGE_CAPTURE);
+                File directory = new File(activity.getFilesDir(), "gpui-picker-capture");
+                if (!directory.isDirectory() && !directory.mkdirs()) throw new IOException("Cannot create capture directory");
+                capture = File.createTempFile("capture-", video ? ".mp4" : ".jpg", directory);
+                Uri output = FileProvider.getUriForFile(activity, activity.getPackageName() + ".gpui.picker.files", capture);
+                intent.putExtra(MediaStore.EXTRA_OUTPUT, output);
+                intent.setClipData(ClipData.newRawUri("camera output", output));
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                if (cameraFacing == 1) {
+                    intent.putExtra("android.intent.extras.CAMERA_FACING", 1);
+                    intent.putExtra("android.intent.extras.LENS_FACING_FRONT", 1);
+                    intent.putExtra("android.intent.extra.USE_FRONT_CAMERA", true);
+                }
+            } else if (source == 0) {
+                intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType(video ? "video/*" : "image/*");
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple);
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            } else {
+                throw new IllegalArgumentException("Unknown image source");
+            }
+            return GpuiPickerActivity.launch(activity, intent, true, capture);
+        } catch (IOException error) {
+            throw new IllegalStateException("Cannot prepare camera output", error);
+        } finally {
+            // launch waits through interruption until native ownership is released.
+            if (capture != null && capture.exists() && !capture.delete()) {
+                throw new IllegalStateException("Cannot remove camera output: " + capture);
+            }
+        }
+    }
+
+    private static void discard(File file, RuntimeException error) {
+        try { GpuiPickerFiles.discard(file); }
+        catch (RuntimeException cleanup) { error.addSuppressed(cleanup); }
+    }
     private GpuiImagePicker() {}
 }

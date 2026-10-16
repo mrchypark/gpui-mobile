@@ -1,19 +1,29 @@
 //! Location services for GPS/network position.
 //!
 //! Provides a cross-platform location API backed by:
-//! - Android: LocationManager via JNI (no Google Play Services dependency)
+//! - Android: GMS fused with LocationManager fallback via JNI
 //! - iOS: CLLocationManager via Objective-C
 //!
 //! Feature-gated behind `location`.
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(all(target_os = "android", debug_assertions, feature = "permission_handler"))]
+mod android_probe;
 mod events;
 #[cfg(target_os = "ios")]
 mod ios;
 mod stream;
+#[cfg(feature = "permission_handler")]
+mod access;
+#[cfg(feature = "permission_handler")]
+pub use access::{check_location_access, request_location_access, LocationAccess};
+#[cfg(feature = "permission_handler")]
+pub mod demo;
+#[cfg(all(target_os = "ios", target_env = "sim", debug_assertions, feature = "permission_handler"))]
+mod simulator_probe;
 pub use stream::{
-    get_current_position_async, watch_position, LocationEvent, LocationPermission,
+    get_current_position_async, get_current_position_with_timeout, watch_position, watch_position_background, LocationEvent, LocationPermission,
     LocationSubscription,
 };
 
@@ -111,18 +121,28 @@ pub fn get_last_known_position() -> Result<Option<Position>, String> {
 }
 
 /// Calculate distance between two positions in meters (Haversine formula).
+/// Returns NaN for nonfinite or out-of-range coordinates.
 pub fn distance_between(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    if !valid_coordinate(lat1, lon1) || !valid_coordinate(lat2, lon2) {
+        return f64::NAN;
+    }
     let r = 6_371_000.0; // Earth radius in meters
     let d_lat = (lat2 - lat1).to_radians();
     let d_lon = (lon2 - lon1).to_radians();
     let a = (d_lat / 2.0).sin().powi(2)
         + lat1.to_radians().cos() * lat2.to_radians().cos() * (d_lon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().asin();
+    // Floating-point rounding can put antipodal points just above one.
+    let c = 2.0 * a.clamp(0.0, 1.0).sqrt().asin();
     r * c
 }
 
 /// Calculate bearing from point 1 to point 2 in degrees (0-360).
+/// Returns NaN for invalid coordinates. Coincident points return zero;
+/// bearings at antipodes/poles are not uniquely defined.
 pub fn bearing_between(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    if !valid_coordinate(lat1, lon1) || !valid_coordinate(lat2, lon2) {
+        return f64::NAN;
+    }
     let lat1_r = lat1.to_radians();
     let lat2_r = lat2.to_radians();
     let d_lon = (lon2 - lon1).to_radians();
@@ -132,4 +152,28 @@ pub fn bearing_between(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
     let bearing = x.atan2(y).to_degrees();
     (bearing + 360.0) % 360.0
+}
+
+fn valid_coordinate(latitude: f64, longitude: f64) -> bool {
+    (-90.0..=90.0).contains(&latitude) && (-180.0..=180.0).contains(&longitude)
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    #[test]
+    fn distance_and_bearing_boundaries() {
+        assert_eq!(distance_between(37.0, 127.0, 37.0, 127.0), 0.0);
+        for latitude in -90..=90 {
+            let distance = distance_between(latitude as f64, 0.0, -latitude as f64, 180.0);
+            assert!((distance - std::f64::consts::PI * 6_371_000.0).abs() < 0.2);
+        }
+        assert!((distance_between(0.0, 179.0, 0.0, -179.0) - 222_389.853).abs() < 0.01);
+        assert_eq!(bearing_between(0.0, 0.0, 0.0, 1.0), 90.0);
+        assert_eq!(bearing_between(0.0, 0.0, 1.0, 0.0), 0.0);
+        for latitude in [91.0, f64::NAN, f64::INFINITY] {
+            assert!(distance_between(latitude, 0.0, 0.0, 0.0).is_nan());
+            assert!(bearing_between(latitude, 0.0, 0.0, 0.0).is_nan());
+        }
+    }
 }

@@ -19,6 +19,26 @@ public final class GpuiInsets implements View.OnAttachStateChangeListener,
     private int[] previous;
     private float previousDensity;
 
+    /** Called on Java's main thread; input bounds are surface-local logical pixels. */
+    public static void updateCursor(Activity activity, float x, float y, float height, float density) {
+        View root = activity.getWindow().getDecorView();
+        View surface = findSurface(root);
+        if (surface == null || !surface.isAttachedToWindow()) return;
+        int[] location = new int[2];
+        surface.getLocationOnScreen(location);
+        android.graphics.Matrix matrix = new android.graphics.Matrix();
+        matrix.setScale(density, density);
+        matrix.postTranslate(location[0], location[1]);
+        android.view.inputmethod.CursorAnchorInfo info = new android.view.inputmethod.CursorAnchorInfo.Builder()
+                .setMatrix(matrix)
+                .setInsertionMarkerLocation(x, y, y + height, y + height, 0)
+                .build();
+        android.view.inputmethod.InputMethodManager manager =
+                (android.view.inputmethod.InputMethodManager) activity.getSystemService(Activity.INPUT_METHOD_SERVICE);
+        View editor = root.findViewWithTag("dev.gpui.mobile.keyboard");
+        if (manager != null) manager.updateCursorAnchorInfo(editor == null ? root : editor, info);
+    }
+
     public static void install(Activity activity) {
         ViewGroup content = activity.findViewById(android.R.id.content);
         if (content == null || content.findViewWithTag(TAG) != null) return;

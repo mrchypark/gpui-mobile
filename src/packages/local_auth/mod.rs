@@ -18,7 +18,6 @@ pub enum BiometricType {
     Face,
     Iris,
 }
-
 /// Result of an authentication attempt.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AuthResult {
@@ -82,6 +81,7 @@ pub fn get_available_biometrics() -> Result<Vec<BiometricType>, String> {
 
 /// Authenticate the user with biometrics.
 /// `reason` is displayed to the user explaining why authentication is needed.
+/// Blocking API: call from a worker thread; authentication is bounded to two minutes.
 pub fn authenticate(reason: &str) -> Result<AuthResult, String> {
     #[cfg(target_os = "ios")]
     {

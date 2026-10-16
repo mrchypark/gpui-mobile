@@ -127,3 +127,33 @@ points to the bulk tool/Simulator path. Source inspection found that UIKit's
 the bulk result alone. This supersedes only the earlier exact-hardware-entry gap;
 the other dated verification limits above remain unchanged.
 
+
+## Fresh patched-build UI follow-up — 2026-10-16
+
+Evidence directory: enclosing workspace `outputs/mobile-fixes-build-20261016/`.
+The new executable SHA-256 is
+`28f154b4b794a0996d03321567e16b3e52c08b9e3ad40d706988d2452f2c6d63`.
+All 12 builder source hashes matched at final audit. Build exit 0, signing verification,
+and fresh adapter/floating-keyboard self-check markers passed. Runtime identity:
+iPhone 16e / iOS 26.3, UDID `1CBC5201-CBB1-42D1-9DC2-CDAA33E624DC`, PID 56948.
+
+- `01-fresh-render.png`: newly rendered app, before input.
+- User manually clicked the field; parent observed focus, active Korean input-method
+  characters, BackSpace clearing, and individual numeric keys producing exact `123`.
+- `02-input123.png` at 11:14:55 KST directly shows `123` and the Korean software
+  keyboard. Log geometry is logical origin (0,536), size 390×308, visible=true.
+  This verifies toggle-associated keyboard display/inset delivery, not automatic
+  appearance from focus alone. Earlier CUA imagery lagged the captured frame;
+  that discrepancy is not a demonstrated backend layout defect.
+- Parent used AX Home, then the ElyIntegration icon. Logs record Paused after
+  11:16:14 and Resumed before active at 11:17:25. Text `123` survived. Parent then
+  pressed software-keyboard AX digit 4; `03-resume-softkey1234.png` directly shows
+  `1234`, keyboard visible, clicks0, pan0,0, commits0. Software-keyboard input and
+  post-release lifecycle recovery pass; no active contacts were involved.
+
+CUA coordinate drag remains blocked by `noWindowsAvailable`. Actual scrolling,
+pinch, partial-pointer cancellation, blur dismissal and floating-keyboard behavior
+remain unverified. New adapter cancellation/inset self-checks passed but do not
+replace these runtime checks. Prior dated evidence above remains historical.
+No source fix was indicated by these input observations. Reviewer captured only
+requested screenshots; parent owned interaction and builder owns its app cleanup.

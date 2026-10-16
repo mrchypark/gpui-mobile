@@ -17,6 +17,109 @@ use objc2::{class, msg_send};
 #[cfg(target_os = "ios")]
 use super::cg_types::ObjcCGRect;
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+pub(crate) struct NativeView {
+    pub pointer: usize,
+    view_type: String,
+    // MKMapView retains these annotations; this table only indexes them.
+    pub markers: HashMap<String, usize>,
+}
+
+fn native_views() -> &'static Mutex<HashMap<PlatformViewId, NativeView>> {
+    static VIEWS: OnceLock<Mutex<HashMap<PlatformViewId, NativeView>>> = OnceLock::new();
+    VIEWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Borrow the actual paint window's UIKit view. No global-window ordering or
+/// key-window state participates in attachment, and no window pointer is cached.
+pub(crate) fn attach_to_paint_window(
+    id: PlatformViewId,
+    window: &gpui::Window,
+) -> Result<(), String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let main: bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+    if !main {
+        return Err("Platform view paint must run on the iOS main thread".into());
+    }
+    let handle = HasWindowHandle::window_handle(window).map_err(|e| e.to_string())?;
+    let RawWindowHandle::UiKit(handle) = handle.as_raw() else {
+        return Err("Paint window does not have a UIKit view".into());
+    };
+    let pointer = native_views()
+        .lock()
+        .map_err(|_| "Native view registry poisoned")?
+        .get(&id)
+        .ok_or("Native view is disposed or missing")?
+        .pointer;
+    unsafe { attach_above_metal(pointer as *mut AnyObject, handle.ui_view.as_ptr().cast()) }
+}
+
+unsafe fn attach_above_metal(view: *mut AnyObject, metal: *mut AnyObject) -> Result<(), String> {
+    let parent: *mut AnyObject = msg_send![metal, superview];
+    if parent.is_null() {
+        return Err("Paint window's Metal view has no superview".into());
+    }
+    let current: *mut AnyObject = msg_send![view, superview];
+    if current != parent {
+        // UIKit reparents the view if this element has moved to another window.
+        let _: () = msg_send![parent, insertSubview: view, aboveSubview: metal];
+    }
+    Ok(())
+}
+
+pub(crate) fn on_main<R: Send, F: FnOnce() -> R + Send>(action: F) -> R {
+    unsafe extern "C" fn invoke<F: FnOnce() -> R, R>(context: *mut std::ffi::c_void) {
+        let state = &mut *(context as *mut (Option<F>, Option<std::thread::Result<R>>));
+        state.1 = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            state.0.take().unwrap(),
+        )));
+    }
+    unsafe extern "C" {
+        fn dispatch_sync_f(
+            queue: *mut std::ffi::c_void,
+            context: *mut std::ffi::c_void,
+            work: unsafe extern "C" fn(*mut std::ffi::c_void),
+        );
+    }
+    let main: bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+    if main {
+        return action();
+    }
+    let mut state: (Option<F>, Option<std::thread::Result<R>>) = (Some(action), None);
+    unsafe {
+        dispatch_sync_f(
+            super::dispatcher::dispatch_get_main_queue(),
+            &mut state as *mut _ as *mut _,
+            invoke::<F, R>,
+        );
+    }
+    match state.1.unwrap() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+pub(crate) fn with_native<R: Send>(
+    id: PlatformViewId,
+    kind: &str,
+    action: impl FnOnce(&mut NativeView) -> Result<R, String> + Send,
+) -> Result<R, String> {
+    on_main(|| {
+        let mut views = native_views()
+            .lock()
+            .map_err(|_| "Native view registry poisoned")?;
+        let view = views
+            .get_mut(&id)
+            .ok_or("Native view is disposed or missing")?;
+        if view.view_type != kind {
+            return Err("Native view type mismatch".into());
+        }
+        action(view)
+    })
+}
+
 /// iOS implementation of a platform view.
 ///
 /// Wraps a `UIView` instance. The view is created during construction but
@@ -24,9 +127,7 @@ use super::cg_types::ObjcCGRect;
 /// `native_view_ptr()` to get the raw `*mut AnyObject` pointer, then insert
 /// it into the appropriate superview from the iOS window code.
 ///
-/// TODO: The window/paint code should call `native_view_ptr()` and insert
-/// the view as a subview of the Metal view's superview (or another
-/// appropriate container) at the correct z-order position.
+/// The element's paint callback attaches it to that exact paint window.
 pub struct IosPlatformView {
     id: PlatformViewId,
     view_type: String,
@@ -35,8 +136,6 @@ pub struct IosPlatformView {
     #[cfg(target_os = "ios")]
     native_view: std::sync::Mutex<*mut AnyObject>,
     disposed: AtomicBool,
-    /// Whether this view has been inserted into the window's view hierarchy.
-    inserted: AtomicBool,
     bounds: std::sync::Mutex<PlatformViewBounds>,
 }
 
@@ -54,14 +153,24 @@ impl IosPlatformView {
     pub fn new(view_type: &str, params: &PlatformViewParams) -> Result<Self, String> {
         let id = PlatformViewId::next();
 
-        let native_view = Self::create_native_view(view_type, &params.bounds, params)?;
+        let native_view = on_main(|| {
+            let pointer = Self::create_native_view(view_type, &params.bounds, params)? as usize;
+            native_views().lock().unwrap().insert(
+                id,
+                NativeView {
+                    pointer,
+                    view_type: view_type.into(),
+                    markers: HashMap::new(),
+                },
+            );
+            Ok::<_, String>(pointer)
+        })? as *mut AnyObject;
 
         Ok(Self {
             id,
             view_type: view_type.to_string(),
             native_view: std::sync::Mutex::new(native_view),
             disposed: AtomicBool::new(false),
-            inserted: AtomicBool::new(false),
             bounds: std::sync::Mutex::new(params.bounds),
         })
     }
@@ -90,6 +199,8 @@ impl IosPlatformView {
             let view: *mut AnyObject = match view_type {
                 "video_player" => Self::create_video_player_view(frame, params)?,
                 "webview" => Self::create_webview_view(frame, params)?,
+                #[cfg(feature = "maps")]
+                "map" => crate::packages::maps::ios::create(frame, params)?,
                 "camera_preview" => Self::create_camera_preview_view(frame, params)?,
                 _ => Self::create_generic_view(frame)?,
             };
@@ -134,38 +245,64 @@ impl IosPlatformView {
         frame: ObjcCGRect,
         params: &PlatformViewParams,
     ) -> Result<*mut AnyObject, String> {
-        // Create a container UIView
-        let uiview_class = class!(UIView);
-        let view: *mut AnyObject = msg_send![uiview_class, alloc];
-        let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
-        if view.is_null() {
-            return Err("Failed to create UIView for video_player".into());
+        let player_id = params
+            .creation_params
+            .get("player_id")
+            .ok_or("video_player requires player_id")?
+            .parse::<u32>()
+            .map_err(|_| "video_player player_id must be an unsigned integer")?;
+        // Hooke's helper acquires +1 while PLAYERS is locked. Retaining a raw
+        // pointer after the old borrowed lookup would still race disposal.
+        let player = crate::packages::video_player::ios_retain_player(player_id)
+            .ok_or("Video player is disposed or missing")?;
+        let player_layer: *mut AnyObject = msg_send![class!(AVPlayerLayer),
+            playerLayerWithPlayer: objc2::rc::Retained::as_ptr(&player)];
+        // AVPlayerLayer retains the player; the local acquisition is released
+        // only after layer construction and container setup have completed.
+        Self::create_video_layer_container(frame, player_layer)
+    }
+
+    unsafe fn create_video_layer_container(
+        frame: ObjcCGRect,
+        player_layer: *mut AnyObject,
+    ) -> Result<*mut AnyObject, String> {
+        if player_layer.is_null() {
+            return Err("Failed to create AVPlayerLayer".into());
         }
-
+        let view: *mut AnyObject = msg_send![class!(UIView), alloc];
+        let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
+        let view = objc2::rc::Retained::from_raw(view)
+            .ok_or("Failed to create UIView for video_player")?;
         let black_color: *mut AnyObject = msg_send![class!(UIColor), blackColor];
-        let _: () = msg_send![view, setBackgroundColor: black_color];
+        let _: () = msg_send![&*view, setBackgroundColor: black_color];
+        let view_layer: *mut AnyObject = msg_send![&*view, layer];
+        if view_layer.is_null() {
+            return Err("Video container has no backing layer".into());
+        }
+        let gravity = Self::make_nsstring("AVLayerVideoGravityResizeAspect");
+        let _: () = msg_send![player_layer, setVideoGravity: gravity];
+        let _: () = msg_send![gravity, release];
+        let _: () = msg_send![view_layer, addSublayer: player_layer];
+        Self::resize_video_layers(objc2::rc::Retained::as_ptr(&view).cast_mut());
+        Ok(objc2::rc::Retained::into_raw(view))
+    }
 
-        // If a player_id is provided, try to get the AVPlayer and create AVPlayerLayer
-        if let Some(player_id_str) = params.creation_params.get("player_id") {
-            if let Ok(player_id) = player_id_str.parse::<u32>() {
-                // Get AVPlayer from the video_player package's PLAYERS map
-                if let Some(player_ptr) = crate::packages::video_player::ios_get_player(player_id) {
-                    let player_layer: *mut AnyObject =
-                        msg_send![class!(AVPlayerLayer), playerLayerWithPlayer: player_ptr];
-                    if !player_layer.is_null() {
-                        let _: () = msg_send![player_layer, setFrame: frame];
-                        // Set video gravity to aspect fit
-                        let gravity = Self::make_nsstring("AVLayerVideoGravityResizeAspect");
-                        let _: () = msg_send![player_layer, setVideoGravity: gravity];
-                        let _: () = msg_send![gravity, release];
-                        let view_layer: *mut AnyObject = msg_send![view, layer];
-                        let _: () = msg_send![view_layer, addSublayer: player_layer];
-                    }
-                }
+    unsafe fn resize_video_layers(view: *mut AnyObject) {
+        let bounds: ObjcCGRect = msg_send![view, bounds];
+        let local = ObjcCGRect::new(0.0, 0.0, bounds.width, bounds.height);
+        let backing: *mut AnyObject = msg_send![view, layer];
+        let layers: *mut AnyObject = msg_send![backing, sublayers];
+        let count: usize = msg_send![layers, count];
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+        for index in 0..count {
+            let layer: *mut AnyObject = msg_send![layers, objectAtIndex: index];
+            let video: bool = msg_send![layer, isKindOfClass: class!(AVPlayerLayer)];
+            if video {
+                let _: () = msg_send![layer, setFrame: local];
             }
         }
-
-        Ok(view)
+        let _: () = msg_send![class!(CATransaction), commit];
     }
 
     /// Create a WKWebView.
@@ -174,6 +311,13 @@ impl IosPlatformView {
         frame: ObjcCGRect,
         params: &PlatformViewParams,
     ) -> Result<*mut AnyObject, String> {
+        if params
+            .creation_params
+            .get("dom_storage_enabled")
+            .is_some_and(|v| v == "false")
+        {
+            return Err("WKWebView has no public per-view DOM storage disable setting".into());
+        }
         let config: *mut AnyObject = msg_send![class!(WKWebViewConfiguration), alloc];
         let config: *mut AnyObject = msg_send![config, init];
         if config.is_null() {
@@ -194,8 +338,26 @@ impl IosPlatformView {
         let webview: *mut AnyObject = msg_send![class!(WKWebView), alloc];
         let webview: *mut AnyObject =
             msg_send![webview, initWithFrame: frame, configuration: config];
+        let _: () = msg_send![config, release];
         if webview.is_null() {
             return Err("Failed to create WKWebView".into());
+        }
+
+        if let Some(agent) = params.creation_params.get("user_agent") {
+            let agent = Self::make_nsstring(agent);
+            let _: () = msg_send![webview, setCustomUserAgent: agent];
+            let _: () = msg_send![agent, release];
+        }
+        if params
+            .creation_params
+            .get("zoom_enabled")
+            .is_some_and(|v| v == "false")
+        {
+            let scroll: *mut AnyObject = msg_send![webview, scrollView];
+            let pinch: *mut AnyObject = msg_send![scroll, pinchGestureRecognizer];
+            if !pinch.is_null() {
+                let _: () = msg_send![pinch, setEnabled: false];
+            }
         }
 
         // Load URL or HTML if provided
@@ -203,6 +365,11 @@ impl IosPlatformView {
             if !url.is_empty() {
                 let ns_url_str = Self::make_nsstring(url);
                 let nsurl: *mut AnyObject = msg_send![class!(NSURL), URLWithString: ns_url_str];
+                if nsurl.is_null() {
+                    let _: () = msg_send![ns_url_str, release];
+                    let _: () = msg_send![webview, release];
+                    return Err("Invalid WebView URL".into());
+                }
                 if !nsurl.is_null() {
                     let request: *mut AnyObject =
                         msg_send![class!(NSURLRequest), requestWithURL: nsurl];
@@ -263,7 +430,8 @@ impl IosPlatformView {
 
     #[cfg(target_os = "ios")]
     unsafe fn make_nsstring(s: &str) -> *mut AnyObject {
-        crate::ios::util::nsstring(s)
+        let string = crate::ios::util::nsstring(s);
+        msg_send![string, retain]
     }
 
     /// Returns the raw pointer to the underlying `UIView`.
@@ -278,71 +446,36 @@ impl IosPlatformView {
     /// Insert this view into the GPUI window's view hierarchy.
     ///
     /// Adds the UIView as a subview of the Metal view's superview (the
-    /// view controller's view), positioned below the Metal view so that
-    /// GPUI content renders on top.
+    /// view controller's view), above the Metal surface for native rendering
+    /// and hit testing. Native controls cover overlapping GPUI content.
     ///
-    /// This should be called once after creation, typically from the
-    /// platform view element's first paint. Subsequent calls are no-ops.
+    /// Called with the actual painting window; also supports reparenting.
     #[cfg(target_os = "ios")]
-    pub fn insert_into_window(&self) -> Result<(), String> {
-        // Guard against double-insertion.
-        if self.inserted.swap(true, Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        let native_view = *self.native_view.lock().unwrap();
-        if native_view.is_null() {
-            self.inserted.store(false, Ordering::Relaxed);
-            return Err("View is null (disposed?)".to_string());
-        }
-
-        unsafe {
-            if let Some(window) = super::ffi::windows().last() {
-                // Get the view controller's view (parent of Metal view)
-                let vc: *mut AnyObject = window.view_controller_ptr();
-                let vc_view: *mut AnyObject = msg_send![vc, view];
-                if !vc_view.is_null() {
-                    // Get the Metal view
-                    let metal_view = window.metal_view_ptr();
-                    if !metal_view.is_null() {
-                        // Insert below the Metal view so GPUI renders on top
-                        let _: () = msg_send![
-                            vc_view,
-                            insertSubview: native_view,
-                            belowSubview: metal_view
-                        ];
-                    } else {
-                        // Fallback: just add as subview
-                        let _: () = msg_send![vc_view, addSubview: native_view];
-                    }
-                    log::info!(
-                        "IosPlatformView: inserted view {} into window hierarchy",
-                        self.id
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        self.inserted.store(false, Ordering::Relaxed);
-        Err("No GPUI window available to host platform view".to_string())
+    pub fn insert_into_window(&self, window: &gpui::Window) -> Result<(), String> {
+        attach_to_paint_window(self.id, window)
     }
 
     /// Update the native view's frame.
     #[cfg(target_os = "ios")]
     fn update_native_frame(&self, bounds: &PlatformViewBounds) {
-        let view = *self.native_view.lock().unwrap();
-        if view.is_null() {
-            return;
-        }
-        unsafe {
-            let frame = ObjcCGRect::new(
-                bounds.x as f64,
-                bounds.y as f64,
-                bounds.width as f64,
-                bounds.height as f64,
-            );
-            let _: () = msg_send![view, setFrame: frame];
-        }
+        on_main(|| {
+            let view = *self.native_view.lock().unwrap();
+            if view.is_null() {
+                return;
+            }
+            unsafe {
+                let frame = ObjcCGRect::new(
+                    bounds.x as f64,
+                    bounds.y as f64,
+                    bounds.width as f64,
+                    bounds.height as f64,
+                );
+                let _: () = msg_send![view, setFrame: frame];
+                if self.view_type == "video_player" {
+                    Self::resize_video_layers(view);
+                }
+            }
+        });
     }
 }
 
@@ -361,7 +494,9 @@ impl PlatformView for IosPlatformView {
         }
         *self.bounds.lock().unwrap() = bounds;
         #[cfg(target_os = "ios")]
-        self.update_native_frame(&bounds);
+        {
+            self.update_native_frame(&bounds);
+        }
     }
 
     fn set_visible(&self, visible: bool) {
@@ -370,12 +505,14 @@ impl PlatformView for IosPlatformView {
         }
         #[cfg(target_os = "ios")]
         {
-            let view = *self.native_view.lock().unwrap();
-            if !view.is_null() {
-                unsafe {
-                    let _: () = msg_send![view, setHidden: !visible];
+            on_main(|| {
+                let view = *self.native_view.lock().unwrap();
+                if !view.is_null() {
+                    unsafe {
+                        let _: () = msg_send![view, setHidden: !visible];
+                    }
                 }
-            }
+            });
         }
         #[cfg(not(target_os = "ios"))]
         {
@@ -389,16 +526,18 @@ impl PlatformView for IosPlatformView {
         }
         #[cfg(target_os = "ios")]
         {
-            let view = *self.native_view.lock().unwrap();
-            if !view.is_null() {
-                unsafe {
-                    let layer: *mut AnyObject = msg_send![view, layer];
-                    if !layer.is_null() {
-                        let z = z_index as f64;
-                        let _: () = msg_send![layer, setZPosition: z];
+            on_main(|| {
+                let view = *self.native_view.lock().unwrap();
+                if !view.is_null() {
+                    unsafe {
+                        let layer: *mut AnyObject = msg_send![view, layer];
+                        if !layer.is_null() {
+                            let z = z_index as f64;
+                            let _: () = msg_send![layer, setZPosition: z];
+                        }
                     }
                 }
-            }
+            });
         }
         #[cfg(not(target_os = "ios"))]
         {
@@ -412,13 +551,20 @@ impl PlatformView for IosPlatformView {
         }
         #[cfg(target_os = "ios")]
         {
-            let view = *self.native_view.lock().unwrap();
-            if !view.is_null() {
-                unsafe {
-                    // Remove from superview if it was added to one.
-                    let _: () = msg_send![view, removeFromSuperview];
+            on_main(|| {
+                native_views().lock().unwrap().remove(&self.id);
+                let mut pointer = self.native_view.lock().unwrap();
+                let view = std::mem::replace(&mut *pointer, std::ptr::null_mut());
+                if !view.is_null() {
+                    unsafe {
+                        if self.view_type == "webview" {
+                            let _: () = msg_send![view, stopLoading];
+                        }
+                        let _: () = msg_send![view, removeFromSuperview];
+                        let _: () = msg_send![view, release];
+                    }
                 }
-            }
+            });
         }
         log::info!("IosPlatformView: disposed view {}", self.id);
     }
@@ -457,5 +603,114 @@ impl PlatformViewFactory for IosPlatformViewFactory {
 
     fn view_type(&self) -> &str {
         &self.view_type
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[test]
+    fn video_creation_rejects_missing_invalid_and_absent_players_and_nil_layer() {
+        on_main(|| unsafe {
+            let frame = ObjcCGRect::new(40.0, 70.0, 120.0, 90.0);
+            let mut params = PlatformViewParams::default();
+            assert!(IosPlatformView::create_video_player_view(frame, &params)
+                .unwrap_err()
+                .contains("requires player_id"));
+            params
+                .creation_params
+                .insert("player_id".into(), "invalid".into());
+            assert!(IosPlatformView::create_video_player_view(frame, &params)
+                .unwrap_err()
+                .contains("unsigned integer"));
+            // Package IDs start at one; zero never identifies a live test player.
+            params
+                .creation_params
+                .insert("player_id".into(), "0".into());
+            assert!(IosPlatformView::create_video_player_view(frame, &params)
+                .unwrap_err()
+                .contains("disposed or missing"));
+            assert!(
+                IosPlatformView::create_video_layer_container(frame, std::ptr::null_mut())
+                    .unwrap_err()
+                    .contains("AVPlayerLayer")
+            );
+        });
+    }
+
+    #[test]
+    fn video_layer_retains_player_and_tracks_local_bounds() {
+        on_main(|| {
+            objc2::rc::autoreleasepool(|_| unsafe {
+                let raw: *mut AnyObject = msg_send![class!(AVQueuePlayer), new];
+                let player = objc2::rc::Retained::from_raw(raw).unwrap();
+                let layer: *mut AnyObject = msg_send![class!(AVPlayerLayer),
+                playerLayerWithPlayer: objc2::rc::Retained::as_ptr(&player)];
+                assert!(!layer.is_null());
+                let frame = ObjcCGRect::new(40.0, 70.0, 120.0, 90.0);
+                let view = objc2::rc::Retained::from_raw(
+                    IosPlatformView::create_video_layer_container(frame, layer).unwrap(),
+                )
+                .unwrap();
+                drop(player);
+                let retained_player: *mut AnyObject = msg_send![layer, player];
+                assert_eq!(retained_player, raw);
+                let _: f32 = msg_send![retained_player, rate];
+                let bounds: ObjcCGRect = msg_send![layer, frame];
+                assert_eq!(
+                    (bounds.x, bounds.y, bounds.width, bounds.height),
+                    (0.0, 0.0, 120.0, 90.0)
+                );
+                let _: () = msg_send![&*view, setFrame: ObjcCGRect::new(80.0, 50.0, 300.0, 200.0)];
+                IosPlatformView::resize_video_layers(objc2::rc::Retained::as_ptr(&view).cast_mut());
+                let bounds: ObjcCGRect = msg_send![layer, frame];
+                assert_eq!(
+                    (bounds.x, bounds.y, bounds.width, bounds.height),
+                    (0.0, 0.0, 300.0, 200.0)
+                );
+                // Owned container drops here; autoreleased layer/player ownership drains with the pool.
+            })
+        });
+    }
+
+    #[test]
+    fn attachment_uses_paint_window_and_can_move_between_windows() {
+        on_main(|| unsafe {
+            struct Owned(Vec<*mut AnyObject>);
+            impl Drop for Owned {
+                fn drop(&mut self) {
+                    for object in self.0.iter().rev() {
+                        unsafe {
+                            let _: () = msg_send![*object, release];
+                        }
+                    }
+                }
+            }
+            let mut owned = Owned(Vec::new());
+            let a: *mut AnyObject = msg_send![class!(UIWindow), new];
+            owned.0.push(a);
+            let b: *mut AnyObject = msg_send![class!(UIWindow), new];
+            owned.0.push(b);
+            let metal_a: *mut AnyObject = msg_send![class!(UIView), new];
+            owned.0.push(metal_a);
+            let metal_b: *mut AnyObject = msg_send![class!(UIView), new];
+            owned.0.push(metal_b);
+            let embedded: *mut AnyObject = msg_send![class!(UIView), new];
+            owned.0.push(embedded);
+            let _: () = msg_send![a, addSubview: metal_a];
+            let _: () = msg_send![b, addSubview: metal_b];
+
+            // B was allocated later, but A paints this element first.
+            attach_above_metal(embedded, metal_a).unwrap();
+            let parent: *mut AnyObject = msg_send![embedded, superview];
+            assert_eq!(parent, a);
+            attach_above_metal(embedded, metal_a).unwrap();
+            attach_above_metal(embedded, metal_b).unwrap();
+            let parent: *mut AnyObject = msg_send![embedded, superview];
+            assert_eq!(parent, b);
+            let _: () = msg_send![metal_b, removeFromSuperview];
+            assert!(attach_above_metal(embedded, metal_b).is_err());
+        });
     }
 }

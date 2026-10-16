@@ -10,19 +10,21 @@
 //! whose view hosts a CAMetalLayer. Rendering is performed by
 //! `gpui_wgpu::WgpuRenderer` which drives wgpu over the Metal backend.
 
-use super::events::*;
 use super::IosDisplay;
+#[path = "input_traits.rs"]
+mod input_traits;
+use super::events::*;
 use crate::mobile_dispatch::Callback;
 use crate::mobile_events::{
     self, AppLifecycle, MobileEvent, MobileEventState, SurfaceLifecycle, WindowInsets,
 };
 use crate::momentum::{MomentumScroller, VelocityTracker};
 use gpui::{
-    point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
-    Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, TileId, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, Capslock,
+    DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, Scene, Size, TileId, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowParams, point, px, size,
 };
 use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -42,6 +44,85 @@ use std::{
 };
 
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
+const IME_NATIVE_EDIT_IVAR: &str = "gpui_ime_native_edit";
+
+// UIKit may call another overridden input method while updating its document.
+// Only the outer native operation delivers to the GPUI document.
+#[allow(deprecated)]
+unsafe fn native_ime_edit(this: *mut AnyObject, edit: impl FnOnce()) {
+    let previous = *(*this).get_ivar::<Bool>(IME_NATIVE_EDIT_IVAR);
+    *(*this).get_mut_ivar::<Bool>(IME_NATIVE_EDIT_IVAR) = Bool::YES;
+    edit();
+    *(*this).get_mut_ivar::<Bool>(IME_NATIVE_EDIT_IVAR) = previous;
+}
+
+#[allow(deprecated)]
+unsafe fn inside_native_ime_edit(this: *mut AnyObject) -> bool {
+    (*(*this).get_ivar::<Bool>(IME_NATIVE_EDIT_IVAR)).as_bool()
+}
+
+unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, before_edit: bool) {
+    let native: *mut AnyObject = msg_send![this, text];
+    let utf8: *const i8 = msg_send![native, UTF8String];
+    let native = if utf8.is_null() { String::new() } else {
+        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+    };
+    // UIKit can mutate textStorage directly before invoking insertText. Verify
+    // the last acknowledged document, not this partially applied native edit.
+    let expected = if before_edit { window.proxy_text.borrow().clone() } else { native.clone() };
+    let (context, matches) = window.input_handler.call(|| !window.closed.get(), |handler| {
+        let (accepts, owner) = mobile_events::query_text_input_owner(|| handler.query_accepts_text_input());
+        if !accepts { return (None, false); }
+        let context = handler.selected_text_range(false).map(|selection| (owner, selection.range));
+        let matches = window.proxy_base.get().and_then(|base| {
+            let end = base.checked_add(expected.encode_utf16().count())?;
+            let range = base..end;
+            let mut adjusted = None;
+            let actual = handler.text_for_range(range.clone(), &mut adjusted)?;
+            Some(actual == expected && adjusted.is_none_or(|adjusted| adjusted == range))
+        }).unwrap_or(false);
+        (context, matches)
+    }).unwrap_or((None, false));
+    let changed = *window.proxy_context.borrow() != context;
+    let owner_changed = window.proxy_context.borrow().as_ref().map(|c| c.0)
+        != context.as_ref().map(|c| c.0);
+    if (before_edit && changed) || owner_changed || !matches {
+        native_ime_edit(this, || {
+            let _: () = msg_send![this, setText: ptr::null_mut::<AnyObject>()];
+        });
+        window.proxy_base.set(context.as_ref().map(|(_, range)| range.start));
+        window.proxy_mapping_valid.set(false);
+        window.proxy_text.borrow_mut().clear();
+    } else if !before_edit {
+        // A void handler callback is not acceptance. Only authoritative text
+        // at the original anchor can certify this native document's mapping.
+        window.proxy_mapping_valid.set(true);
+        *window.proxy_text.borrow_mut() = native;
+    }
+    *window.proxy_context.borrow_mut() = context;
+}
+
+// Describe one whole native edit, including textStorage mutations that precede
+// an overridden callback. Offsets are UTF-16; comparison boundaries are scalars.
+fn native_text_edit<'a>(before: &str, after: &'a str) -> (std::ops::Range<usize>, &'a str) {
+    let prefix = before.chars().zip(after.chars()).take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    let suffix = before[prefix..].chars().rev().zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b).map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    let start = before[..prefix].encode_utf16().count();
+    let end = before[..before.len() - suffix].encode_utf16().count();
+    (start..end, &after[prefix..after.len() - suffix])
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ImeRange {
+    location: usize,
+    length: usize,
+}
+unsafe impl Encode for ImeRange {
+    const ENCODING: Encoding = Encoding::Struct("_NSRange", &[usize::ENCODING, usize::ENCODING]);
+}
 
 /// Lightweight window handle for wgpu surface creation.
 /// Stores the raw UIView pointer needed by wgpu to create a Metal surface.
@@ -294,21 +375,18 @@ fn register_metal_view_class() -> &'static AnyClass {
     class!(GPUIMetalView)
 }
 
-/// Register a custom UIView subclass that implements UIKeyInput protocol.
-///
-/// iOS requires the first-responder view to conform to `UIKeyInput` in order
-/// for the software keyboard to actually route typed characters back to the
-/// app.  Without this, `becomeFirstResponder` silently fails and no keyboard
-/// appears.
-///
-/// The three required methods:
-/// - `hasText` → always returns YES (simplifies things; no harm)
-/// - `insertText:` → forwards the text to `IosWindow::handle_text_input`
-/// - `deleteBackward` → dispatches a backspace via `crate::dispatch_text_input`
+/// UIKit owns the insertion proxy's composition storage and UITextInput protocol;
+/// GPUI owns the document. The legacy string callback receives committed text only.
 fn register_text_input_view_class() -> &'static AnyClass {
     TEXT_INPUT_VIEW_CLASS_REGISTERED.call_once(|| {
-        let superclass = class!(UIView);
+        // UITextView supplies UIKit's positions, ranges, tokenizer and composing
+        // storage. GPUI remains the document owner; this is an insertion proxy.
+        let superclass = class!(UITextView);
         let mut decl = ClassBuilder::new(c"GPUITextInputView", superclass).unwrap();
+        input_traits::register(&mut decl);
+        if let Some(protocol) = objc2::runtime::AnyProtocol::get(c"UITextInputTraits") {
+            decl.add_protocol(protocol);
+        }
 
         // Declare protocol conformance so iOS knows this view can receive
         // keyboard text input.
@@ -318,12 +396,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
 
         // Store the IosWindow pointer so callbacks can reach the Rust window.
         decl.add_ivar::<*mut std::ffi::c_void>(c"gpui_window_ptr");
-
-        // UITextInputTraits property storage — UIView doesn't provide these,
-        // but iOS reads them from the first responder to configure the keyboard.
-        decl.add_ivar::<isize>(c"_keyboardType"); // UIKeyboardType
-        decl.add_ivar::<isize>(c"_autocorrectionType"); // UITextAutocorrectionType
-        decl.add_ivar::<isize>(c"_autocapitalizationType"); // UITextAutocapitalizationType
+        decl.add_ivar::<Bool>(c"gpui_ime_native_edit");
 
         // --- UIKeyInput protocol methods ---
 
@@ -334,6 +407,10 @@ fn register_text_input_view_class() -> &'static AnyClass {
 
         // void insertText:(NSString *)text
         unsafe extern "C" fn insert_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), insertText: text];
+                return;
+            }
             #[allow(deprecated)]
             let window_ptr: *mut std::ffi::c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
             if window_ptr.is_null() || text.is_null() {
@@ -342,11 +419,134 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
                 return;
             };
-            window.handle_text_input(text);
+            let text: *mut AnyObject = msg_send![text, retain];
+            sync_proxy_context(this, &window, true);
+            let acknowledged = window.proxy_text.borrow().clone();
+            let mapped_base = window.proxy_base.get().filter(|_| window.proxy_mapping_valid.get());
+            // Korean keyboards replace earlier syllable fragments using the
+            // native document. Clearing it turns each fragment into an append.
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), insertText: text];
+            });
+            let delivered = if !crate::mobile_dispatch::has_text_handler() {
+                let utf8: *const i8 = msg_send![text, UTF8String];
+                if utf8.is_null() { false } else {
+                    let value = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+                    let native: *mut AnyObject = msg_send![this, text];
+                    let native_utf8: *const i8 = msg_send![native, UTF8String];
+                    let current = if native_utf8.is_null() { String::new() } else {
+                        std::ffi::CStr::from_ptr(native_utf8).to_string_lossy().into_owned()
+                    };
+                    window.input_handler.call(|| !window.closed.get(), |handler| {
+                        if let Some(base) = mapped_base {
+                            let (range, replacement) = native_text_edit(&acknowledged, &current);
+                            if let (Some(start), Some(end)) = (base.checked_add(range.start), base.checked_add(range.end)) {
+                                handler.replace_text_in_range(Some(start..end), replacement);
+                                // An unchanged-text commit still ends composition.
+                                // Some handlers ignore an empty textual diff.
+                                if handler.marked_text_range().is_some() {
+                                    handler.unmark_text();
+                                }
+                            }
+                        } else {
+                            handler.replace_text_in_range(None, &value);
+                        }
+                    }).is_some()
+                }
+            } else { false };
+            if !delivered { window.handle_text_input(text); }
+            sync_proxy_context(this, &window, false);
+            let _: () = msg_send![text, release];
+        }
+
+        unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, selection: ImeRange) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
+                return;
+            }
+            #[allow(deprecated)]
+            let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
+            let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            sync_proxy_context(this, &window, true);
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
+            });
+            let text = if text.is_null() { String::new() } else {
+                let utf8: *const i8 = msg_send![text, UTF8String];
+                if utf8.is_null() { return; }
+                std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+            };
+            let selection = crate::mobile_dispatch::composing_selection(&text, selection.location, selection.length);
+            if !crate::mobile_dispatch::has_text_handler() { window.input_handler.call(|| !window.closed.get(), |handler| {
+                handler.replace_and_mark_text_in_range(None, &text, Some(selection));
+            }); }
+            sync_proxy_context(this, &window, false);
+        }
+
+        unsafe extern "C" fn replace_range(this: *mut AnyObject, _sel: Sel, range: *mut AnyObject, text: *mut AnyObject) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), replaceRange: range, withText: text];
+                return;
+            }
+            #[allow(deprecated)]
+            let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
+            let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            if range.is_null() || text.is_null() { return; }
+            // Do not apply a range obtained from a previous owner's document.
+            let previous = window.proxy_context.borrow().clone();
+            sync_proxy_context(this, &window, true);
+            if previous != *window.proxy_context.borrow() || !window.proxy_mapping_valid.get() { return; }
+            let beginning: *mut AnyObject = msg_send![this, beginningOfDocument];
+            let start: *mut AnyObject = msg_send![range, start];
+            let end: *mut AnyObject = msg_send![range, end];
+            let start: isize = msg_send![this, offsetFromPosition: beginning, toPosition: start];
+            let end: isize = msg_send![this, offsetFromPosition: beginning, toPosition: end];
+            let utf8: *const i8 = msg_send![text, UTF8String];
+            if utf8.is_null() || start < 0 || end < start { return; }
+            let replacement = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+            // The proxy contains the current insertion context, not the full
+            // document. Translate from its caret to the actual owner's caret.
+            window.input_handler.call(|| !window.closed.get(), |handler| {
+                let Some(base) = window.proxy_base.get() else { return; };
+                let Some(owner_start) = base.checked_add(start as usize) else { return; };
+                let Some(owner_end) = base.checked_add(end as usize) else { return; };
+                native_ime_edit(this, || {
+                    let _: () = msg_send![super(this, class!(UITextView)), replaceRange: range, withText: text];
+                });
+                handler.replace_text_in_range(Some(owner_start..owner_end), &replacement);
+            });
+            sync_proxy_context(this, &window, false);
+        }
+
+        unsafe extern "C" fn unmark_text(this: *mut AnyObject, _sel: Sel) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), unmarkText];
+                return;
+            }
+            #[allow(deprecated)]
+            let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
+            let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            sync_proxy_context(this, &window, true);
+            let marked: *mut AnyObject = msg_send![this, markedTextRange];
+            if marked.is_null() { return; }
+            let text: *mut AnyObject = msg_send![this, textInRange: marked];
+            let text: *mut AnyObject = msg_send![text, retain];
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), unmarkText];
+            });
+            if crate::mobile_dispatch::has_text_handler() || window.input_handler.call(|| !window.closed.get(), |handler| handler.unmark_text()).is_none() {
+                window.handle_text_input(text);
+            }
+            let _: () = msg_send![text, release];
+            sync_proxy_context(this, &window, false);
         }
 
         // void deleteBackward
         unsafe extern "C" fn delete_backward(this: *mut AnyObject, _sel: Sel) {
+            if inside_native_ime_edit(this) {
+                let _: () = msg_send![super(this, class!(UITextView)), deleteBackward];
+                return;
+            }
             #[allow(deprecated)]
             let window_ptr: *mut std::ffi::c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
             if window_ptr.is_null() {
@@ -355,45 +555,55 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
                 return;
             };
+            sync_proxy_context(this, &window, true);
+            let marked: *mut AnyObject = msg_send![this, markedTextRange];
+            if !marked.is_null() {
+                let beginning: *mut AnyObject = msg_send![this, beginningOfDocument];
+                let start: *mut AnyObject = msg_send![marked, start];
+                let start: isize = msg_send![this, offsetFromPosition: beginning, toPosition: start];
+                if start < 0 { return; }
+                let text: *mut AnyObject = msg_send![this, textInRange: marked];
+                let length: usize = msg_send![text, length];
+                let selection: ImeRange = msg_send![this, selectedRange];
+                let Some(location) = selection.location.checked_sub(start as usize) else { return; };
+                if location > length || selection.length > length - location { return; }
+                let deletion = if selection.length != 0 {
+                    ImeRange { location, length: selection.length }
+                } else {
+                    if location == 0 { return; }
+                    // UITextView.deleteBackward cancels the whole marked text.
+                    // Preserve composition and delete one native grapheme instead.
+                    let range: ImeRange = msg_send![text, rangeOfComposedCharacterSequenceAtIndex: location - 1];
+                    range
+                };
+                let empty: *mut AnyObject = msg_send![class!(NSString), string];
+                let updated: *mut AnyObject = msg_send![text, stringByReplacingCharactersInRange: deletion, withString: empty];
+                let updated: *mut AnyObject = msg_send![updated, retain];
+                set_marked_text(this, sel!(setMarkedText:selectedRange:), updated,
+                    ImeRange { location: deletion.location, length: 0 });
+                let _: () = msg_send![updated, release];
+                return;
+            }
+            native_ime_edit(this, || {
+                let _: () = msg_send![super(this, class!(UITextView)), deleteBackward];
+            });
             window.handle_delete_backward();
+            sync_proxy_context(this, &window, false);
         }
 
         // canBecomeFirstResponder must return Bool::YES
         unsafe extern "C" fn can_become_first_responder(_this: *mut AnyObject, _sel: Sel) -> Bool {
             Bool::YES
         }
-
-        // --- UITextInputTraits property accessors ---
-        #[allow(deprecated)]
-        unsafe extern "C" fn get_keyboard_type(this: *mut AnyObject, _sel: Sel) -> isize {
-            *(*this).get_ivar::<isize>("_keyboardType")
+        unsafe extern "C" fn caret_rect(this: *mut AnyObject, _sel: Sel, _position: *mut AnyObject) -> ObjcCGRect {
+            msg_send![this, bounds]
         }
-        #[allow(deprecated)]
-        unsafe extern "C" fn set_keyboard_type(this: *mut AnyObject, _sel: Sel, val: isize) {
-            *(*this).get_mut_ivar::<isize>("_keyboardType") = val;
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn get_autocorrection_type(this: *mut AnyObject, _sel: Sel) -> isize {
-            *(*this).get_ivar::<isize>("_autocorrectionType")
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn set_autocorrection_type(this: *mut AnyObject, _sel: Sel, val: isize) {
-            *(*this).get_mut_ivar::<isize>("_autocorrectionType") = val;
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn get_autocapitalization_type(this: *mut AnyObject, _sel: Sel) -> isize {
-            *(*this).get_ivar::<isize>("_autocapitalizationType")
-        }
-        #[allow(deprecated)]
-        unsafe extern "C" fn set_autocapitalization_type(
-            this: *mut AnyObject,
-            _sel: Sel,
-            val: isize,
-        ) {
-            *(*this).get_mut_ivar::<isize>("_autocapitalizationType") = val;
-        }
-
         unsafe {
+            decl.add_method(sel!(caretRectForPosition:), caret_rect as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> ObjcCGRect);
+            decl.add_method(sel!(firstRectForRange:), caret_rect as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> ObjcCGRect);
+            decl.add_method(sel!(setMarkedText:selectedRange:), set_marked_text as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, ImeRange));
+            decl.add_method(sel!(unmarkText), unmark_text as unsafe extern "C" fn(*mut AnyObject, Sel));
+            decl.add_method(sel!(replaceRange:withText:), replace_range as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject));
             decl.add_method(
                 sel!(hasText),
                 has_text as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
@@ -411,31 +621,6 @@ fn register_text_input_view_class() -> &'static AnyClass {
                 can_become_first_responder as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
             );
 
-            // UITextInputTraits property methods
-            decl.add_method(
-                sel!(keyboardType),
-                get_keyboard_type as unsafe extern "C" fn(*mut AnyObject, Sel) -> isize,
-            );
-            decl.add_method(
-                sel!(setKeyboardType:),
-                set_keyboard_type as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
-            );
-            decl.add_method(
-                sel!(autocorrectionType),
-                get_autocorrection_type as unsafe extern "C" fn(*mut AnyObject, Sel) -> isize,
-            );
-            decl.add_method(
-                sel!(setAutocorrectionType:),
-                set_autocorrection_type as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
-            );
-            decl.add_method(
-                sel!(autocapitalizationType),
-                get_autocapitalization_type as unsafe extern "C" fn(*mut AnyObject, Sel) -> isize,
-            );
-            decl.add_method(
-                sel!(setAutocapitalizationType:),
-                set_autocapitalization_type as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
-            );
         }
 
         decl.register();
@@ -514,6 +699,7 @@ impl IosWindow {
 
 #[allow(clippy::type_complexity)]
 pub(crate) struct IosWindowInner {
+    gpui_handle: AnyWindowHandle,
     handle_id: Cell<usize>,
     pub(crate) closed: Cell<bool>,
     /// The UIWindow object
@@ -530,6 +716,11 @@ pub(crate) struct IosWindowInner {
     scale_factor: Cell<f32>,
     /// Input handler for text input
     input_handler: Callback<PlatformInputHandler>,
+    proxy_context: RefCell<Option<(Option<mobile_events::TextInputOwner>, std::ops::Range<usize>)>>,
+    proxy_base: Cell<Option<usize>>,
+    proxy_mapping_valid: Cell<bool>,
+    proxy_text: RefCell<String>,
+    input_configuration: RefCell<gpui::TextInputConfiguration>,
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: Callback<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -559,6 +750,7 @@ pub(crate) struct IosWindowInner {
     mouse_position: Cell<Point<Pixels>>,
     /// Current modifiers
     modifiers: Cell<Modifiers>,
+    capslock: Cell<bool>,
     /// Track if a touch is currently pressed
     touch_pressed: Cell<bool>,
     /// Touch gesture state machine — distinguishes taps from scroll drags.
@@ -585,8 +777,28 @@ unsafe impl Send for IosWindow {}
 unsafe impl Sync for IosWindow {}
 
 impl IosWindowInner {
+    fn apply_input_configuration(&self) {
+        let configuration = self.input_configuration.borrow().clone();
+        let (correct, capitalize, spellcheck, action) =
+            mobile_events::ios_input_traits(&configuration);
+        unsafe {
+            let _: () = msg_send![self.text_input_view, setAutocorrectionType: correct];
+            let _: () = msg_send![self.text_input_view, setAutocapitalizationType: capitalize];
+            let _: () = msg_send![self.text_input_view, setSpellCheckingType: spellcheck];
+            let _: () = msg_send![self.text_input_view, setReturnKeyType: action];
+            let _: () = msg_send![self.text_input_view, reloadInputViews];
+        }
+    }
     pub(crate) fn native_handle(&self) -> usize {
         self.handle_id.get()
+    }
+
+    pub(crate) fn active_handle(&self) -> Option<AnyWindowHandle> {
+        if self.closed.get() || !self.app_active.get() {
+            return None;
+        }
+        let key: Bool = unsafe { msg_send![self.window, isKeyWindow] };
+        key.as_bool().then_some(self.gpui_handle)
     }
 
     fn dispatch_input(&self, event: PlatformInput) {
@@ -788,7 +1000,14 @@ impl IosWindowInner {
             let text_input_frame = ObjcCGRect::new(0.0, 0.0, 1.0, 1.0);
             let text_input_view: *mut AnyObject =
                 msg_send![text_input_view, initWithFrame: text_input_frame];
+            input_traits::initialize(text_input_view);
+            #[cfg(debug_assertions)]
+            input_traits::verify_live_proxy(text_input_view);
             let _: () = msg_send![text_input_view, setAlpha: 0.01_f64];
+            let clear: *mut AnyObject = msg_send![class!(UIColor), clearColor];
+            let _: () = msg_send![text_input_view, setTextColor: clear];
+            let _: () = msg_send![text_input_view, setBackgroundColor: clear];
+            let _: () = msg_send![text_input_view, setScrollEnabled: Bool::NO];
             let _: () = msg_send![text_input_view, setUserInteractionEnabled: true];
             let _: () = msg_send![view, addSubview: text_input_view];
 
@@ -796,8 +1015,8 @@ impl IosWindowInner {
             let pixel_w = (screen_bounds_cg.width * scale) as i32;
             let pixel_h = (screen_bounds_cg.height * scale) as i32;
 
-            let _handle = handle; // consumed but not stored
             let ios_window = Self {
+                gpui_handle: handle,
                 handle_id: Cell::new(0),
                 closed: Cell::new(false),
                 window,
@@ -807,6 +1026,11 @@ impl IosWindowInner {
                 bounds: Cell::new(screen_bounds),
                 scale_factor: Cell::new(scale_factor),
                 input_handler: Callback::default(),
+                proxy_context: RefCell::new(None),
+                proxy_base: Cell::new(None),
+                proxy_mapping_valid: Cell::new(false),
+                proxy_text: RefCell::new(String::new()),
+                input_configuration: RefCell::new(gpui::TextInputConfiguration::default()),
                 request_frame_callback: Callback::default(),
                 input_callback: Callback::default(),
                 active_status_callback: Callback::default(),
@@ -823,6 +1047,7 @@ impl IosWindowInner {
                 appearance_changed_callback: Callback::default(),
                 mouse_position: Cell::new(Point::default()),
                 modifiers: Cell::new(Modifiers::default()),
+                capslock: Cell::new(false),
                 touch_pressed: Cell::new(false),
                 touch_state: Cell::new(TouchState::Idle),
                 mobile_events: RefCell::new(MobileEventState::default()),
@@ -1387,10 +1612,7 @@ impl IosWindowInner {
                 return;
             }
             let _: () = msg_send![self.text_input_view, setKeyboardType: kb_type];
-            log::info!("GPUI iOS: setAutocorrectionType");
-            let _: () = msg_send![self.text_input_view, setAutocorrectionType: 1_isize];
-            log::info!("GPUI iOS: setAutocapitalizationType");
-            let _: () = msg_send![self.text_input_view, setAutocapitalizationType: 0_isize];
+            self.apply_input_configuration();
             log::info!("GPUI iOS: scheduling becomeFirstResponder");
 
             // Defer becomeFirstResponder to the next run-loop iteration.
@@ -1517,6 +1739,8 @@ impl IosWindowInner {
 
         let key = key_code_to_string(key_code);
         let modifiers = modifier_flags_to_modifiers(modifier_flags);
+        self.modifiers.set(modifiers);
+        self.capslock.set(modifier_flags & (1 << 16) != 0);
 
         log::info!(
             "GPUI iOS: Key event - key: {:?}, modifiers: {:?}, down: {}",
@@ -1565,6 +1789,10 @@ impl IosWindowInner {
         let previously_visible = self.can_render();
         if self.app_active.replace(is_active) == is_active {
             return;
+        }
+        if !is_active {
+            self.modifiers.set(Modifiers::default());
+            self.capslock.set(false);
         }
         log::info!("GPUI iOS: Window active status changed to: {}", is_active);
         let lifecycle = if is_active {
@@ -1783,8 +2011,9 @@ impl PlatformWindow for IosWindow {
     }
 
     fn capslock(&self) -> Capslock {
-        // Would need to check UIKeyModifierFlags
-        Capslock { on: false }
+        Capslock {
+            on: self.capslock.get(),
+        }
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
@@ -1795,6 +2024,16 @@ impl PlatformWindow for IosWindow {
         self.input_handler.take()
     }
 
+    fn set_text_input_configuration(&mut self, configuration: gpui::TextInputConfiguration) {
+        if *self.input_configuration.borrow() == configuration {
+            return;
+        }
+        *self.input_configuration.borrow_mut() = configuration;
+        if !self.closed.get() {
+            self.apply_input_configuration();
+        }
+    }
+
     fn prompt(
         &self,
         _level: PromptLevel,
@@ -1802,8 +2041,12 @@ impl PlatformWindow for IosWindow {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<futures::channel::oneshot::Receiver<usize>> {
-        // Would use UIAlertController
-        let (_tx, rx) = futures::channel::oneshot::channel();
+        if answers.is_empty() || self.closed.get() {
+            return None;
+        }
+        let inner = self.inner.clone();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let sender = Rc::new(RefCell::new(Some(tx)));
 
         unsafe {
             // Create UIAlertController
@@ -1812,10 +2055,13 @@ impl PlatformWindow for IosWindow {
 
             let alert_style: i64 = 1; // UIAlertControllerStyleAlert
 
-            let title_str: *mut AnyObject =
-                msg_send![class!(NSString), stringWithUTF8String: title.as_ptr()];
-            let message_str: *mut AnyObject =
-                msg_send![class!(NSString), stringWithUTF8String: message.as_ptr()];
+            // Rust strings are not NUL-terminated; preserve their exact UTF-8 bytes.
+            let title_str: *mut AnyObject = msg_send![class!(NSString), alloc];
+            let title_str: *mut AnyObject = msg_send![title_str,
+                initWithBytes: title.as_ptr(), length: title.len(), encoding: 4_usize];
+            let message_str: *mut AnyObject = msg_send![class!(NSString), alloc];
+            let message_str: *mut AnyObject = msg_send![message_str,
+                initWithBytes: message.as_ptr(), length: message.len(), encoding: 4_usize];
 
             let alert: *mut AnyObject = msg_send![
                 class!(UIAlertController),
@@ -1823,30 +2069,40 @@ impl PlatformWindow for IosWindow {
                 message: message_str,
                 preferredStyle: alert_style
             ];
+            let _: () = msg_send![title_str, release];
+            let _: () = msg_send![message_str, release];
 
             // Add buttons
-            for button in answers.iter() {
-                let button_title: *mut AnyObject = msg_send![
-                    class!(NSString),
-                    stringWithUTF8String: button.label().as_str().as_ptr()
-                ];
+            for (index, button) in answers.iter().enumerate() {
+                let label = button.label();
+                let label = label.as_str();
+                let button_title: *mut AnyObject = msg_send![class!(NSString), alloc];
+                let button_title: *mut AnyObject = msg_send![button_title,
+                    initWithBytes: label.as_ptr(), length: label.len(), encoding: 4_usize];
 
                 let action_style: i64 = if button.is_cancel() { 1 } else { 0 }; // UIAlertActionStyleCancel or Default
 
-                // Note: In production, this would need a block that calls tx.send(index)
+                let sender = sender.clone();
+                let handler = block2::RcBlock::new(move |_action: *mut AnyObject| {
+                    let sender = sender.borrow_mut().take();
+                    if let Some(sender) = sender {
+                        let _ = sender.send(index);
+                    }
+                });
                 let action: *mut AnyObject = msg_send![
                     class!(UIAlertAction),
                     actionWithTitle: button_title,
                     style: action_style,
-                    handler: ptr::null::<AnyObject>()
+                    handler: &*handler
                 ];
+                let _: () = msg_send![button_title, release];
 
                 let _: () = msg_send![alert, addAction: action];
             }
 
             // Present the alert
             let _: () = msg_send![
-                self.view_controller,
+                inner.view_controller,
                 presentViewController: alert,
                 animated: true,
                 completion: ptr::null::<AnyObject>()
@@ -1992,8 +2248,27 @@ impl PlatformWindow for IosWindow {
         guard.as_ref().and_then(|r| r.gpu_specs())
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
-        // iOS handles IME positioning automatically
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        let x = f32::from(bounds.origin.x);
+        let y = f32::from(bounds.origin.y);
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+        if self.closed.get()
+            || ![x, y, width, height].iter().all(|value| value.is_finite())
+            || width < 0.0
+            || height < 0.0
+        {
+            return;
+        }
+        unsafe {
+            let frame = ObjcCGRect::new(
+                x as f64,
+                y as f64,
+                width.max(1.0) as f64,
+                height.max(1.0) as f64,
+            );
+            let _: () = msg_send![self.text_input_view, setFrame: frame];
+        }
     }
 
     fn text_input_state_changed(&self, change: gpui::TextInputStateChange) {

@@ -9,6 +9,11 @@ mod ios;
 ///
 /// On iOS this wraps `NSUserDefaults.standardUserDefaults`.
 /// On Android this wraps `PreferenceManager.getDefaultSharedPreferences()`.
+/// Typed getters return None for missing keys or mismatched types. The existing
+/// Option/bool getters cannot distinguish native access errors from absence.
+/// iOS writes use the OS-managed asynchronous persistence policy; Android writes
+/// check the synchronous commit result. clear() removes the application domain,
+/// not registered/global fallback defaults on iOS.
 pub struct SharedPreferences {
     #[cfg(target_os = "ios")]
     inner: ios::IosSharedPreferences,

@@ -1,0 +1,419 @@
+--- a/src/droidplug/jni/objects.rs
++++ b/src/droidplug/jni/objects.rs
+@@ -104,13 +104,13 @@
+         env.cast_local::<JFuture>(raw)
+     }
+ 
+-    pub fn read(&self, env: &mut Env<'local>, uuid: &JUuid<'local>) -> Result<JFuture<'local>> {
++    pub fn read(&self, env: &mut Env<'local>, service: &JUuid<'local>, uuid: &JUuid<'local>) -> Result<JFuture<'local>> {
+         let raw = env
+             .call_method(
+                 self,
+                 jni_str!("read"),
+-                jni_sig!("(Ljava/util/UUID;)Lio/github/gedgygedgy/rust/future/Future;"),
+-                &[uuid.into()],
++                jni_sig!("(Ljava/util/UUID;Ljava/util/UUID;)Lio/github/gedgygedgy/rust/future/Future;"),
++                &[service.into(), uuid.into()],
+             )?
+             .l()?;
+         env.cast_local::<JFuture>(raw)
+@@ -119,6 +119,7 @@
+     pub fn write(
+         &self,
+         env: &mut Env<'local>,
++        service: &JUuid<'local>,
+         uuid: &JUuid<'local>,
+         data: &JObject<'local>,
+         write_type: jint,
+@@ -127,8 +128,8 @@
+             .call_method(
+                 self,
+                 jni_str!("write"),
+-                jni_sig!("(Ljava/util/UUID;[BI)Lio/github/gedgygedgy/rust/future/Future;"),
+-                &[uuid.into(), data.into(), write_type.into()],
++                jni_sig!("(Ljava/util/UUID;Ljava/util/UUID;[BI)Lio/github/gedgygedgy/rust/future/Future;"),
++                &[service.into(), uuid.into(), data.into(), write_type.into()],
+             )?
+             .l()?;
+         env.cast_local::<JFuture>(raw)
+@@ -137,6 +138,7 @@
+     pub fn set_characteristic_notification(
+         &self,
+         env: &mut Env<'local>,
++        service: &JUuid<'local>,
+         uuid: &JUuid<'local>,
+         enable: bool,
+     ) -> Result<JFuture<'local>> {
+@@ -144,8 +146,8 @@
+             .call_method(
+                 self,
+                 jni_str!("setCharacteristicNotification"),
+-                jni_sig!("(Ljava/util/UUID;Z)Lio/github/gedgygedgy/rust/future/Future;"),
+-                &[uuid.into(), enable.into()],
++                jni_sig!("(Ljava/util/UUID;Ljava/util/UUID;Z)Lio/github/gedgygedgy/rust/future/Future;"),
++                &[service.into(), uuid.into(), enable.into()],
+             )?
+             .l()?;
+         env.cast_local::<JFuture>(raw)
+@@ -166,6 +168,7 @@
+     pub fn read_descriptor(
+         &self,
+         env: &mut Env<'local>,
++        service: &JUuid<'local>,
+         characteristic: &JUuid<'local>,
+         uuid: &JUuid<'local>,
+     ) -> Result<JFuture<'local>> {
+@@ -174,9 +177,9 @@
+                 self,
+                 jni_str!("readDescriptor"),
+                 jni_sig!(
+-                    "(Ljava/util/UUID;Ljava/util/UUID;)Lio/github/gedgygedgy/rust/future/Future;"
++                    "(Ljava/util/UUID;Ljava/util/UUID;Ljava/util/UUID;)Lio/github/gedgygedgy/rust/future/Future;"
+                 ),
+-                &[characteristic.into(), uuid.into()],
++                &[service.into(), characteristic.into(), uuid.into()],
+             )?
+             .l()?;
+         env.cast_local::<JFuture>(raw)
+@@ -185,6 +188,7 @@
+     pub fn write_descriptor(
+         &self,
+         env: &mut Env<'local>,
++        service: &JUuid<'local>,
+         characteristic: &JUuid<'local>,
+         uuid: &JUuid<'local>,
+         data: &JObject<'local>,
+@@ -194,9 +198,9 @@
+                 self,
+                 jni_str!("writeDescriptor"),
+                 jni_sig!(
+-                    "(Ljava/util/UUID;Ljava/util/UUID;[B)Lio/github/gedgygedgy/rust/future/Future;"
++                    "(Ljava/util/UUID;Ljava/util/UUID;Ljava/util/UUID;[B)Lio/github/gedgygedgy/rust/future/Future;"
+                 ),
+-                &[characteristic.into(), uuid.into(), data.into()],
++                &[service.into(), characteristic.into(), uuid.into(), data.into()],
+             )?
+             .l()?;
+         env.cast_local::<JFuture>(raw)
+@@ -338,6 +342,11 @@
+ }
+ 
+ impl<'local> JBluetoothGattCharacteristic<'local> {
++    pub fn get_service_uuid(&self, env: &mut Env<'local>) -> Result<Uuid> {
++        let service = env.call_method(self, jni_str!("getService"),
++            jni_sig!("()Landroid/bluetooth/BluetoothGattService;"), &[])?.l()?;
++        env.cast_local::<JBluetoothGattService>(service)?.get_uuid(env)
++    }
+     pub fn get_uuid(&self, env: &mut Env<'local>) -> Result<Uuid> {
+         let obj = env
+             .call_method(
+--- a/src/droidplug/peripheral.rs
++++ b/src/droidplug/peripheral.rs
+@@ -189,7 +189,8 @@
+     ) -> Result<()> {
+         let future = self.with_obj(|env, obj| {
+             let uuid_obj = JUuid::new(env, characteristic.uuid)?;
+-            let future = obj.set_characteristic_notification(env, &uuid_obj, enable)?;
++            let service = JUuid::new(env, characteristic.service_uuid)?;
++            let future = obj.set_characteristic_notification(env, &service, &uuid_obj, enable)?;
+             Ok(JSendFuture::new(env, &future)?)
+         })?;
+         let result_ref = future.await?;
+@@ -362,7 +363,8 @@
+                 WriteType::WithResponse => 2,
+                 WriteType::WithoutResponse => 1,
+             };
+-            let future = obj.write(env, &uuid, &data_obj.into(), write_type)?;
++            let service = JUuid::new(env, characteristic.service_uuid)?;
++            let future = obj.write(env, &service, &uuid, &data_obj.into(), write_type)?;
+             Ok(JSendFuture::new(env, &future)?)
+         })?;
+         let result_ref = future.await?;
+@@ -372,7 +374,8 @@
+     async fn read(&self, characteristic: &Characteristic) -> Result<Vec<u8>> {
+         let future = self.with_obj(|env, obj| {
+             let uuid = JUuid::new(env, characteristic.uuid)?;
+-            let future = obj.read(env, &uuid)?;
++            let service = JUuid::new(env, characteristic.service_uuid)?;
++            let future = obj.read(env, &service, &uuid)?;
+             Ok(JSendFuture::new(env, &future)?)
+         })?;
+         let result_ref = future.await?;
+@@ -396,7 +399,6 @@
+ 
+     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
+         use futures::stream::StreamExt;
+-        let shared = self.shared.clone();
+         let stream = self.with_obj(|env, obj| {
+             let stream = obj.get_notifications(env)?;
+             Ok(JSendStream::new(env, &stream)?)
+@@ -412,17 +414,7 @@
+                                 env.cast_local::<JBluetoothGattCharacteristic>(local_obj)?;
+                             let uuid = characteristic.get_uuid(env)?;
+                             let value = characteristic.get_value(env)?;
+-                            let service_uuid = shared
+-                                .lock()
+-                                .ok()
+-                                .and_then(|guard| {
+-                                    guard
+-                                        .services
+-                                        .iter()
+-                                        .find(|s| s.characteristics.iter().any(|c| c.uuid == uuid))
+-                                        .map(|s| s.uuid)
+-                                })
+-                                .unwrap_or_default();
++                            let service_uuid = characteristic.get_service_uuid(env)?;
+                             Ok(ValueNotification {
+                                 uuid,
+                                 service_uuid,
+@@ -459,7 +451,8 @@
+             let characteristic = JUuid::new(env, descriptor.characteristic_uuid)?;
+             let uuid = JUuid::new(env, descriptor.uuid)?;
+             let data_obj = super::jni_utils::arrays::slice_to_byte_array(env, data)?;
+-            let future = obj.write_descriptor(env, &characteristic, &uuid, &data_obj.into())?;
++            let service = JUuid::new(env, descriptor.service_uuid)?;
++            let future = obj.write_descriptor(env, &service, &characteristic, &uuid, &data_obj.into())?;
+             Ok(JSendFuture::new(env, &future)?)
+         })?;
+         let result_ref = future.await?;
+@@ -470,7 +463,8 @@
+         let future = self.with_obj(|env, obj| {
+             let characteristic = JUuid::new(env, descriptor.characteristic_uuid)?;
+             let uuid = JUuid::new(env, descriptor.uuid)?;
+-            let future = obj.read_descriptor(env, &characteristic, &uuid)?;
++            let service = JUuid::new(env, descriptor.service_uuid)?;
++            let future = obj.read_descriptor(env, &service, &characteristic, &uuid)?;
+             Ok(JSendFuture::new(env, &future)?)
+         })?;
+         let result_ref = future.await?;
+--- a/src/droidplug/java/src/main/java/com/nonpolynomial/btleplug/android/impl/Peripheral.java
++++ b/src/droidplug/java/src/main/java/com/nonpolynomial/btleplug/android/impl/Peripheral.java
+@@ -272,7 +272,7 @@
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    public Future<byte[]> read(UUID uuid) {
++    public Future<byte[]> read(UUID serviceUuid, UUID uuid) {
+         SimpleFuture<byte[]> future = new SimpleFuture<>();
+         synchronized (this) {
+             this.queueCommand(() -> {
+@@ -281,7 +281,7 @@
+                         throw new NotConnectedException();
+                     }
+ 
+-                    BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(uuid);
++                    BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(serviceUuid, uuid);
+                     this.setCommandCallback(new CommandCallback(future) {
+                         @Override
+                         public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
+@@ -290,7 +290,7 @@
+                                     throw new RuntimeException("Unable to read characteristic, status: " + status);
+                                 }
+ 
+-                                if (!characteristic.getUuid().equals(uuid)) {
++                                if (!matchesCharacteristic(characteristic, serviceUuid, uuid)) {
+                                     throw new UnexpectedCharacteristicException();
+                                 }
+ 
+@@ -308,7 +308,7 @@
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    public Future<Void> write(UUID uuid, byte[] data, int writeType) {
++    public Future<Void> write(UUID serviceUuid, UUID uuid, byte[] data, int writeType) {
+         SimpleFuture<Void> future = new SimpleFuture<>();
+         synchronized (this) {
+             this.queueCommand(() -> {
+@@ -317,7 +317,7 @@
+                         throw new NotConnectedException();
+                     }
+ 
+-                    BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(uuid);
++                    BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(serviceUuid, uuid);
+                     characteristic.setValue(data);
+                     characteristic.setWriteType(writeType);
+                     this.setCommandCallback(new CommandCallback(future) {
+@@ -328,7 +328,7 @@
+                                     throw new RuntimeException("Unable to write characteristic, status: " + status);
+                                 }
+ 
+-                                if (!characteristic.getUuid().equals(uuid)) {
++                                if (!matchesCharacteristic(characteristic, serviceUuid, uuid)) {
+                                     throw new UnexpectedCharacteristicException();
+                                 }
+ 
+@@ -377,7 +377,7 @@
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    public Future<Void> setCharacteristicNotification(UUID uuid, boolean enable) {
++    public Future<Void> setCharacteristicNotification(UUID serviceUuid, UUID uuid, boolean enable) {
+         SimpleFuture<Void> future = new SimpleFuture<>();
+         synchronized (this) {
+             this.queueCommand(() -> {
+@@ -386,12 +386,13 @@
+                         throw new NotConnectedException();
+                     }
+ 
+-                    BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(uuid);
++                    BluetoothGattCharacteristic characteristic = this.getCharacteristicByUuid(serviceUuid, uuid);
+                     if (!this.gatt.setCharacteristicNotification(characteristic, enable)) {
+                         throw new RuntimeException("Unable to set characteristic notification");
+                     }
+ 
+                     BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIGURATION_DESCRIPTOR);
++                    if (descriptor == null) throw new NoSuchCharacteristicException();
+                     byte[] cccdValue;
+                     if (!enable) {
+                         cccdValue = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
+@@ -401,10 +402,6 @@
+                         cccdValue = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE;
+                     }
+                     descriptor.setValue(cccdValue);
+-                    if (!this.gatt.writeDescriptor(descriptor)) {
+-                        throw new RuntimeException("Unable to write client characteristic configuration descriptor");
+-                    }
+-
+                     this.setCommandCallback(new CommandCallback(future) {
+                         @Override
+                         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
+@@ -413,7 +410,7 @@
+                                     throw new RuntimeException("Unable to write client characteristic configuration descriptor, status: " + status);
+                                 }
+ 
+-                                if (!descriptor.getUuid().equals(CLIENT_CHARACTERISTIC_CONFIGURATION_DESCRIPTOR) || !descriptor.getCharacteristic().getUuid().equals(uuid)) {
++                                if (!descriptor.getUuid().equals(CLIENT_CHARACTERISTIC_CONFIGURATION_DESCRIPTOR) || !matchesCharacteristic(descriptor.getCharacteristic(), serviceUuid, uuid)) {
+                                     throw new UnexpectedCharacteristicException();
+                                 }
+ 
+@@ -421,6 +418,9 @@
+                             });
+                         }
+                     });
++                    if (!this.gatt.writeDescriptor(descriptor)) {
++                        throw new RuntimeException("Unable to write client characteristic configuration descriptor");
++                    }
+                 });
+             });
+         }
+@@ -436,7 +436,7 @@
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    public Future<byte[]> readDescriptor(UUID characteristic, UUID uuid) {
++    public Future<byte[]> readDescriptor(UUID serviceUuid, UUID characteristic, UUID uuid) {
+         SimpleFuture<byte[]> future = new SimpleFuture<>();
+         synchronized (this) {
+             this.queueCommand(() -> {
+@@ -445,7 +445,7 @@
+                         throw new NotConnectedException();
+                     }
+ 
+-                    BluetoothGattDescriptor descriptor = this.getDescriptorByUuid(characteristic, uuid);
++                    BluetoothGattDescriptor descriptor = this.getDescriptorByUuid(serviceUuid, characteristic, uuid);
+                     this.setCommandCallback(new CommandCallback(future) {
+                         @Override
+                         public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
+@@ -454,7 +454,7 @@
+                                     throw new RuntimeException("Unable to read descriptor, status: " + status);
+                                 }
+ 
+-                                if (!descriptor.getUuid().equals(uuid)) {
++                                if (!descriptor.getUuid().equals(uuid) || !matchesCharacteristic(descriptor.getCharacteristic(), serviceUuid, characteristic)) {
+                                     throw new UnexpectedCharacteristicException();
+                                 }
+ 
+@@ -472,7 +472,7 @@
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    public Future<Void> writeDescriptor(UUID characteristic, UUID uuid, byte[] data) {
++    public Future<Void> writeDescriptor(UUID serviceUuid, UUID characteristic, UUID uuid, byte[] data) {
+         SimpleFuture<Void> future = new SimpleFuture<>();
+         synchronized (this) {
+             this.queueCommand(() -> {
+@@ -481,7 +481,7 @@
+                         throw new NotConnectedException();
+                     }
+ 
+-                    BluetoothGattDescriptor descriptor = this.getDescriptorByUuid(characteristic, uuid);
++                    BluetoothGattDescriptor descriptor = this.getDescriptorByUuid(serviceUuid, characteristic, uuid);
+                     descriptor.setValue(data);
+                     this.setCommandCallback(new CommandCallback(future) {
+                         @Override
+@@ -491,7 +491,7 @@
+                                     throw new RuntimeException("Unable to write descriptor, status: " + status);
+                                 }
+ 
+-                                if (!descriptor.getUuid().equals(uuid)) {
++                                if (!descriptor.getUuid().equals(uuid) || !matchesCharacteristic(descriptor.getCharacteristic(), serviceUuid, characteristic)) {
+                                     throw new UnexpectedCharacteristicException();
+                                 }
+ 
+@@ -538,30 +538,25 @@
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    private List<BluetoothGattCharacteristic> getCharacteristics() {
+-        List<BluetoothGattCharacteristic> result = new ArrayList<>();
+-        if (this.gatt != null) {
+-            for (BluetoothGattService service : this.gatt.getServices()) {
+-                result.addAll(service.getCharacteristics());
+-            }
+-        }
+-        return result;
++    static boolean matchesCharacteristic(BluetoothGattCharacteristic characteristic, UUID service, UUID uuid) {
++        return characteristic.getService() != null && characteristic.getService().getUuid().equals(service)
++            && characteristic.getUuid().equals(uuid);
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    private BluetoothGattCharacteristic getCharacteristicByUuid(UUID uuid) {
+-        for (BluetoothGattCharacteristic characteristic : this.getCharacteristics()) {
+-            if (characteristic.getUuid().equals(uuid)) {
+-                return characteristic;
+-            }
++    private BluetoothGattCharacteristic getCharacteristicByUuid(UUID serviceUuid, UUID uuid) {
++        BluetoothGattService service = this.gatt.getService(serviceUuid);
++        if (service != null) {
++            BluetoothGattCharacteristic characteristic = service.getCharacteristic(uuid);
++            if (characteristic != null) return characteristic;
+         }
+ 
+         throw new NoSuchCharacteristicException();
+     }
+ 
+     @SuppressLint("MissingPermission")
+-    private BluetoothGattDescriptor getDescriptorByUuid(UUID characteristicUuid, UUID uuid) {
+-        BluetoothGattCharacteristic characteristic = getCharacteristicByUuid(characteristicUuid);
++    private BluetoothGattDescriptor getDescriptorByUuid(UUID serviceUuid, UUID characteristicUuid, UUID uuid) {
++        BluetoothGattCharacteristic characteristic = getCharacteristicByUuid(serviceUuid, characteristicUuid);
+         for (BluetoothGattDescriptor descriptor : characteristic.getDescriptors()) {
+             if (descriptor.getUuid().equals(uuid)) {
+                 return descriptor;
+@@ -700,6 +695,10 @@
+         public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+             BluetoothGattCharacteristic characteristic2 = new BluetoothGattCharacteristic(characteristic.getUuid(), characteristic.getProperties(), characteristic.getPermissions());
+             characteristic2.setValue(characteristic.getValue());
++            // Keep the native service identity on the immutable value snapshot.
++            BluetoothGattService service = characteristic.getService();
++            if (service == null) return;
++            new BluetoothGattService(service.getUuid(), service.getType()).addCharacteristic(characteristic2);
+             synchronized (Peripheral.this) {
+                 for (WeakReference<QueueStream<BluetoothGattCharacteristic>> ref : Peripheral.this.notificationStreams) {
+                     QueueStream<BluetoothGattCharacteristic> stream = ref.get();
+--- a/src/droidplug/java/src/main/java/com/nonpolynomial/btleplug/android/impl/Adapter.java
++++ b/src/droidplug/java/src/main/java/com/nonpolynomial/btleplug/android/impl/Adapter.java
+@@ -70,6 +70,12 @@
+     public native void onConnectionStateChanged(String address, boolean connected);
+ 
+     private class Callback extends ScanCallback {
++        @Override public void onScanFailed(int errorCode) {
++            org.gpui.mobile.ble.Ble.scanFailed(errorCode);
++        }
++        @Override public void onBatchScanResults(java.util.List<ScanResult> results) {
++            for (ScanResult result : results) Adapter.this.reportScanResult(result);
++        }
+         @Override
+         public void onScanResult(int callbackType, ScanResult result) {
+             Adapter.this.reportScanResult(result);

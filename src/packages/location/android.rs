@@ -49,7 +49,7 @@ pub fn get_last_known_position() -> Result<Option<Position>, String> {
         super::stream::parse_position(&helpers::get_string(env, &value)).map(Some)
     })
 }
-pub(super) fn start(id: u64, settings: &LocationSettings, once: bool) -> Result<(), String> {
+pub(super) fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms: u64, background: bool) -> Result<(), String> {
     let accuracy = match settings.accuracy {
         LocationAccuracy::Lowest => 0,
         LocationAccuracy::Low => 1,
@@ -64,13 +64,15 @@ pub(super) fn start(id: u64, settings: &LocationSettings, once: bool) -> Result<
         env.call_static_method(
             &cls,
             jni::jni_str!("start"),
-            jni::jni_sig!("(Landroid/app/Activity;JIDZ)V"),
+            jni::jni_sig!("(Landroid/app/Activity;JIDZJZ)V"),
             &[
                 JValue::Object(&activity),
                 JValue::Long(id as i64),
                 JValue::Int(accuracy),
                 JValue::Double(settings.distance_filter),
                 JValue::Bool(once),
+                JValue::Long(timeout_ms as i64),
+                JValue::Bool(background),
             ],
         )
         .map(|_| ())
@@ -108,7 +110,9 @@ unsafe extern "system" fn Java_dev_gpui_mobile_GpuiLocation_nativeEvent(
 ) {
     let _ = helpers::with_env(|env| {
         let object = JObject::from_raw(env, raw);
-        events::send(id as u64, helpers::get_string(env, &object));
+        if !events::send(id as u64, helpers::get_string(env, &object)) {
+            stop(id as u64);
+        }
         Ok(())
     });
 }
