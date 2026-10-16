@@ -135,11 +135,19 @@ and Home/icon resume passed with text and viewport preserved. See
 `docs/ios-ui-verification.md` at the repository root for traces, screenshots and
 exact source/build hashes. The parent verified all seven recorded source hashes.
 
-Controls scrolling, pinch zoom, exact hardware text entry, automatic keyboard
+On 2026-10-16, 25 CUA individual BackSpace presses cleared the field, then separate
+`pressKey` calls for a, b, c, 1, 2, 3 produced exact `abc123` on the same executable
+(local `a08990b`, remote baseline `7253295`). See `09-hardware-abc123.png` in the
+UI evidence outputs. Individual tool-driven hardware-key input passed; human
+physical-keyboard typing was not tested. Bulk `typeText('abc123')` still produced
+`å∫ç123`; that tool/Simulator-path discrepancy remains unresolved and does not
+justify a backend change.
+
+Controls scrolling, pinch zoom, automatic keyboard
 appearance, blur dismissal, floating-keyboard interaction, active-contact
 cancellation, lifecycle stress, physical devices and FPS remain unverified.
-The reset button does not blur the input. Hardware tool typing produced
-Option-like glyphs; exact `ely` came from software-keyboard AX clicks.
+The reset button does not blur the input. Exact `ely` came from software-keyboard
+AX clicks in the earlier dated verification.
 Startup assertions are deterministic tests, separate from actual UI evidence.
 
 Debug builds execute adapter regression assertions before opening the UI. These
