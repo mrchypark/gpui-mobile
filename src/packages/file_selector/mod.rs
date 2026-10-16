@@ -7,6 +7,10 @@
 //! Inspired by [file_selector](https://pub.dev/packages/file_selector).
 //!
 //! Feature-gated behind `file_selector`.
+//!
+//! iOS picker calls must run on the main thread and service its run loop until
+//! completion; overlapping presentations return an error. Android calls must
+//! run off the UI thread. iOS file selections are imported copies.
 
 #[cfg(target_os = "android")]
 mod android;
@@ -99,6 +103,9 @@ pub fn open_files(options: &OpenFileOptions) -> Result<Vec<SelectedFile>, String
 /// Open a save dialog to get a file path from the user.
 ///
 /// Returns `Ok(None)` if the user cancelled.
+/// Android returns a content URI, which must be written via ContentResolver.
+/// iOS returns an error: native export requires existing file contents, which
+/// this path-only API does not accept.
 pub fn get_save_path(options: &SaveFileOptions) -> Result<Option<String>, String> {
     #[cfg(target_os = "ios")]
     {
@@ -132,4 +139,30 @@ pub fn get_directory_path(initial_directory: Option<&str>) -> Result<Option<Stri
         let _ = initial_directory;
         Err("file_selector is only available on iOS and Android".into())
     }
+}
+
+/// Internal GPUI adapter: return usable filesystem paths, never SAF URIs.
+pub(crate) fn prompt_paths(options: gpui::PathPromptOptions) -> Result<Option<Vec<std::path::PathBuf>>, String> {
+    if !options.files || options.directories {
+        return Err("Mobile GPUI path prompts support files only; directory grants are not filesystem paths".into());
+    }
+    let files = if options.multiple {
+        open_files(&OpenFileOptions::default())?
+    } else {
+        open_file(&OpenFileOptions::default())?.into_iter().collect()
+    };
+    if files.is_empty() { return Ok(None); }
+    let mut paths = Vec::with_capacity(files.len());
+    for file in files {
+        let path = std::path::PathBuf::from(file.path);
+        if !path.is_absolute() || !path.is_file() {
+            return Err("Picker did not return an imported filesystem file".into());
+        }
+        paths.push(path);
+    }
+    Ok(Some(paths))
+}
+
+pub(crate) fn prompt_new_path(_directory: &std::path::Path, _suggested_name: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+    Err("Mobile save dialogs require export contents or a ContentResolver URI; GPUI's filesystem PathBuf cannot safely represent that contract".into())
 }

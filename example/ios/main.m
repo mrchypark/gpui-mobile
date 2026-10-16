@@ -7,6 +7,10 @@
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <TargetConditionals.h>
+#if TARGET_OS_SIMULATOR
+#include <dlfcn.h>
+#endif
 
 // Define USE_GPUI_RUST to enable Rust GPUI integration
 // This requires linking against libgpui.a
@@ -140,6 +144,7 @@
 #ifdef USE_GPUI_RUST
 @property (nonatomic, assign) void *gpuiApp;
 @property (nonatomic, assign) void *gpuiWindow;
+@property (nonatomic) BOOL awaitingInitialUserActivity;
 @property (nonatomic, strong) CADisplayLink *displayLink;
 #endif
 @end
@@ -150,6 +155,19 @@
     NSLog(@"GPUI iOS Application Launching...");
 
 #ifdef USE_GPUI_RUST
+    NSURL *initialURL = launchOptions[UIApplicationLaunchOptionsURLKey];
+    NSDictionary *activities = launchOptions[UIApplicationLaunchOptionsUserActivityDictionaryKey];
+    for (id value in activities.allValues) {
+        if ([value isKindOfClass:NSUserActivity.class] &&
+            [((NSUserActivity *)value).activityType isEqualToString:NSUserActivityTypeBrowsingWeb]) {
+            initialURL = ((NSUserActivity *)value).webpageURL;
+            break;
+        }
+    }
+    self.awaitingInitialUserActivity = initialURL == nil &&
+        [activities[UIApplicationLaunchOptionsUserActivityTypeKey] isEqual:NSUserActivityTypeBrowsingWeb];
+    if (!self.awaitingInitialUserActivity)
+        gpui_ios_record_initial_url((__bridge void *)initialURL.absoluteString);
     // Register the example app's root view (Router), then start GPUI.
     // gpui_ios_register_app() is defined in the example crate and sets up
     // the callback that creates the Router with all screens + demos.
@@ -209,6 +227,17 @@
     NSLog(@"GPUI iOS: Did become active");
 #ifdef USE_GPUI_RUST
     gpui_ios_did_become_active(self.gpuiApp);
+#if TARGET_OS_SIMULATOR
+    // Opt-in debug probe; release archives do not export this symbol.
+    if ([[[NSProcessInfo processInfo] environment][@"GPUI_LOCATION_PROBE"] isEqualToString:@"1"]) {
+        void (*probe)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "gpui_location_start_simulator_probe");
+        if (probe) {
+            probe();
+        } else {
+            NSLog(@"GPS_SIM_PROBE unavailable in this build");
+        }
+    }
+#endif
 #endif
 }
 
@@ -239,6 +268,31 @@
     gpui_ios_handle_open_url((__bridge void *)urlString);
 #endif
     return YES;
+}
+
+- (BOOL)application:(UIApplication *)application continueUserActivity:(NSUserActivity *)activity
+        restorationHandler:(void (^)(NSArray<id<UIUserActivityRestoring>> *))restorationHandler {
+    if (![activity.activityType isEqualToString:NSUserActivityTypeBrowsingWeb] || !activity.webpageURL)
+        return NO;
+#ifdef USE_GPUI_RUST
+    NSString *url = activity.webpageURL.absoluteString;
+    if (self.awaitingInitialUserActivity) {
+        self.awaitingInitialUserActivity = NO;
+        gpui_ios_record_initial_url((__bridge void *)url);
+    }
+    gpui_ios_handle_open_url((__bridge void *)url);
+#endif
+    return YES;
+}
+
+- (void)application:(UIApplication *)application didFailToContinueUserActivityWithType:(NSString *)type
+        error:(NSError *)error {
+#ifdef USE_GPUI_RUST
+    if (self.awaitingInitialUserActivity && [type isEqualToString:NSUserActivityTypeBrowsingWeb]) {
+        self.awaitingInitialUserActivity = NO;
+        gpui_ios_record_initial_url(NULL);
+    }
+#endif
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application {

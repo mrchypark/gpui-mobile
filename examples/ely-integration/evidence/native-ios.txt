@@ -1,0 +1,54 @@
+Final source validation — 2026-10-15, KST
+Ely: 7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd
+GPUI/gpui_wgpu: 1a28cff4b409169bac058bca40dfbfeb7621d19b
+wgpu: registry 29.0.4
+
+Command (repository root):
+CARGO_NET_OFFLINE=true sh examples/ely-integration/ios-simulator.sh --no-run
+Rust staticlib: PASS, exit 0, 7.33s
+Native clang link/ad-hoc sign: PASS
+Linker warning: __eh_frame >16MB; exception unwind performance may be affected.
+Simulator install/launch: PASS, dev.gpui.mobile.ely, PID 20634
+2026-10-15 20:01:03 ELY_ADAPTER_SELFCHECK PASS
+2026-10-15 20:01:04 CADisplayLink started for GPUI rendering
+Real MobileEvent::Insets reached model: top=62px, bottom=34px, keyboard_visible=false.
+Screenshot visually inspected: real Ely Button, Input and InfiniteCanvas rendered.
+
+Raw logs preserved outside repository in chat work/ely-integration-evidence/:
+  native-ios-reviewed.log
+  runtime-ios-reviewed.log
+  final-source.sha256
+Screenshot preserved in chat outputs/ely-viewport-final.png.
+
+No physical UI gestures were performed: Mac locked during verification.
+Actual button clicks, drag/pinch, input, scroll and lifecycle recovery are NOT VERIFIED.
+Startup assertions cover coordinate translation, final Ended snapshot, cancellation,
+additional-finger outside canvas, exclusive pinch, routing latch, foreign windows,
+safe-area/keyboard max, and bottom-touching narrow floating keyboard exclusion.
+
+Final keyboard/Android-packaging source verification, 2026-10-15 21:28 KST:
+CARGO_NET_OFFLINE=true sh examples/ely-integration/ios-simulator.sh --no-run
+Rust staticlib build PASS (3m56s), native link/sign PASS.
+Developer simctl install/launch PASS, ElyIntegration PID 18809.
+ELY_FLOATING_KEYBOARD_SELFCHECK PASS
+ELY_ADAPTER_SELFCHECK PASS
+Real GPUI ScrollHandle/types and published Ely helpers; no stubs.
+Actual initial safe-area event: top62 bottom34, keyboard hidden.
+Screenshot outputs/ely-viewport-keyboard-ready.png inspected: reset button,
+input, status and canvas initially visible; previous screenshots preserved.
+No actual UI interaction or keyboard gesture was performed.
+Linker retains prior large __eh_frame compact-unwind warning.
+
+Focus-hook follow-up: baseline7253295 + local src/ios/window.rs, 23:12 KST.
+Build/link/sign PASS in4m15s; codesign verification PASS; PID11799.
+Source manifest ui-focus-fix.source.sha256: all7 hashes verified by builder and parent.
+window.rs SHA256 a24fe548a1e1d896e14f9adb96226996230d4e4039c4464a7bd9328e57062b5b
+Executable SHA256 f92a7178ea3810d5605803f9300a91bfe0f48f1becf90fe07993a55e6e53d961
+Build log SHA256 b886eb3fb3ab9795e6c3da9ad477e4496c60a5d68c806138c53de262aae6ae3e
+Both startup selfchecks PASS. Parent actual unlocked CUA: software-keyboard
+AX e/l/y => exact ely, toggle show/hide, reset1, canvas pan-75,-50 commits2,
+Home/icon resume preserving text+viewport. Keyboard rect(0,566)402x308.
+Screenshots05/06/07 and native-trace-focus-fix.log under outputs/ios-ui-verification.
+Scroll, pinch, hardware exact text, automatic keyboard appearance, blur dismissal,
+floating-keyboard interaction and active-contact cancellation remain unverified.
+See docs/ios-ui-verification.md for precise scope. Build and screen work ended.

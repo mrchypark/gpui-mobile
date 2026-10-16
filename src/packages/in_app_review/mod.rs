@@ -1,7 +1,7 @@
 //! In-app review prompt for App Store / Google Play Store.
 //!
 //! Provides a cross-platform API to request in-app reviews backed by:
-//! - Android: Google Play Store intents
+//! - Android: Google Play In-App Review SDK (store intents only for open_store_listing)
 //! - iOS: SKStoreReviewController
 //!
 //! Feature-gated behind `in_app_review`.
@@ -30,6 +30,8 @@ pub fn is_available() -> Result<bool, String> {
 /// Request the in-app review flow.
 /// Note: The OS may choose not to show the review dialog (rate limiting).
 /// There is no way to know if the dialog was actually shown.
+/// On Android this waits for Play's asynchronous completion and must be called
+/// from a worker thread, not the UI thread. Errors do not open a store listing.
 pub fn request_review() -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {

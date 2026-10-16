@@ -14,9 +14,11 @@ pub struct DeviceInfo {
     pub manufacturer: String,
     /// OS version string (e.g. "17.0", "14").
     pub os_version: String,
-    /// User-assigned device name (e.g. "John's iPhone").
+    /// OS-provided device name; may be generic on iOS without the device-name
+    /// entitlement. Android falls back to the model if no name is configured.
     pub device_name: String,
     /// Whether the app is running on a physical device (vs. simulator/emulator).
+    /// Android uses system-property heuristics; this is not an attestation.
     pub is_physical_device: bool,
 }
 

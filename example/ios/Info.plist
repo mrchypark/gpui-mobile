@@ -58,6 +58,16 @@
     <string>This app needs access to the camera to take photos and videos.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>This app needs access to the microphone to record video with audio.</string>
+    <key>NSMotionUsageDescription</key>
+    <string>This test app uses motion sensors and barometric pressure to demonstrate and verify native sensor readings.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>This demo uses your location for position updates, including background tracking when you explicitly start it.</string>
+    <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+    <string>Allow ongoing location access for background tracking that you explicitly start. You can stop tracking in the app.</string>
+    <key>UIBackgroundModes</key>
+    <array><string>location</string><string>bluetooth-central</string></array>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>This demo uses Bluetooth to discover and connect to nearby BLE devices when you use its foreground Bluetooth features.</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>

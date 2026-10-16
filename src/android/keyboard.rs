@@ -183,6 +183,13 @@ pub fn android_meta_caps_lock(meta_state: i32) -> bool {
     meta_state & AMETA_CAPS_LOCK_ON != 0
 }
 
+/// Control/Meta combinations belong to shortcut dispatch, not text insertion.
+/// Alt remains available for layout-generated Unicode characters.
+pub(crate) fn allows_text_input(meta_state: i32) -> bool {
+    let modifiers = android_meta_to_modifiers(meta_state);
+    !modifiers.control && !modifiers.platform
+}
+
 /// Convert an Android key code to a GPUI key name string.
 ///
 /// Returns `None` for key codes that should be ignored (e.g. pure modifier
@@ -324,7 +331,13 @@ pub fn android_key_to_keystroke(
     meta_state: i32,
     unicode_char: u32,
 ) -> Option<Keystroke> {
-    let key = android_keycode_to_key(key_code)?;
+    let key = android_keycode_to_key(key_code).or_else(|| {
+        (key_code == AKEYCODE_UNKNOWN)
+            .then(|| char::from_u32(unicode_char))
+            .flatten()
+            .filter(|character| !character.is_control())
+            .map(|character| character.to_string())
+    })?;
     let modifiers = android_meta_to_modifiers(meta_state);
 
     // Determine the character representation.
@@ -402,6 +415,14 @@ impl gpui::PlatformKeyboardLayout for AndroidKeyboardLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shortcuts_do_not_insert_text_but_layout_modifiers_can() {
+        assert!(!allows_text_input(AMETA_CTRL_ON));
+        assert!(!allows_text_input(AMETA_META_ON | AMETA_SHIFT_ON));
+        assert!(allows_text_input(AMETA_SHIFT_ON));
+        assert!(allows_text_input(AMETA_ALT_ON));
+        assert!(allows_text_input(AMETA_NONE));
+    }
 
     #[test]
     fn meta_to_modifiers_none() {
@@ -635,5 +656,18 @@ mod tests {
             android_keycode_to_key(AKEYCODE_BACKSLASH),
             Some("\\".to_string())
         );
+    }
+
+    #[test]
+    fn ime_unicode_without_hardware_keycode_preserves_scalar() {
+        for character in ['한', 'é', '🦀'] {
+            let key = android_key_to_keystroke(AKEYCODE_UNKNOWN, 0, character as u32).unwrap();
+            assert_eq!(
+                key.key_char.as_deref(),
+                Some(character.to_string().as_str())
+            );
+        }
+        assert!(android_key_to_keystroke(AKEYCODE_UNKNOWN, 0, 0).is_none());
+        assert!(android_key_to_keystroke(AKEYCODE_UNKNOWN, 0, 0xd800).is_none());
     }
 }

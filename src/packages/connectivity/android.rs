@@ -73,7 +73,7 @@ pub fn check_connectivity() -> ConnectivityStatus {
         {
             Ok(1) => Ok(ConnectivityStatus::Wifi),     // TYPE_WIFI
             Ok(0) => Ok(ConnectivityStatus::Cellular), // TYPE_MOBILE
-            Ok(_) => Ok(ConnectivityStatus::Wifi),     // Ethernet etc. treated as Wifi
+            Ok(_) => Ok(ConnectivityStatus::None),     // No public enum case for other transports.
             Err(_) => {
                 env.exception_clear();
                 Ok(ConnectivityStatus::None)

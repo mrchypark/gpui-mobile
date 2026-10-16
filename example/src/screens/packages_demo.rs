@@ -24,10 +24,23 @@ pub(crate) struct PackagesState {
     pub notif_counter: i32,
     pub audio_status: Option<String>,
     pub video_status: Option<String>,
+    pub url_status: Option<String>,
 }
 
 thread_local! {
     pub(crate) static PACKAGES_STATE: RefCell<PackagesState> = RefCell::new(PackagesState::default());
+}
+
+// Called from a foreground task, outside any Router/PackagesState borrow.
+// iOS pickers service UIKit's run loop; Android pickers block a worker.
+async fn run_picker<T: Send + 'static>(
+    executor: &gpui::BackgroundExecutor,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    #[cfg(target_os = "ios")]
+    { let _ = executor; operation() }
+    #[cfg(not(target_os = "ios"))]
+    { executor.spawn(async move { operation() }).await }
 }
 
 /// Render the Packages demo screen.
@@ -223,6 +236,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
         .child(section_header("URL Launcher", sub_text))
         .child({
             let can = gpui_mobile::packages::url_launcher::can_launch_url("https://zed.dev");
+            let status = PACKAGES_STATE.with(|s| s.borrow().url_status.clone().unwrap_or_else(|| "Not opened".into()));
             info_card(card_bg)
                 .child(kv_row(
                     "Can open https://zed.dev",
@@ -231,6 +245,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                     text_color,
                     sub_text,
                 ))
+                .child(kv_row("Last launch", &status, BLUE, text_color, sub_text))
                 .child(divider_line(divider_color))
                 .child(
                     div()
@@ -253,10 +268,19 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
                                     cx.listener(|_this, _, _, cx| {
-                                        let _ = gpui_mobile::packages::url_launcher::launch_url(
-                                            "https://zed.dev",
-                                        );
-                                        cx.notify();
+                                        cx.spawn(async |this, cx| {
+                                            let result = cx.background_executor().spawn(async {
+                                                gpui_mobile::packages::url_launcher::launch_url("https://zed.dev")
+                                            }).await;
+                                            let _ = this.update(cx, |_this, cx| {
+                                                PACKAGES_STATE.with(|s| s.borrow_mut().url_status = Some(match result {
+                                                    Ok(true) => "Opened".into(),
+                                                    Ok(false) => "Not opened: no application accepted the URL".into(),
+                                                    Err(error) => format!("Error: {error}"),
+                                                }));
+                                                cx.notify();
+                                            });
+                                        }).detach();
                                     }),
                                 ),
                         ),
@@ -424,7 +448,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Pick File", BLUE, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::file_selector::OpenFileOptions::default();
                                         gpui_mobile::packages::file_selector::open_file(&opts)
                                     }).await;
@@ -445,7 +469,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Pick Files", GREEN, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::file_selector::OpenFileOptions::default();
                                         gpui_mobile::packages::file_selector::open_files(&opts)
                                     }).await;
@@ -465,7 +489,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Pick Dir", TEAL, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::file_selector::get_directory_path(None)
                                     }).await;
                                     let _ = this.update(cx, |_this, cx| {
@@ -504,7 +528,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Gallery", MAUVE, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::image_picker::ImagePickerOptions {
                                             source: gpui_mobile::packages::image_picker::ImageSource::Gallery,
                                             ..Default::default()
@@ -528,7 +552,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Camera", PEACH, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::image_picker::ImagePickerOptions {
                                             source: gpui_mobile::packages::image_picker::ImageSource::Camera,
                                             ..Default::default()
@@ -552,7 +576,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Multi", YELLOW, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::image_picker::pick_multi_image(None, None, None)
                                     }).await;
                                     let _ = this.update(cx, |_this, cx| {
@@ -571,7 +595,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Video", TEAL, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::image_picker::pick_video(
                                             gpui_mobile::packages::image_picker::ImageSource::Gallery,
                                             gpui_mobile::packages::image_picker::CameraDevice::Rear,
@@ -594,7 +618,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Record", super::RED, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::image_picker::pick_video(
                                             gpui_mobile::packages::image_picker::ImageSource::Camera,
                                             gpui_mobile::packages::image_picker::CameraDevice::Rear,

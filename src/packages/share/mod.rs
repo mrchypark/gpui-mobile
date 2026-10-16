@@ -20,6 +20,8 @@ pub enum ShareResult {
 ///
 /// `text` — the content to share (can be a message, URL, or any string).
 /// `subject` — optional subject line (used by email and some apps).
+/// Success means the native share sheet was presented/requested, not that the
+/// user completed a share. Individual receiving applications may ignore subject.
 pub fn share_text(text: &str, subject: Option<&str>) -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {

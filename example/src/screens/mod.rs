@@ -14,11 +14,14 @@
 
 pub mod about;
 pub mod audio_player;
+#[cfg(feature = "ble")]
+pub mod ble;
 pub mod chat;
 pub mod components;
 pub mod counter;
 pub mod feed;
 pub mod form;
+pub mod gps;
 pub mod home;
 pub mod packages_demo;
 pub mod settings;
@@ -34,7 +37,62 @@ use gpui::{
 use gpui_mobile::components::material::{MaterialTheme, NavigationBarBuilder, TopAppBar};
 use gpui_mobile::{set_system_chrome, StatusBarContentStyle, SystemChromeStyle};
 
+/// Shared standard-app observer; runs on the same UI thread as the demo state.
+/// Dispatch regardless of the visible route: a background session can outlive it.
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub fn on_mobile_event(event: &gpui_mobile::mobile_events::MobileEvent) {
+    // GPS needs no screen hook: native location lifecycle pauses ordinary watches
+    // and retains explicit background watches. Never call gps::stop on pause.
+    #[cfg(feature = "ble")]
+    match event {
+        gpui_mobile::mobile_events::MobileEvent::Lifecycle(
+            gpui_mobile::mobile_events::AppLifecycle::Paused,
+        ) => ble::on_pause(),
+        gpui_mobile::mobile_events::MobileEvent::Lifecycle(
+            gpui_mobile::mobile_events::AppLifecycle::Resumed,
+        ) => ble::on_resume(),
+        _ => {}
+    }
+    #[cfg(not(feature = "ble"))]
+    let _ = event;
+}
+
 // ── Screen enum ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod service_route_tests {
+    use super::{Router, Screen};
+
+    #[test]
+    fn gps_deeplink_and_back_restore_home() {
+        assert_eq!(Screen::from_deeplink_url("gpui://location"), Some(Screen::Gps));
+        let mut router = Router::new();
+        router.navigate_to(Screen::Gps);
+        assert!(router.can_go_back());
+        assert!(router.go_back());
+        assert_eq!(router.current_screen, Screen::Home);
+    }
+
+    #[cfg(feature = "ble")]
+    #[test]
+    fn service_navigation_keeps_back_stack() {
+        assert_eq!(Screen::from_deeplink_url("gpui://bluetooth"), Some(Screen::Ble));
+        let mut router = Router::new();
+        router.navigate_to(Screen::Ble);
+        router.navigate_to(Screen::Gps);
+        assert!(router.go_back());
+        assert_eq!(router.current_screen, Screen::Ble);
+        assert!(router.go_back());
+        assert_eq!(router.current_screen, Screen::Home);
+    }
+
+    #[cfg(not(feature = "ble"))]
+    #[test]
+    fn disabled_ble_has_no_deeplink() {
+        assert_eq!(Screen::from_deeplink_url("gpui://ble"), None);
+        assert_eq!(Screen::from_deeplink_url("gpui://bluetooth"), None);
+    }
+}
 
 /// All navigable screens in the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,6 +108,9 @@ pub enum Screen {
     Animations,
     Shaders,
     PackagesDemo,
+    Gps,
+    #[cfg(feature = "ble")]
+    Ble,
     WebViewBrowser,
     Swiper,
     Feed,
@@ -87,6 +148,9 @@ impl Screen {
             "animations" => Some(Screen::Animations),
             "shaders" => Some(Screen::Shaders),
             "packages" | "packages_demo" => Some(Screen::PackagesDemo),
+            "gps" | "location" => Some(Screen::Gps),
+            #[cfg(feature = "ble")]
+            "ble" | "bluetooth" => Some(Screen::Ble),
             "webview" | "webview_browser" | "browser" => Some(Screen::WebViewBrowser),
             "swiper" | "discover" => Some(Screen::Swiper),
             "feed" => Some(Screen::Feed),
@@ -110,6 +174,9 @@ impl Screen {
             Screen::Animations => "Animations",
             Screen::Shaders => "Shaders",
             Screen::PackagesDemo => "Packages",
+            Screen::Gps => "GPS",
+            #[cfg(feature = "ble")]
+            Screen::Ble => "Bluetooth",
             Screen::WebViewBrowser => "Browser",
             Screen::Swiper => "Discover",
             Screen::Feed => "Feed",
@@ -282,6 +349,7 @@ impl Router {
     /// Navigate to a new screen, pushing the current one onto the history stack.
     pub fn navigate_to(&mut self, screen: Screen) {
         if self.current_screen != screen {
+            self.leave_service_screen();
             // Dismiss webview when leaving the browser screen
             if self.current_screen == Screen::WebViewBrowser {
                 webview_browser::dismiss_webview();
@@ -322,6 +390,7 @@ impl Router {
     /// Go back to the previous screen. Returns `true` if navigation occurred.
     pub fn go_back(&mut self) -> bool {
         if let Some(prev) = self.history.pop() {
+            self.leave_service_screen();
             // Dismiss webview when leaving browser
             if self.current_screen == Screen::WebViewBrowser {
                 webview_browser::dismiss_webview();
@@ -341,6 +410,17 @@ impl Router {
             true
         } else {
             false
+        }
+    }
+
+    // Navigation stops screen polling, not an explicitly retained background session.
+    fn leave_service_screen(&self) {
+        if self.current_screen == Screen::Gps {
+            gps::dismiss();
+        }
+        #[cfg(feature = "ble")]
+        if self.current_screen == Screen::Ble {
+            ble::dismiss();
         }
     }
 
@@ -486,6 +566,9 @@ impl Router {
             Screen::Material => self.render_material_screen(cx).into_any_element(),
             Screen::Form => self.render_form_screen(cx).into_any_element(),
             Screen::PackagesDemo => self.render_packages_demo_screen(cx).into_any_element(),
+            Screen::Gps => gps::render(self, cx).into_any_element(),
+            #[cfg(feature = "ble")]
+            Screen::Ble => ble::render(self, cx).into_any_element(),
             Screen::WebViewBrowser => self.render_webview_browser_screen(cx).into_any_element(),
             Screen::Swiper => self.render_swiper_screen(cx).into_any_element(),
             Screen::Feed => self.render_feed_screen(cx).into_any_element(),

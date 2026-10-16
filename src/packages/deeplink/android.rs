@@ -1,10 +1,7 @@
 use crate::android::jni::{self as jni_helpers, get_string};
 use jni::objects::JValue;
-use std::sync::Mutex;
 
 const HELPER_CLASS: &str = "dev.gpui.mobile.GpuiDeepLink";
-
-static LATEST_LINK: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn get_initial_link() -> Result<Option<String>, String> {
     jni_helpers::with_env(|env| {
@@ -32,12 +29,11 @@ pub fn get_initial_link() -> Result<Option<String>, String> {
         if url.is_empty() {
             Ok(None)
         } else {
-            *LATEST_LINK.lock().unwrap() = Some(url.clone());
+            super::LATEST_LINK
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| url.clone());
             Ok(Some(url))
         }
     })
-}
-
-pub fn get_latest_link() -> Option<String> {
-    LATEST_LINK.lock().unwrap().clone()
 }

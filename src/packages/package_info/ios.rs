@@ -10,20 +10,16 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
             return Err("Failed to get NSBundle.mainBundle".into());
         }
 
-        let info_dict: *mut AnyObject = msg_send![bundle, infoDictionary];
-        if info_dict.is_null() {
-            return Err("Failed to get infoDictionary".into());
-        }
-
-        let app_name = nsdict_string(info_dict, "CFBundleDisplayName")
-            .or_else(|| nsdict_string(info_dict, "CFBundleName"))
+        let app_name = bundle_string(bundle, "CFBundleDisplayName")
+            .or_else(|| bundle_string(bundle, "CFBundleName"))
             .unwrap_or_default();
 
-        let package_name = nsdict_string(info_dict, "CFBundleIdentifier").unwrap_or_default();
+        let package_name =
+            bundle_string(bundle, "CFBundleIdentifier").ok_or("Bundle identifier unavailable")?;
 
-        let version = nsdict_string(info_dict, "CFBundleShortVersionString").unwrap_or_default();
+        let version = bundle_string(bundle, "CFBundleShortVersionString").unwrap_or_default();
 
-        let build_number = nsdict_string(info_dict, "CFBundleVersion").unwrap_or_default();
+        let build_number = bundle_string(bundle, "CFBundleVersion").unwrap_or_default();
 
         Ok(PackageInfo {
             app_name,
@@ -34,10 +30,14 @@ pub fn get_package_info() -> Result<PackageInfo, String> {
     }
 }
 
-unsafe fn nsdict_string(dict: *mut AnyObject, key: &str) -> Option<String> {
+unsafe fn bundle_string(bundle: *mut AnyObject, key: &str) -> Option<String> {
     let key_nsstring = nsstring(key);
-    let value: *mut AnyObject = msg_send![dict, objectForKey: key_nsstring];
+    let value: *mut AnyObject = msg_send![bundle, objectForInfoDictionaryKey: key_nsstring];
     if value.is_null() {
+        return None;
+    }
+    let string: bool = msg_send![value, isKindOfClass: class!(NSString)];
+    if !string {
         return None;
     }
     let utf8: *const i8 = msg_send![value, UTF8String];

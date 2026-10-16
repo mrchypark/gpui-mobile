@@ -1,8 +1,11 @@
 use super::HapticFeedback;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Bool};
 use objc2::{class, msg_send};
 
 #[link(name = "AudioToolbox", kind = "framework")]
+extern "C" {}
+
+#[link(name = "CoreHaptics", kind = "framework")]
 extern "C" {}
 
 pub fn vibrate(_duration_ms: u32) -> Result<(), String> {
@@ -32,9 +35,17 @@ pub fn haptic_feedback(feedback: HapticFeedback) -> Result<(), String> {
 }
 
 pub fn can_vibrate() -> bool {
-    // All iPhones with Taptic Engine (iPhone 7+) support haptics.
-    // We assume true since we target modern iOS.
-    true
+    // Public hardware capability query; legacy system-vibration-only devices
+    // may report false because they do not support Core Haptics.
+    unsafe {
+        let capabilities: *mut AnyObject =
+            msg_send![class!(CHHapticEngine), capabilitiesForHardware];
+        if capabilities.is_null() {
+            return false;
+        }
+        let supported: Bool = msg_send![capabilities, supportsHaptics];
+        supported.as_bool()
+    }
 }
 
 unsafe fn impact_feedback(style: i64) -> Result<(), String> {
@@ -45,6 +56,7 @@ unsafe fn impact_feedback(style: i64) -> Result<(), String> {
     }
     let _: () = msg_send![generator, prepare];
     let _: () = msg_send![generator, impactOccurred];
+    let _: () = msg_send![generator, release];
     Ok(())
 }
 
@@ -56,6 +68,7 @@ unsafe fn selection_feedback() -> Result<(), String> {
     }
     let _: () = msg_send![generator, prepare];
     let _: () = msg_send![generator, selectionChanged];
+    let _: () = msg_send![generator, release];
     Ok(())
 }
 
@@ -67,5 +80,6 @@ unsafe fn notification_feedback(type_: i64) -> Result<(), String> {
     }
     let _: () = msg_send![generator, prepare];
     let _: () = msg_send![generator, notificationOccurred: type_];
+    let _: () = msg_send![generator, release];
     Ok(())
 }

@@ -2,7 +2,7 @@
 //!
 //! Provides a cross-platform audio player API backed by:
 //! - Android: MediaPlayer via JNI
-//! - iOS: AVAudioPlayer via Objective-C
+//! - iOS: AVQueuePlayer/AVPlayerLooper via Objective-C
 //!
 //! Feature-gated behind `audio`.
 
@@ -28,6 +28,7 @@ pub enum LoopMode {
     #[default]
     Off,
     One,
+    /// Repeats the current source, like One; this player has no playlist API.
     All,
 }
 
@@ -57,6 +58,7 @@ impl AudioPlayer {
 
     /// Set the audio source from a URL (http/https/file).
     /// Returns the duration in milliseconds, or None if unknown.
+    /// Android preparation waits for native readiness; call from a worker thread.
     pub fn set_url(&self, url: &str) -> Result<Option<u64>, String> {
         #[cfg(target_os = "android")]
         {
@@ -74,6 +76,7 @@ impl AudioPlayer {
     }
 
     /// Set the audio source from a file path.
+    /// Android preparation waits for native readiness; call from a worker thread.
     pub fn set_file_path(&self, path: &str) -> Result<Option<u64>, String> {
         #[cfg(target_os = "android")]
         {
@@ -140,6 +143,9 @@ impl AudioPlayer {
 
     /// Seek to position in milliseconds.
     pub fn seek(&self, position_ms: u64) -> Result<(), String> {
+        if position_ms > i64::MAX as u64 {
+            return Err("Seek position exceeds native time range".into());
+        }
         #[cfg(target_os = "android")]
         {
             android::seek(self.id, position_ms)
@@ -157,6 +163,9 @@ impl AudioPlayer {
 
     /// Set volume (0.0 to 1.0).
     pub fn set_volume(&self, volume: f32) -> Result<(), String> {
+        if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+            return Err("Volume must be finite and between 0 and 1".into());
+        }
         #[cfg(target_os = "android")]
         {
             android::set_volume(self.id, volume)
@@ -174,6 +183,9 @@ impl AudioPlayer {
 
     /// Set playback speed (1.0 = normal).
     pub fn set_speed(&self, speed: f32) -> Result<(), String> {
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err("Playback speed must be finite and positive".into());
+        }
         #[cfg(target_os = "android")]
         {
             android::set_speed(self.id, speed)

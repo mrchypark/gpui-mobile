@@ -1,0 +1,35 @@
+--- a/src/droidplug/java/src/main/java/com/nonpolynomial/btleplug/android/impl/Peripheral.java
++++ b/src/droidplug/java/src/main/java/com/nonpolynomial/btleplug/android/impl/Peripheral.java
+@@ -184,6 +184,11 @@
+             this.queueCommand(() -> {
+                 this.asyncWithFuture(future, () -> {
+                     if (!this.connected) {
++                        if (this.gatt != null) {
++                            BluetoothGatt old = this.gatt;
++                            this.gatt = null;
++                            old.close();
++                        }
+                         Peripheral.this.wakeCommand(future, null);
+                     } else {
+                         this.setCommandCallback(new CommandCallback(future) {
+@@ -213,3 +218,3 @@
+-    public boolean isConnected() {
++    public synchronized boolean isConnected() {
+         return this.connected;
+     }
+@@ -642,6 +647,15 @@
+                 if (Peripheral.this.commandCallback != null) {
+                     Peripheral.this.dispatchToCommandCallback("onConnectionStateChange",
+                             () -> Peripheral.this.commandCallback.onConnectionStateChange(gatt, status, newState));
++                } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
++                    // Idle remote disconnect has no command to own cleanup.
++                    // Clear identity first, so duplicate/late callbacks cannot
++                    // close this client twice or affect a replacement client.
++                    Peripheral.this.gatt = null;
++                    try { gatt.close(); }
++                    catch (Throwable error) {
++                        Log.e(TAG, "Unable to close retired idle GATT client", error);
++                    }
+                 }
+                 suppressDisconnectNotification = Peripheral.this.suppressDisconnectNotification;
+                 // A failed connect closes the gatt and clears `connected` even if the state was CONNECTED.

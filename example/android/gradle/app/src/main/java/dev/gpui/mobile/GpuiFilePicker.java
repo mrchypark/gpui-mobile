@@ -6,7 +6,6 @@ import android.net.Uri;
 import android.provider.DocumentsContract;
 
 import java.util.ArrayList;
-import java.util.concurrent.CountDownLatch;
 
 /**
  * File picker helper using the Storage Access Framework.
@@ -97,23 +96,7 @@ public final class GpuiFilePicker {
     // ── Internal ─────────────────────────────────────────────────────────
 
     private static ArrayList<String> launchPicker(Activity activity, Intent intent) {
-        CountDownLatch latch = new CountDownLatch(1);
-        GpuiPickerActivity.sLatch = latch;
-        GpuiPickerActivity.sResult.set(null);
-        GpuiPickerActivity.sPendingIntent = intent;
-
-        Intent proxy = new Intent(activity, GpuiPickerActivity.class);
-        proxy.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(proxy);
-
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-        }
-
-        return GpuiPickerActivity.sResult.get();
+        return GpuiPickerActivity.launch(activity, intent, Intent.ACTION_OPEN_DOCUMENT.equals(intent.getAction()), null);
     }
 
     private static void applyMimeTypes(Intent intent, String mimeTypes) {

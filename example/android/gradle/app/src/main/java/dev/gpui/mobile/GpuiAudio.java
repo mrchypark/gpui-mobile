@@ -3,266 +3,144 @@ package dev.gpui.mobile;
 import android.app.Activity;
 import android.media.MediaPlayer;
 import android.media.PlaybackParams;
-import android.os.Build;
 import android.util.SparseArray;
 
-import java.io.IOException;
-
-/**
- * Audio playback helper for the GPUI audio package.
- *
- * <p>Uses {@link MediaPlayer} for audio playback. All public methods are static
- * and called from Rust via JNI.</p>
- */
+/** Serialized player operations; native errors reach the Rust Result through JNI. */
 public final class GpuiAudio {
-
-    private static final String TAG = "GpuiAudio";
-    private static final SparseArray<MediaPlayer> sPlayers = new SparseArray<>();
-    private static int sNextId = 1;
-
-    /**
-     * Create a new audio player.
-     *
-     * @return Player ID, or -1 on failure.
-     */
-    public static int create(Activity activity) {
-        try {
-            int id = sNextId++;
-            MediaPlayer mp = new MediaPlayer();
-            synchronized (sPlayers) {
-                sPlayers.put(id, mp);
-            }
-            return id;
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "create failed", e);
-            return -1;
-        }
+    private static final class Player {
+        final MediaPlayer nativePlayer = new MediaPlayer();
+        int state; // 0 idle, 1 loading, 2 ready, 3 playing, 4 paused, 5 completed, -1 error
+        float speed = 1, volume = 1;
+        boolean looping;
+        GpuiMediaLoad load;
+        long generation;
     }
-
-    /**
-     * Set the audio source from a URL or file path.
-     *
-     * @return Duration in milliseconds, or -1 if unknown/error.
-     */
+    private static final SparseArray<Player> players = new SparseArray<>();
+    private static int nextId = 1;
+    private static Player player(int id) {
+        Player p = players.get(id);
+        if (p == null) throw new IllegalStateException("Audio player not found: " + id);
+        return p;
+    }
+    private static void ready(Player p) {
+        if (p.state < 2) throw new IllegalStateException("Audio source is not ready");
+    }
+    public static synchronized int create(Activity activity) {
+        Player p = new Player();
+        int id = nextId++;
+        players.put(id, p);
+        return id;
+    }
     public static long setUrl(Activity activity, int id, String url) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            throw new IllegalStateException("Load audio from a worker thread");
         }
-        if (mp == null) return -1;
-
-        try {
-            mp.reset();
-            mp.setDataSource(url);
-            mp.prepare();
-            return mp.getDuration();
-        } catch (IOException e) {
-            android.util.Log.e(TAG, "setUrl failed: " + url, e);
-            return -1;
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "setUrl failed: " + url, e);
-            return -1;
-        }
-    }
-
-    /**
-     * Start or resume playback.
-     */
-    public static void play(int id) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return;
-
-        try {
-            mp.start();
-        } catch (IllegalStateException e) {
-            android.util.Log.e(TAG, "play failed", e);
-        }
-    }
-
-    /**
-     * Pause playback.
-     */
-    public static void pause(int id) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return;
-
-        try {
-            if (mp.isPlaying()) {
-                mp.pause();
-            }
-        } catch (IllegalStateException e) {
-            android.util.Log.e(TAG, "pause failed", e);
-        }
-    }
-
-    /**
-     * Stop playback and reset to the beginning.
-     */
-    public static void stop(int id) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return;
-
-        try {
-            mp.stop();
-            mp.prepare();
-            mp.seekTo(0);
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "stop failed", e);
-        }
-    }
-
-    /**
-     * Seek to position in milliseconds.
-     */
-    public static void seek(int id, long positionMs) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return;
-
-        try {
-            mp.seekTo((int) positionMs);
-        } catch (IllegalStateException e) {
-            android.util.Log.e(TAG, "seek failed", e);
-        }
-    }
-
-    /**
-     * Set volume (0.0 to 1.0).
-     */
-    public static void setVolume(int id, float volume) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return;
-
-        try {
-            float v = Math.max(0.0f, Math.min(1.0f, volume));
-            mp.setVolume(v, v);
-        } catch (IllegalStateException e) {
-            android.util.Log.e(TAG, "setVolume failed", e);
-        }
-    }
-
-    /**
-     * Set playback speed (requires API 23+).
-     */
-    public static void setSpeed(int id, float speed) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return;
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        final Player p;
+        final GpuiMediaLoad load = new GpuiMediaLoad();
+        final long generation;
+        synchronized (GpuiAudio.class) {
+            p = player(id);
+            if (p.load != null) throw new IllegalStateException("Audio source is loading");
+            generation = ++p.generation;
+            p.load = load; p.state = 1;
             try {
-                PlaybackParams params = mp.getPlaybackParams();
-                params.setSpeed(speed);
-                mp.setPlaybackParams(params);
-            } catch (Exception e) {
-                android.util.Log.e(TAG, "setSpeed failed", e);
+                p.nativePlayer.reset();
+                p.nativePlayer.setOnPreparedListener(mp -> load.complete(null));
+                p.nativePlayer.setOnCompletionListener(mp -> {
+                    synchronized (GpuiAudio.class) { if (p.generation == generation) p.state = 5; }
+                });
+                p.nativePlayer.setOnErrorListener((mp, what, extra) -> {
+                    synchronized (GpuiAudio.class) { if (p.generation == generation) p.state = -1; }
+                    load.complete(new IllegalStateException("Audio error " + what + "/" + extra)); return true;
+                });
+                android.net.Uri uri = android.net.Uri.parse(url);
+                String scheme = uri.getScheme();
+                if (scheme == null || "http".equals(scheme) || "https".equals(scheme)) p.nativePlayer.setDataSource(url);
+                else p.nativePlayer.setDataSource(activity, uri);
+                p.nativePlayer.prepareAsync();
+            } catch (Exception error) {
+                p.load = null; p.state = -1;
+                throw new IllegalStateException("Audio loading failed", error);
             }
-        } else {
-            android.util.Log.w(TAG, "setSpeed requires API 23+, current: " + Build.VERSION.SDK_INT);
         }
-    }
-
-    /**
-     * Set looping mode.
-     */
-    public static void setLooping(int id, boolean looping) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return;
-
         try {
-            mp.setLooping(looping);
-        } catch (IllegalStateException e) {
-            android.util.Log.e(TAG, "setLooping failed", e);
+            load.await();
+            synchronized (GpuiAudio.class) {
+                if (players.get(id) != p || p.load != load) throw new IllegalStateException("Audio load cancelled");
+                p.nativePlayer.setLooping(p.looping);
+                p.nativePlayer.setVolume(p.volume, p.volume);
+                p.state = 2;
+                return p.nativePlayer.getDuration();
+            }
+        } catch (RuntimeException error) {
+            synchronized (GpuiAudio.class) {
+                if (players.get(id) == p && p.load == load) { p.nativePlayer.reset(); p.state = -1; }
+            }
+            throw error;
+        } finally {
+            synchronized (GpuiAudio.class) { if (p.load == load) p.load = null; }
         }
     }
-
-    /**
-     * Get current playback position in milliseconds.
-     */
-    public static long getPosition(int id) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return -1;
-
-        try {
-            return mp.getCurrentPosition();
-        } catch (IllegalStateException e) {
-            return -1;
-        }
+    public static synchronized void play(int id) {
+        Player p = player(id); ready(p);
+        p.nativePlayer.setPlaybackParams(new PlaybackParams().allowDefaults().setSpeed(p.speed));
+        p.nativePlayer.start(); p.state = 3;
     }
-
-    /**
-     * Get total duration in milliseconds.
-     */
-    public static long getDuration(int id) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return -1;
-
-        try {
-            return mp.getDuration();
-        } catch (IllegalStateException e) {
-            return -1;
-        }
+    public static synchronized void pause(int id) {
+        Player p = player(id); ready(p);
+        if (p.nativePlayer.isPlaying()) p.nativePlayer.pause();
+        p.state = 4;
     }
-
-    /**
-     * Check if currently playing.
-     */
-    public static boolean isPlaying(int id) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-        }
-        if (mp == null) return false;
-
-        try {
-            return mp.isPlaying();
-        } catch (IllegalStateException e) {
-            return false;
-        }
+    public static synchronized void stop(int id) {
+        Player p = player(id); ready(p);
+        if (p.nativePlayer.isPlaying()) p.nativePlayer.pause();
+        p.nativePlayer.seekTo(0L, MediaPlayer.SEEK_CLOSEST); p.state = 2;
     }
-
-    /**
-     * Release the player and free resources.
-     */
-    public static void dispose(int id) {
-        MediaPlayer mp;
-        synchronized (sPlayers) {
-            mp = sPlayers.get(id);
-            sPlayers.remove(id);
-        }
-        if (mp == null) return;
-
-        try {
-            mp.release();
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "dispose failed", e);
-        }
+    public static synchronized void seek(int id, long ms) {
+        Player p = player(id); ready(p);
+        if (ms < 0) throw new IllegalArgumentException("Negative seek");
+        p.nativePlayer.seekTo(ms, MediaPlayer.SEEK_CLOSEST);
     }
-
+    public static synchronized void setVolume(int id, float volume) {
+        if (!Float.isFinite(volume) || volume < 0 || volume > 1) throw new IllegalArgumentException("Invalid volume");
+        Player p = player(id);
+        if (p.load != null) throw new IllegalStateException("Audio source is loading");
+        p.nativePlayer.setVolume(volume, volume); p.volume = volume;
+    }
+    public static synchronized void setSpeed(int id, float speed) {
+        if (!Float.isFinite(speed) || speed <= 0) throw new IllegalArgumentException("Invalid speed");
+        Player p = player(id);
+        if (p.load != null) throw new IllegalStateException("Audio source is loading");
+        if (p.state == 3) p.nativePlayer.setPlaybackParams(new PlaybackParams().allowDefaults().setSpeed(speed));
+        p.speed = speed;
+    }
+    public static synchronized void setLooping(int id, boolean looping) {
+        Player p = player(id);
+        if (p.load != null) throw new IllegalStateException("Audio source is loading");
+        p.nativePlayer.setLooping(looping); p.looping = looping;
+    }
+    public static synchronized long getPosition(int id) {
+        Player p = player(id);
+        if (p.state == 0) return 0;
+        ready(p); return p.nativePlayer.getCurrentPosition();
+    }
+    public static synchronized long getDuration(int id) {
+        Player p = player(id);
+        if (p.state == 0) return 0;
+        ready(p); return p.nativePlayer.getDuration();
+    }
+    public static synchronized boolean isPlaying(int id) { return getState(id) == 3; }
+    public static synchronized int getState(int id) {
+        Player p = player(id);
+        if (p.state == -1) throw new IllegalStateException("Native audio playback failed");
+        return p.state;
+    }
+    public static synchronized void dispose(int id) {
+        Player p = players.get(id);
+        if (p == null) return;
+        players.remove(id); p.generation++;
+        if (p.load != null) p.load.complete(new IllegalStateException("Audio player disposed during load"));
+        p.nativePlayer.release();
+    }
     private GpuiAudio() {}
 }

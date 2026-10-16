@@ -1,0 +1,26 @@
+[package]
+name = "gpui-mobile-ely-integration"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent lockfile and patches: the parent repository is not a workspace.
+[workspace]
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+gpui-mobile = { path = "../.." }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", default-features = false }
+# Verified published mobile fixes, retaining the common Zed GPUI revision.
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd", default-features = false }
+# Devices cannot read Ely assets from the build machine's filesystem in debug builds.
+rust-embed = { version = "8.12", features = ["debug-embed"] }
+
+# Cargo only honors patches at the invoking workspace root.
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }

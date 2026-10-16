@@ -94,6 +94,10 @@ fn settings_to_creation_params(
 /// Creates a platform view of type "webview" and loads the URL.
 /// Returns a handle for controlling and dismissing the view.
 pub fn load_url(url: &str, settings: &WebViewSettings) -> Result<WebViewHandle, String> {
+    if url.trim().is_empty() {
+        return Err("WebView URL must not be empty".into());
+    }
+    validate_settings(settings)?;
     ensure_factory_registered();
 
     let mut params_map = settings_to_creation_params(settings);
@@ -117,6 +121,7 @@ pub fn load_url(url: &str, settings: &WebViewSettings) -> Result<WebViewHandle, 
 
 /// Load raw HTML content in a WebView.
 pub fn load_html(html: &str, settings: &WebViewSettings) -> Result<WebViewHandle, String> {
+    validate_settings(settings)?;
     ensure_factory_registered();
 
     let mut params_map = settings_to_creation_params(settings);
@@ -138,11 +143,14 @@ pub fn load_html(html: &str, settings: &WebViewSettings) -> Result<WebViewHandle
     })
 }
 
-/// Evaluate JavaScript in an existing WebView.
+/// Evaluate JavaScript in an existing WebView and wait for its native completion.
+///
+/// Call from a worker thread: the synchronous API rejects native UI-thread calls
+/// to avoid blocking callback delivery. Results are discarded; native execution
+/// errors and a ten-second completion timeout are returned as errors. A timeout
+/// does not undo script effects. This does not await JavaScript promises.
 pub fn evaluate_javascript(handle: &WebViewHandle, script: &str) -> Result<(), String> {
-    if handle.platform_handle.is_none() {
-        return Err("No active WebView".into());
-    }
+    active_id(handle)?;
     #[cfg(target_os = "ios")]
     {
         ios::evaluate_javascript(handle, script)
@@ -160,9 +168,7 @@ pub fn evaluate_javascript(handle: &WebViewHandle, script: &str) -> Result<(), S
 
 /// Navigate the WebView back one page in its history.
 pub fn go_back(handle: &WebViewHandle) -> Result<(), String> {
-    if handle.platform_handle.is_none() {
-        return Err("No active WebView".into());
-    }
+    active_id(handle)?;
     #[cfg(target_os = "ios")]
     {
         ios::go_back(handle)
@@ -180,9 +186,7 @@ pub fn go_back(handle: &WebViewHandle) -> Result<(), String> {
 
 /// Reload the current page in the WebView.
 pub fn reload(handle: &WebViewHandle) -> Result<(), String> {
-    if handle.platform_handle.is_none() {
-        return Err("No active WebView".into());
-    }
+    active_id(handle)?;
     #[cfg(target_os = "ios")]
     {
         ios::reload(handle)
@@ -200,9 +204,7 @@ pub fn reload(handle: &WebViewHandle) -> Result<(), String> {
 
 /// Stop loading the current page in the WebView.
 pub fn stop_loading(handle: &WebViewHandle) -> Result<(), String> {
-    if handle.platform_handle.is_none() {
-        return Err("No active WebView".into());
-    }
+    active_id(handle)?;
     #[cfg(target_os = "ios")]
     {
         ios::stop_loading(handle)
@@ -247,5 +249,83 @@ impl Drop for WebViewHandle {
         if let Some(h) = self.platform_handle.take() {
             h.dispose();
         }
+    }
+}
+
+fn active_id(handle: &WebViewHandle) -> Result<crate::platform_view::PlatformViewId, String> {
+    let handle = handle.platform_handle.as_ref().ok_or("No active WebView")?;
+    if handle.inner().is_disposed() || handle.view_type() != "webview" {
+        return Err("No active WebView instance".into());
+    }
+    Ok(handle.id())
+}
+
+fn validate_settings(settings: &WebViewSettings) -> Result<(), String> {
+    if !settings.top_offset.is_finite() || settings.top_offset < 0.0 {
+        return Err("WebView top offset must be finite and non-negative".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform_view::{PlatformView, PlatformViewId};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn invalid_load_parameters_fail_before_native_creation() {
+        assert!(load_url("", &WebViewSettings::default()).is_err());
+        let settings = WebViewSettings {
+            top_offset: f32::NAN,
+            ..Default::default()
+        };
+        assert!(load_html("", &settings).is_err());
+    }
+
+    struct View {
+        id: PlatformViewId,
+        kind: &'static str,
+        disposed: AtomicBool,
+    }
+    impl PlatformView for View {
+        fn id(&self) -> PlatformViewId {
+            self.id
+        }
+        fn view_type(&self) -> &str {
+            self.kind
+        }
+        fn set_bounds(&self, _: PlatformViewBounds) {}
+        fn set_visible(&self, _: bool) {}
+        fn set_z_index(&self, _: i32) {}
+        fn dispose(&self) {
+            self.disposed.store(true, Ordering::Relaxed);
+        }
+        fn is_disposed(&self) -> bool {
+            self.disposed.load(Ordering::Relaxed)
+        }
+    }
+    fn handle(kind: &'static str) -> WebViewHandle {
+        WebViewHandle {
+            platform_handle: Some(Arc::new(PlatformViewHandle::new(Box::new(View {
+                id: PlatformViewId::next(),
+                kind,
+                disposed: AtomicBool::new(false),
+            })))),
+        }
+    }
+    #[test]
+    fn instances_and_external_disposal_are_independent() {
+        let first = handle("webview");
+        let second = handle("webview");
+        assert_ne!(active_id(&first).unwrap(), active_id(&second).unwrap());
+        first.platform_view_handle().unwrap().dispose();
+        assert!(active_id(&first).is_err());
+        assert!(active_id(&second).is_ok());
+        assert!(evaluate_javascript(&first, "1").is_err());
+        assert!(go_back(&first).is_err());
+        assert!(reload(&first).is_err());
+        assert!(stop_loading(&first).is_err());
+        assert!(active_id(&handle("map")).is_err());
     }
 }

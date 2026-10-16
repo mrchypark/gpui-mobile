@@ -7,7 +7,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use gpui::{PlatformDispatcher, Priority, RunnableVariant, ThreadTaskTimings};
+use gpui::{PlatformDispatcher, Priority, RunnableVariant};
 use std::thread;
 
 use objc2::runtime::Bool;
@@ -63,19 +63,6 @@ impl PlatformDispatcher for IosDispatcher {
         }
     }
 
-    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
-        Vec::new()
-    }
-
-    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
-        ThreadTaskTimings {
-            thread_name: None,
-            thread_id: thread::current().id(),
-            timings: Vec::new(),
-            total_pushed: 0,
-        }
-    }
-
     fn dispatch(&self, runnable: RunnableVariant, priority: Priority) {
         let context = runnable.into_raw().as_ptr() as *mut c_void;
         unsafe {
@@ -98,20 +85,35 @@ impl PlatformDispatcher for IosDispatcher {
         let context = runnable.into_raw().as_ptr() as *mut c_void;
         unsafe {
             let queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0);
-            let when = dispatch_time(DISPATCH_TIME_NOW, duration.as_nanos() as i64);
+            let when = dispatch_time(DISPATCH_TIME_NOW, delay_nanoseconds(duration));
             dispatch_after_f(when, queue, context, Some(trampoline));
         }
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
-        // On iOS, we don't have direct realtime thread control like macOS.
-        // Use a high-priority GCD queue as an approximation.
+        // A dedicated thread does not promise hard realtime scheduling.
         thread::Builder::new()
             .name("gpui-ios-realtime".into())
             .spawn(move || {
                 f();
             })
-            .ok();
+            .expect("failed to spawn iOS realtime thread");
+    }
+}
+
+fn delay_nanoseconds(duration: Duration) -> i64 {
+    duration.as_nanos().min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_delays_do_not_wrap_into_the_past() {
+        assert_eq!(delay_nanoseconds(Duration::ZERO), 0);
+        assert_eq!(delay_nanoseconds(Duration::from_millis(2)), 2_000_000);
+        assert_eq!(delay_nanoseconds(Duration::MAX), i64::MAX);
     }
 }
 

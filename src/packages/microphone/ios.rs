@@ -9,7 +9,6 @@ extern "C" {}
 struct RecorderState {
     recorder: *mut AnyObject, // AVAudioRecorder
     path: String,
-    start_time: std::time::Instant,
 }
 
 unsafe impl Send for RecorderState {}
@@ -17,11 +16,16 @@ unsafe impl Send for RecorderState {}
 static STATE: Mutex<Option<RecorderState>> = Mutex::new(None);
 
 pub fn is_available() -> bool {
-    // AVAudioRecorder is available on all iOS versions we support
-    true
+    unsafe {
+        let session: *mut AnyObject = msg_send![class!(AVAudioSession), sharedInstance];
+        msg_send![session, isInputAvailable]
+    }
 }
 
 pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
+    if config.format == AudioFormat::Amr {
+        return Err("AMR recording is Android-only".into());
+    }
     let mut guard = STATE.lock().unwrap();
     if guard.is_some() {
         return Err("Already recording".into());
@@ -67,11 +71,17 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
             number_with_int(config.bit_rate as i32),
         ];
 
-        let settings: *mut AnyObject = msg_send![class!(NSDictionary),
+        let settings: *mut AnyObject = msg_send![class!(NSMutableDictionary),
             dictionaryWithObjects: values.as_ptr(),
             forKeys: keys.as_ptr(),
             count: 4usize
         ];
+        if config.format == AudioFormat::Wav {
+            let _: () = msg_send![settings, removeObjectForKey: nsstring("AVEncoderBitRateKey")];
+            for (key, value) in [("AVLinearPCMBitDepthKey", 16), ("AVLinearPCMIsFloatKey", 0), ("AVLinearPCMIsBigEndianKey", 0)] {
+                let _: () = msg_send![settings, setObject: number_with_int(value), forKey: nsstring(key)];
+            }
+        }
 
         // Create AVAudioRecorder
         let mut error: *mut AnyObject = std::ptr::null_mut();
@@ -89,6 +99,9 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
             } else {
                 "Failed to create recorder".to_string()
             };
+            if !recorder.is_null() {
+                let _: () = msg_send![recorder, release];
+            }
             return Err(err_msg);
         }
 
@@ -99,25 +112,34 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
         let session: *mut AnyObject = msg_send![class!(AVAudioSession), sharedInstance];
         let record_category = nsstring("AVAudioSessionCategoryRecord");
         let mut session_error: *mut AnyObject = std::ptr::null_mut();
-        let _: () = msg_send![session,
+        let category_ok: bool = msg_send![session,
             setCategory: record_category,
             error: &mut session_error as *mut *mut AnyObject
         ];
-        let _: () = msg_send![session,
+        if !category_ok {
+            let _: () = msg_send![recorder, release];
+            return Err("Failed to configure recording audio session".into());
+        }
+        let active: bool = msg_send![session,
             setActive: true,
             error: &mut session_error as *mut *mut AnyObject
         ];
+        if !active {
+            let _: () = msg_send![recorder, release];
+            return Err("Failed to activate recording audio session".into());
+        }
 
         // Start recording
         let ok: bool = msg_send![recorder, record];
         if !ok {
+            let _: () = msg_send![recorder, release];
+            let _: bool = msg_send![session, setActive: false, error: &mut session_error as *mut *mut AnyObject];
             return Err("Failed to start recording".into());
         }
 
         *guard = Some(RecorderState {
             recorder,
             path: path_str.clone(),
-            start_time: std::time::Instant::now(),
         });
 
         Ok(path_str)
@@ -129,13 +151,15 @@ pub fn stop_recording() -> Result<Recording, String> {
     let state = guard.take().ok_or("Not recording")?;
 
     unsafe {
+        let duration: f64 = msg_send![state.recorder, currentTime];
         let _: () = msg_send![state.recorder, stop];
-        let duration_ms = state.start_time.elapsed().as_millis() as u64;
+        let _: () = msg_send![state.recorder, release];
+        let duration_ms = (duration * 1000.0) as u64;
 
         // Deactivate audio session
         let session: *mut AnyObject = msg_send![class!(AVAudioSession), sharedInstance];
         let mut error: *mut AnyObject = std::ptr::null_mut();
-        let _: () = msg_send![session,
+        let _: bool = msg_send![session,
             setActive: false,
             error: &mut error as *mut *mut AnyObject
         ];
@@ -182,6 +206,8 @@ pub fn get_amplitude() -> Result<f64, String> {
     let guard = STATE.lock().unwrap();
     let state = guard.as_ref().ok_or("Not recording")?;
     unsafe {
+        let recording: bool = msg_send![state.recorder, isRecording];
+        if !recording { return Ok(0.0); }
         let _: () = msg_send![state.recorder, updateMeters];
         let level: f32 = msg_send![state.recorder, averagePowerForChannel: 0i64];
         // Convert from dB (range: -160 to 0) to linear (0.0 to 1.0)

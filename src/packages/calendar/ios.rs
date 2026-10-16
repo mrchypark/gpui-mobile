@@ -15,6 +15,12 @@ unsafe fn new_event_store() -> *mut AnyObject {
     store
 }
 
+unsafe fn require_read_access() -> Result<(), String> {
+    let status: i64 =
+        msg_send![class!(EKEventStore), authorizationStatusForEntityType: EK_ENTITY_TYPE_EVENT];
+    super::authorization::require_read(status)
+}
+
 /// Convert a Unix timestamp in milliseconds to an NSDate.
 unsafe fn nsdate_from_ms(ms: i64) -> *mut AnyObject {
     let seconds = (ms as f64) / 1000.0;
@@ -51,7 +57,11 @@ unsafe fn nsstring_from_str(s: &str) -> *mut AnyObject {
 }
 
 pub fn get_calendars() -> Result<Vec<Calendar>, String> {
+    objc2::rc::autoreleasepool(|_| get_calendars_inner())
+}
+fn get_calendars_inner() -> Result<Vec<Calendar>, String> {
     unsafe {
+        require_read_access()?;
         let store = new_event_store();
         if store.is_null() {
             return Err("Failed to create EKEventStore".into());
@@ -61,7 +71,7 @@ pub fn get_calendars() -> Result<Vec<Calendar>, String> {
             msg_send![store, calendarsForEntityType: EK_ENTITY_TYPE_EVENT];
         if calendars.is_null() {
             let _: () = msg_send![store, release];
-            return Ok(vec![]);
+            return Err("EventKit returned no calendar collection".into());
         }
 
         let count: u64 = msg_send![calendars, count];
@@ -99,7 +109,15 @@ pub fn get_events(
     start_ms: i64,
     end_ms: i64,
 ) -> Result<Vec<CalendarEvent>, String> {
+    objc2::rc::autoreleasepool(|_| get_events_inner(calendar_id, start_ms, end_ms))
+}
+fn get_events_inner(
+    calendar_id: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<CalendarEvent>, String> {
     unsafe {
+        require_read_access()?;
         let store = new_event_store();
         if store.is_null() {
             return Err("Failed to create EKEventStore".into());
@@ -113,7 +131,7 @@ pub fn get_events(
             msg_send![store, calendarsForEntityType: EK_ENTITY_TYPE_EVENT];
         if all_calendars.is_null() {
             let _: () = msg_send![store, release];
-            return Ok(vec![]);
+            return Err("EventKit returned no calendar collection".into());
         }
 
         let cal_count: u64 = msg_send![all_calendars, count];
@@ -148,13 +166,13 @@ pub fn get_events(
         ];
         if predicate.is_null() {
             let _: () = msg_send![store, release];
-            return Ok(vec![]);
+            return Err("EventKit could not construct event query".into());
         }
 
         let events: *mut AnyObject = msg_send![store, eventsMatchingPredicate: predicate];
         if events.is_null() {
             let _: () = msg_send![store, release];
-            return Ok(vec![]);
+            return Err("EventKit returned no event collection".into());
         }
 
         let count: u64 = msg_send![events, count];
@@ -194,7 +212,13 @@ pub fn get_events(
 }
 
 pub fn create_event(event: &CalendarEvent) -> Result<String, String> {
+    objc2::rc::autoreleasepool(|_| create_event_inner(event))
+}
+fn create_event_inner(event: &CalendarEvent) -> Result<String, String> {
     unsafe {
+        // Selecting an existing calendar by ID requires reading it, even on
+        // iOS17 where a separate write-only permission exists.
+        require_read_access()?;
         let store = new_event_store();
         if store.is_null() {
             return Err("Failed to create EKEventStore".into());
@@ -219,6 +243,11 @@ pub fn create_event(event: &CalendarEvent) -> Result<String, String> {
             let _: () = msg_send![ek_event, setLocation: ns_location];
         }
 
+        if event.all_day {
+            let utc: *mut AnyObject =
+                msg_send![class!(NSTimeZone), timeZoneForSecondsFromGMT: 0isize];
+            let _: () = msg_send![ek_event, setTimeZone: utc];
+        }
         let start_date = nsdate_from_ms(event.start_ms);
         let _: () = msg_send![ek_event, setStartDate: start_date];
 
@@ -276,7 +305,11 @@ pub fn create_event(event: &CalendarEvent) -> Result<String, String> {
 }
 
 pub fn delete_event(event_id: &str) -> Result<bool, String> {
+    objc2::rc::autoreleasepool(|_| delete_event_inner(event_id))
+}
+fn delete_event_inner(event_id: &str) -> Result<bool, String> {
     unsafe {
+        require_read_access()?;
         let store = new_event_store();
         if store.is_null() {
             return Err("Failed to create EKEventStore".into());
@@ -287,6 +320,15 @@ pub fn delete_event(event_id: &str) -> Result<bool, String> {
         if event.is_null() {
             let _: () = msg_send![store, release];
             return Ok(false);
+        }
+
+        let recurring: bool = msg_send![event, hasRecurrenceRules];
+        let detached: bool = msg_send![event, isDetached];
+        if recurring || detached {
+            let _: () = msg_send![store, release];
+            return Err(
+                "Recurring event deletion requires an explicit scope and is unsupported".into(),
+            );
         }
 
         let mut error: *mut AnyObject = std::ptr::null_mut();

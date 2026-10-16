@@ -87,11 +87,16 @@ fn ensure_factory_registered() {
 
 /// Get the raw AVPlayer pointer for a given player ID (iOS only).
 ///
-/// Used by `IosPlatformView` to create an `AVPlayerLayer` during
-/// platform view construction.
+/// Borrowed pointer: concurrent disposal invalidates it. This legacy accessor
+/// transfers no ownership; internal layer creation uses ios_retain_player instead.
 #[cfg(target_os = "ios")]
 pub fn ios_get_player(id: u32) -> Option<*mut objc2::runtime::AnyObject> {
     ios::get_player_ptr(id)
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) fn ios_retain_player(id: u32) -> Option<objc2::rc::Retained<objc2::runtime::AnyObject>> {
+    ios::retain_player(id)
 }
 
 impl VideoPlayer {
@@ -112,6 +117,7 @@ impl VideoPlayer {
     }
 
     /// Set video source from a URL.
+    /// Waits for native readiness; call from a worker thread.
     pub fn set_url(&self, url: &str) -> Result<VideoInfo, String> {
         #[cfg(target_os = "ios")]
         {
@@ -129,6 +135,7 @@ impl VideoPlayer {
     }
 
     /// Set video source from a file path.
+    /// Waits for native readiness; call from a worker thread.
     pub fn set_file_path(&self, path: &str) -> Result<VideoInfo, String> {
         #[cfg(target_os = "ios")]
         {
@@ -179,6 +186,9 @@ impl VideoPlayer {
 
     /// Seek to a position in milliseconds.
     pub fn seek(&self, position_ms: u64) -> Result<(), String> {
+        if position_ms > i64::MAX as u64 {
+            return Err("Seek position exceeds native time range".into());
+        }
         #[cfg(target_os = "ios")]
         {
             ios::seek(self.id, position_ms)
@@ -196,6 +206,9 @@ impl VideoPlayer {
 
     /// Set volume (0.0 to 1.0).
     pub fn set_volume(&self, volume: f32) -> Result<(), String> {
+        if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+            return Err("Volume must be finite and between 0 and 1".into());
+        }
         #[cfg(target_os = "ios")]
         {
             ios::set_volume(self.id, volume)
@@ -213,6 +226,9 @@ impl VideoPlayer {
 
     /// Set playback speed (e.g. 1.0 for normal, 2.0 for double speed).
     pub fn set_speed(&self, speed: f32) -> Result<(), String> {
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err("Playback speed must be finite and positive".into());
+        }
         #[cfg(target_os = "ios")]
         {
             ios::set_speed(self.id, speed)

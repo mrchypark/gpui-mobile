@@ -19,6 +19,24 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
         LIGHT_SUBTEXT
     };
 
+    let services = div().flex().flex_col().min_w_0().gap_3().child(nav_card(
+        "📍", "GPS", "Track your location",
+        GREEN, card_bg, text_color, sub_text,
+        cx.listener(|this, _event, _window, cx| {
+            this.navigate_to(Screen::Gps);
+            cx.notify();
+        }),
+    ));
+    #[cfg(feature = "ble")]
+    let services = services.child(nav_card(
+        "📶", "Bluetooth", "Find and connect to devices",
+        BLUE, card_bg, text_color, sub_text,
+        cx.listener(|this, _event, _window, cx| {
+            this.navigate_to(Screen::Ble);
+            cx.notify();
+        }),
+    ));
+
     div()
         .flex()
         .flex_col()
@@ -26,6 +44,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
         .gap_4()
         .px_4()
         .py_6()
+        .child(services)
         // ── Welcome banner ───────────────────────────────────────────────
         .child(
             div()
@@ -338,6 +357,7 @@ fn nav_card(
     div()
         .flex()
         .flex_row()
+        .min_w_0()
         .gap_3()
         .p_4()
         .rounded_xl()
@@ -350,6 +370,7 @@ fn nav_card(
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w_0()
                 .gap_1()
                 .child(
                     div()
@@ -360,6 +381,7 @@ fn nav_card(
                 .child(
                     div()
                         .text_xs()
+                        .whitespace_normal()
                         .text_color(rgb(sub_text))
                         .child(description.to_string()),
                 ),

@@ -11,7 +11,7 @@ pub enum AudioFormat {
     /// AAC encoding (.m4a)
     #[default]
     Aac,
-    /// WAV encoding (.wav)
+    /// PCM16 little-endian WAV (.wav); bitrate is sample_rate * channels * 16.
     Wav,
     /// AMR encoding (.amr) — Android only
     Amr,
@@ -26,7 +26,8 @@ pub struct RecordingConfig {
     pub sample_rate: u32,
     /// Number of channels (default: 1 for mono).
     pub channels: u8,
-    /// Bit rate in bits per second (default: 128000).
+    /// AAC/AMR encoder bitrate in bits per second (default: 128000).
+    /// Ignored for PCM16 WAV, whose bitrate follows sample_rate and channels.
     pub bit_rate: u32,
 }
 
@@ -69,6 +70,7 @@ pub fn is_available() -> bool {
 /// Start recording audio with the given configuration.
 /// Returns the path where audio will be saved.
 pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
+    validate_config(config)?;
     #[cfg(target_os = "ios")]
     {
         ios::start_recording(config)
@@ -81,6 +83,50 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
     {
         let _ = config;
         Err("microphone is only available on iOS and Android".into())
+    }
+}
+
+fn validate_config(config: &RecordingConfig) -> Result<(), String> {
+    if config.sample_rate == 0 || config.sample_rate > i32::MAX as u32
+        || !(1..=2).contains(&config.channels)
+        || (config.format != AudioFormat::Wav && (config.bit_rate == 0 || config.bit_rate > i32::MAX as u32))
+    {
+        return Err("Recording requires a positive sample/bit rate and one or two channels".into());
+    }
+    if config.format == AudioFormat::Amr && (config.sample_rate != 8000 || config.channels != 1
+        || ![4750, 5150, 5900, 6700, 7400, 7950, 10200, 12200].contains(&config.bit_rate)) {
+        return Err("AMR-NB requires 8000 Hz mono and a supported 4750–12200 bit/s mode".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recording_config_rejects_invalid_native_arguments() {
+        let mut config = RecordingConfig::default();
+        assert!(validate_config(&config).is_ok());
+        config.sample_rate = u32::MAX;
+        assert!(validate_config(&config).is_err());
+        config.sample_rate = 44100;
+        config.format = AudioFormat::Wav;
+        config.bit_rate = u32::MAX; // Ignored for fixed PCM16 encoding.
+        assert!(validate_config(&config).is_ok());
+        config.format = AudioFormat::Amr;
+        config.sample_rate = 8000; config.channels = 1; config.bit_rate = 12200;
+        assert!(validate_config(&config).is_ok());
+        config.sample_rate = 44100;
+        assert!(validate_config(&config).is_err());
+        config.format = AudioFormat::Aac;
+        config.sample_rate = 0;
+        assert!(validate_config(&config).is_err());
+        config.sample_rate = 44_100;
+        config.channels = 0;
+        assert!(validate_config(&config).is_err());
+        config.channels = 2;
+        config.bit_rate = u32::MAX;
+        assert!(validate_config(&config).is_err());
     }
 }
 
