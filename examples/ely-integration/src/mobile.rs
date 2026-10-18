@@ -4,13 +4,15 @@ use ely_gpui_component::{
 };
 use gpui::{Bounds, Pixels, TouchPhase, point, px, size};
 use gpui_mobile::mobile_events::{AppLifecycle, MobileEvent, SurfaceLifecycle, WindowInsets};
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::{BTreeMap, BTreeSet}, rc::Rc};
 
 pub struct MobileViewport {
     pub view: Viewport,
     pub insets: WindowInsets,
     pub canvas: Bounds<Pixels>,
     contacts: BTreeMap<u64, TouchContact>,
+    active: BTreeSet<u64>,
+    blocked: bool,
     touch: CanvasTouch,
     drag: Option<((f32, f32), Viewport)>,
     pub commits: usize,
@@ -23,6 +25,8 @@ impl Default for MobileViewport {
             insets: WindowInsets::default(),
             canvas: Bounds::default(),
             contacts: BTreeMap::new(),
+            active: BTreeSet::new(),
+            blocked: false,
             touch: CanvasTouch::new(4.),
             drag: None,
             commits: 0,
@@ -101,6 +105,8 @@ impl MobileViewport {
     }
 
     fn cancel(&mut self) {
+        // Keep physical contacts separate from the cancelled recognizer snapshot.
+        self.blocked = !self.active.is_empty();
         let action = self.touch.cancel();
         self.action(action);
         self.contacts.clear();
@@ -110,15 +116,33 @@ impl MobileViewport {
     pub fn event(&mut self, event: &MobileEvent) {
         match event {
             MobileEvent::Insets(insets) => {
-                self.cancel();
-                self.insets = insets.clone();
+                if self.insets != *insets {
+                    self.cancel();
+                    self.insets = insets.clone();
+                }
             }
             MobileEvent::Lifecycle(AppLifecycle::Paused)
-            | MobileEvent::Surface(SurfaceLifecycle::Lost) => self.cancel(),
+            | MobileEvent::Surface(SurfaceLifecycle::Lost) => {
+                self.active.clear();
+                self.cancel();
+            }
             // CanvasTouch owns recognition; the backend's cumulative pinch stream is ignored.
             MobileEvent::Pinch { .. } => {}
             MobileEvent::Touch { event, .. } => {
                 let id = event.id.0;
+                match event.phase {
+                    TouchPhase::Started => {
+                        self.active.insert(id);
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        self.active.remove(&id);
+                    }
+                    _ => {}
+                }
+                if self.blocked {
+                    self.blocked = !self.active.is_empty();
+                    return;
+                }
                 let p = event.position - self.canvas.origin;
                 let contact = TouchContact {
                     id,
@@ -254,6 +278,100 @@ pub fn self_check() {
     final_position.event(&event(40, TouchPhase::Ended, 62., 154.));
     assert_eq!((final_position.view.x, final_position.view.y), (-20., -10.));
     assert_eq!(final_position.commits, 1);
+
+    let mut cancelled = MobileViewport::default();
+    cancelled.canvas = m.canvas;
+    let mut route = GestureRoute::new(7);
+    route.painted = m.canvas;
+    for e in [
+        event(50, TouchPhase::Started, 42., 144.),
+        event(51, TouchPhase::Started, 62., 144.),
+        event(50, TouchPhase::Cancelled, 42., 144.),
+        event(52, TouchPhase::Started, 20., 20.), // outside still belongs to raw sequence
+        event(51, TouchPhase::Ended, 62., 144.),
+        event(52, TouchPhase::Moved, 80., 20.),
+    ] {
+        assert!(route.route(7, &e));
+        cancelled.event(&e);
+    }
+    assert_eq!(route.active, BTreeSet::from([52]));
+    assert_eq!(cancelled.active, BTreeSet::from([52]));
+    assert!(cancelled.blocked);
+    assert!(cancelled.contacts.is_empty());
+    assert!(cancelled.drag.is_none());
+    assert_eq!(cancelled.view, Viewport::new(0., 0., 1.));
+    assert_eq!(cancelled.commits, 0);
+    let release = event(52, TouchPhase::Ended, 80., 20.);
+    assert!(route.route(7, &release));
+    cancelled.event(&release);
+    assert!(!cancelled.blocked);
+    assert_eq!(cancelled.commits, 0);
+    assert!(!route.route(7, &event(53, TouchPhase::Started, 20., 20.)));
+    assert!(!route.route(7, &event(53, TouchPhase::Ended, 20., 20.)));
+    for e in [
+        event(54, TouchPhase::Started, 42., 144.),
+        event(54, TouchPhase::Ended, 62., 154.),
+    ] {
+        assert!(route.route(7, &e));
+        cancelled.event(&e);
+    }
+    assert_eq!(cancelled.commits, 1);
+    assert_eq!((cancelled.view.x, cancelled.view.y), (-20., -10.));
+
+    let mut insets = MobileViewport::default();
+    insets.canvas = m.canvas;
+    insets.event(&event(60, TouchPhase::Started, 42., 144.));
+    insets.event(&event(60, TouchPhase::Moved, 62., 144.));
+    for _ in 0..2 {
+        insets.event(&MobileEvent::Insets(insets.insets.clone()));
+        assert_eq!(insets.view.x, -20.);
+        assert!(insets.drag.is_some());
+        assert!(insets.contacts.contains_key(&60));
+    }
+    let mut changed = insets.insets.clone();
+    changed.safe_area.top = px(24.);
+    insets.event(&MobileEvent::Insets(changed.clone()));
+    assert_eq!(insets.insets, changed);
+    assert_eq!(insets.view.x, 0.); // changed geometry rolls back the preview
+    assert!(insets.blocked);
+    assert!(insets.contacts.is_empty());
+    insets.event(&event(60, TouchPhase::Ended, 82., 144.));
+    assert!(!insets.blocked);
+    assert_eq!(insets.commits, 0);
+    let mut overlay = GestureRoute::new(7);
+    overlay.painted = m.canvas;
+    overlay.menu_open.set(true);
+    assert!(!overlay.route(7, &event(70, TouchPhase::Started, 22., 134.)));
+    // An outside click can close the menu synchronously; its release stays legacy.
+    overlay.menu_open.set(false);
+    assert!(!overlay.route(7, &event(71, TouchPhase::Started, 42., 144.)));
+    assert!(!overlay.route(7, &event(70, TouchPhase::Ended, 22., 134.)));
+    assert!(!overlay.route(7, &event(71, TouchPhase::Cancelled, 42., 144.)));
+    assert!(!overlay.route(7, &event(71, TouchPhase::Moved, 42., 144.)));
+    assert!(overlay.route(7, &event(72, TouchPhase::Started, 22., 134.)));
+    // Opening an overlay cannot steal a raw gesture already owned by the canvas.
+    overlay.menu_open.set(true);
+    assert!(overlay.route(7, &event(73, TouchPhase::Started, 20., 20.)));
+    assert!(overlay.route(7, &event(72, TouchPhase::Cancelled, 22., 134.)));
+    assert!(overlay.route(7, &event(73, TouchPhase::Ended, 20., 20.)));
+    assert!(!overlay.route(7, &event(74, TouchPhase::Started, 22., 134.)));
+    assert!(!overlay.route(7, &event(74, TouchPhase::Ended, 22., 134.)));
+    for teardown in [
+        MobileEvent::Lifecycle(AppLifecycle::Paused),
+        MobileEvent::Surface(SurfaceLifecycle::Lost),
+    ] {
+        overlay.menu_open.set(true);
+        overlay.route(7, &event(75, TouchPhase::Started, 22., 134.));
+        assert!(!overlay.route(7, &teardown));
+        assert!(overlay.menu_open.get());
+        assert!(overlay.active.is_empty());
+        assert!(!overlay.route(7, &event(76, TouchPhase::Started, 22., 134.)));
+        assert!(!overlay.route(7, &event(76, TouchPhase::Ended, 22., 134.)));
+        // Only the actual menu close observer changes overlay ownership.
+        overlay.menu_open.set(false);
+        assert!(overlay.route(7, &event(77, TouchPhase::Started, 22., 134.)));
+        assert!(overlay.route(7, &event(77, TouchPhase::Ended, 22., 134.)));
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +387,7 @@ mod tests {
 pub struct GestureRoute {
     pub owner: u64,
     pub painted: Bounds<Pixels>,
+    pub menu_open: Rc<Cell<bool>>,
     active: std::collections::BTreeSet<u64>,
     raw: bool,
 }
@@ -277,6 +396,7 @@ impl GestureRoute {
         Self {
             owner,
             painted: Bounds::default(),
+            menu_open: Rc::new(Cell::new(false)),
             active: Default::default(),
             raw: false,
         }
@@ -289,20 +409,20 @@ impl GestureRoute {
             MobileEvent::Touch { event, .. } => match event.phase {
                 TouchPhase::Started => {
                     if self.active.is_empty() {
-                        self.raw = self.painted.contains(&event.position);
+                        self.raw = !self.menu_open.get() && self.painted.contains(&event.position);
                     }
                     self.active.insert(event.id.0);
                 }
-                TouchPhase::Ended => {
+                TouchPhase::Ended | TouchPhase::Cancelled => {
                     self.active.remove(&event.id.0);
-                }
-                TouchPhase::Cancelled => {
-                    self.active.clear();
                 }
                 _ => {}
             },
             MobileEvent::Lifecycle(AppLifecycle::Paused)
-            | MobileEvent::Surface(SurfaceLifecycle::Lost) => self.active.clear(),
+            | MobileEvent::Surface(SurfaceLifecycle::Lost) => {
+                self.active.clear();
+                self.raw = false;
+            }
             _ => {}
         }
         self.raw
