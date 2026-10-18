@@ -6,6 +6,7 @@ use ely_gpui_component::{
     buttons::Button,
     canvas::InfiniteCanvas,
     forms::{Input, TextInput},
+    menus::{DropdownMenu, Menu, MenuItem},
 };
 use gpui::{
     App, Bounds, Context, Entity, Focusable, IntoElement, Render, Window, WindowOptions, canvas,
@@ -25,11 +26,14 @@ struct ElyRoot {
     mobile: MobileViewport,
     route: Rc<RefCell<GestureRoute>>,
     input: Entity<TextInput>,
+    second_input: Entity<TextInput>,
     controls_scroll: gpui::ScrollHandle,
     keyboard_reveal: Rc<RefCell<floating_keyboard::RevealState>>,
     _focus_subscriptions: Vec<gpui::Subscription>,
     events: usize,
     resets: usize,
+    menu_selected: Option<usize>,
+    menu_selections: usize,
 }
 impl Render for ElyRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -37,6 +41,37 @@ impl Render for ElyRoot {
             .mobile
             .available(Bounds::new(point(px(0.), px(0.)), window.viewport_size()));
         let header = px(180.).min(available.size.height);
+        let mut submenu = Menu::new();
+        for index in 0..=30 {
+            let owner = cx.entity();
+            let label = if index == 30 {
+                "Last item".to_string()
+            } else {
+                format!("Item {}", index + 1)
+            };
+            submenu = submenu.item(MenuItem::new(label).on_click(move |_, cx| {
+                owner.update(cx, |view, cx| {
+                    view.menu_selected = Some(index);
+                    view.menu_selections += 1;
+                    eprintln!(
+                        "ELY_MENU selected={} count={} canvas_commits={} pan={},{} zoom={}",
+                        index, view.menu_selections, view.mobile.commits,
+                        view.mobile.view.x, view.mobile.view.y, view.mobile.view.zoom
+                    );
+                    cx.notify();
+                });
+            }));
+        }
+        let menu = Menu::new()
+            .usable_bounds(available)
+            .on_open_change({
+                let menu_open = self.route.borrow().menu_open.clone();
+                move |open| {
+                    menu_open.set(open);
+                    eprintln!("ELY_MENU open={open}");
+                }
+            })
+            .item(MenuItem::submenu("30 items + last", submenu));
         let area = Bounds::new(
             available.origin + point(px(0.), header),
             size(
@@ -48,6 +83,9 @@ impl Render for ElyRoot {
         let scroll = self.controls_scroll.clone();
         let keyboard_reveal = self.keyboard_reveal.clone();
         let focus = self.input.read(cx).focus_handle(cx);
+        let second_focus = self.second_input.read(cx).focus_handle(cx);
+        let second_scroll = scroll.clone();
+        let second_reveal = keyboard_reveal.clone();
         let keyboard = if self.mobile.insets.keyboard_visible == Some(false) {
             None
         } else {
@@ -77,6 +115,11 @@ impl Render for ElyRoot {
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .child(DropdownMenu::new("device-menu", "Menu touch probe", menu))
+                    .child(format!(
+                        "Menu selected {:?} · count {} (Last item = 30)",
+                        self.menu_selected, self.menu_selections
+                    ))
                     .child(
                         Button::new("reset", format!("Reset viewport · clicks {}", self.resets))
                             .on_click(cx.listener(|view, _, _, cx| {
@@ -93,6 +136,16 @@ impl Render for ElyRoot {
                             |bounds, _, _| bounds,
                             move |_, field, window, _| {
                                 if keyboard_reveal.borrow_mut().reveal(&scroll, focus.is_focused(window), field, keyboard) {
+                                    window.request_animation_frame();
+                                }
+                            },
+                        ).absolute().top_0().left_0().size_full()))
+                    .child(div().relative().flex_shrink_0()
+                        .child(Input::new(&self.second_input))
+                        .child(canvas(
+                            |bounds, _, _| bounds,
+                            move |_, field, window, _| {
+                                if second_reveal.borrow_mut().reveal(&second_scroll, second_focus.is_focused(window), field, keyboard) {
                                     window.request_animation_frame();
                                 }
                             },
@@ -186,11 +239,33 @@ fn open_window(cx: &mut App) {
         let route = Rc::new(RefCell::new(GestureRoute::new(owner)));
         let root = cx.new(|cx| {
             let input =
-                cx.new(|cx| TextInput::new(window, cx).placeholder("Tap to edit a map label"));
+                cx.new(|cx| TextInput::new(window, cx)
+                    .input_owner_observer(|owner| {
+                        gpui_mobile::mobile_events::report_text_input_owner(
+                            gpui_mobile::mobile_events::TextInputOwner {
+                                window: owner.window.as_u64(),
+                                editor: owner.editor.as_u64(),
+                                activation: owner.activation,
+                            }, owner.focused, owner.disabled,
+                        );
+                    })
+                    .placeholder("A · map label"));
+            let second_input = cx.new(|cx| TextInput::new(window, cx)
+                .input_owner_observer(|owner| {
+                    gpui_mobile::mobile_events::report_text_input_owner(
+                        gpui_mobile::mobile_events::TextInputOwner {
+                            window: owner.window.as_u64(), editor: owner.editor.as_u64(),
+                            activation: owner.activation,
+                        }, owner.focused, owner.disabled,
+                    );
+                }).placeholder("B · second label"));
             let focus = input.read(cx).focus_handle(cx);
+            let second_focus = second_input.read(cx).focus_handle(cx);
             let subscriptions = vec![
                 cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
                 cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+                cx.on_focus(&second_focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&second_focus, window, |_, _, cx| cx.notify()),
             ];
             let controls_scroll = gpui::ScrollHandle::new();
             controls_scroll.set_offset(point(px(0.), px(-180.)));
@@ -198,11 +273,14 @@ fn open_window(cx: &mut App) {
                 mobile: MobileViewport::default(),
                 route: route.clone(),
                 input,
+                second_input,
                 controls_scroll,
                 keyboard_reveal: Default::default(),
                 _focus_subscriptions: subscriptions,
                 events: 0,
                 resets: 0,
+                menu_selected: None,
+                menu_selections: 0,
             }
         });
         let weak = root.downgrade();
