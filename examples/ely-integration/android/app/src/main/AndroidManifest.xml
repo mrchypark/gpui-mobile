@@ -9,15 +9,26 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
     <application android:label="Ely Integration" android:hasCode="true"
         android:hardwareAccelerated="true" android:theme="@style/GpuiTheme">
         <meta-data android:name="com.google.android.geo.API_KEY" android:value="${mapsApiKey}" />
         <service android:name="dev.gpui.mobile.GpuiLocationService"
             android:exported="false" android:foregroundServiceType="location" />
+        <service android:name="org.gpui.mobile.ble.BleConnectionService"
+            android:exported="false" android:foregroundServiceType="connectedDevice" />
         <provider android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.gpui.picker.files"
             android:exported="false" android:grantUriPermissions="true">
