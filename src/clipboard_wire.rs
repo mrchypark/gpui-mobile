@@ -1,5 +1,5 @@
 //! Lossless native clipboard transport (big-endian lengths, UTF-8, raw image bytes).
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat};
 
 pub(super) const FORMATS: &[(ImageFormat, &str, &str)] = &[

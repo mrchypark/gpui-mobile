@@ -29,7 +29,9 @@ pub(crate) fn deliver_ime_key(
         }
         ImeInput::Enter => ("enter".into(), "\n".into(), false),
         ImeInput::Backspace => ("backspace".into(), "\x08".into(), false),
-        ImeInput::DeleteBefore { .. } | ImeInput::Compose { .. } | ImeInput::FinishComposition => return,
+        ImeInput::DeleteBefore { .. } | ImeInput::Compose { .. } | ImeInput::FinishComposition => {
+            return
+        }
     };
     if prefer_character_input && legacy(&text) {
         return;
@@ -125,7 +127,9 @@ impl<T> Default for Callback<T> {
     }
 }
 impl<T> Callback<T> {
-    pub fn generation(&self) -> u64 { self.generation.get() }
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
     pub fn take(&self) -> Option<T> {
         self.generation.set(self.generation.get().wrapping_add(1));
         self.value.borrow_mut().take()

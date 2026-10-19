@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 pub(super) fn encode(username: &str, password: &[u8]) -> Result<Vec<u8>> {
     let length = u32::try_from(username.len())?;

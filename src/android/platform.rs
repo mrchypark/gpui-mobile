@@ -42,16 +42,16 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
+        Arc,
     },
 };
 
 use super::{
-    AndroidBackend,
     dispatcher::AndroidDispatcher,
     display::{AndroidDisplay, DisplayList},
     window::{AndroidWindow, WindowList},
+    AndroidBackend,
 };
 use gpui_wgpu::GpuContext;
 
@@ -1018,7 +1018,8 @@ impl AndroidPlatform {
     fn register_thermal_listener(&self, callback: Box<dyn FnMut()>) {
         let generation = super::jni::begin_thermal_listener();
         assert!(generation > 0, "Thermal generation exhausted");
-        self.thermal_registration.store(generation, Ordering::Release);
+        self.thermal_registration
+            .store(generation, Ordering::Release);
         let registration = self.thermal_registration.clone();
         let send_callback: Box<dyn FnMut() + Send> =
             unsafe { std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback) };
@@ -1029,32 +1030,51 @@ impl AndroidPlatform {
             state.thermal_generation = generation;
         }
         java_main_task(<Self as Platform>::background_executor(self), move |env| {
-            if registration.load(Ordering::Acquire) != generation { return Ok(()); }
+            if registration.load(Ordering::Acquire) != generation {
+                return Ok(());
+            }
             use crate::android::jni::{self as bridge, JniExt};
             use jni::objects::JValue;
             let activity = bridge::activity(env)?;
             let class = bridge::find_app_class(env, "dev.gpui.mobile.GpuiThermal")?;
-            let started = env.call_static_method(&class, jni::jni_str!("register"),
-                jni::jni_sig!("(Landroid/app/Activity;J)Z"),
-                &[JValue::Object(&activity), JValue::Long(generation)]).e()?.z().e()?;
+            let started = env
+                .call_static_method(
+                    &class,
+                    jni::jni_str!("register"),
+                    jni::jni_sig!("(Landroid/app/Activity;J)Z"),
+                    &[JValue::Object(&activity), JValue::Long(generation)],
+                )
+                .e()?
+                .z()
+                .e()?;
             if !started {
                 bridge::end_thermal_listener(generation);
-                log::debug!("Thermal listener unavailable (API<29, stale registration, or inactive host)");
+                log::debug!(
+                    "Thermal listener unavailable (API<29, stale registration, or inactive host)"
+                );
             }
             Ok(())
-        }).detach();
+        })
+        .detach();
     }
 
     /// Volta's JNI queue calls this on the native owner after releasing queue locks.
     pub(crate) fn deliver_thermal_status(&self, generation: i64, status: i32) {
         let mut callback = {
             let mut state = self.state.lock();
-            if generation != state.thermal_generation || generation <= 0
-                || !(0..=6).contains(&status) || state.thermal_status == status { return; }
+            if generation != state.thermal_generation
+                || generation <= 0
+                || !(0..=6).contains(&status)
+                || state.thermal_status == status
+            {
+                return;
+            }
             state.thermal_status = status;
             state.thermal_callback.take()
         };
-        if let Some(callback) = callback.as_mut() { callback(); }
+        if let Some(callback) = callback.as_mut() {
+            callback();
+        }
         let mut state = self.state.lock();
         if state.thermal_generation == generation && state.thermal_callback.is_none() {
             state.thermal_callback = callback;
@@ -1094,12 +1114,22 @@ impl AndroidPlatform {
             let result = (|| {
                 let activity = bridge::activity(env)?;
                 let class = bridge::find_app_class(env, "dev.gpui.mobile.GpuiThermal")?;
-                env.call_static_method(&class, jni::jni_str!("currentStatus"),
-                    jni::jni_sig!("(Landroid/app/Activity;)I"), &[JValue::Object(&activity)]).e()?.i().e()
+                env.call_static_method(
+                    &class,
+                    jni::jni_str!("currentStatus"),
+                    jni::jni_sig!("(Landroid/app/Activity;)I"),
+                    &[JValue::Object(&activity)],
+                )
+                .e()?
+                .i()
+                .e()
             })();
-            if result.is_err() { let _ = env.exception_clear(); }
+            if result.is_err() {
+                let _ = env.exception_clear();
+            }
             result
-        }).unwrap_or(-1)
+        })
+        .unwrap_or(-1)
     }
     /// Preferred wgpu backend.
     pub fn preferred_backend(&self) -> AndroidBackend {
@@ -1640,9 +1670,15 @@ impl Platform for AndroidPlatform {
             let state = self.state.lock();
             if state.thermal_callback.is_none() && state.thermal_generation > 0 {
                 state.thermal_status
-            } else { -1 }
+            } else {
+                -1
+            }
         };
-        let status = if observed >= 0 { observed } else { self.query_thermal_status_via_jni() };
+        let status = if observed >= 0 {
+            observed
+        } else {
+            self.query_thermal_status_via_jni()
+        };
         match status {
             1 => ThermalState::Fair,
             2 | 3 => ThermalState::Serious,
@@ -2076,7 +2112,9 @@ mod tests {
         {
             let mut state = platform.state.lock();
             state.thermal_generation = 7;
-            state.thermal_callback = Some(Box::new(move || { counter.fetch_add(1, Ordering::Relaxed); }));
+            state.thermal_callback = Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }));
         }
         for (generation, status) in [(6, 3), (7, -1), (7, 7), (7, 3), (7, 3), (7, 0)] {
             platform.deliver_thermal_status(generation, status);
@@ -2098,7 +2136,10 @@ mod tests {
             state.thermal_generation = 9;
             state.thermal_callback = Some(Box::new(move || {
                 let platform = weak.upgrade().unwrap();
-                let mut state = platform.state.try_lock().expect("callback ran under platform lock");
+                let mut state = platform
+                    .state
+                    .try_lock()
+                    .expect("callback ran under platform lock");
                 assert_eq!(state.thermal_status, 4);
                 state.thermal_generation = 10;
                 state.thermal_callback = Some(Box::new(|| {}));
