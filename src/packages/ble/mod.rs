@@ -17,14 +17,19 @@ pub use btleplug::{Error, Result};
 mod android;
 #[cfg(target_os = "android")]
 pub use android::init_android;
-mod state;
-mod convenience;
 mod background;
+mod convenience;
+mod state;
 pub use convenience::{ScanOptions, ScanResult};
 pub mod demo;
-pub mod qcy;
-#[cfg(all(target_os = "android", debug_assertions, feature = "location", feature = "permission_handler"))]
+#[cfg(all(
+    target_os = "android",
+    debug_assertions,
+    feature = "location",
+    feature = "permission_handler"
+))]
 mod device_probe;
+pub mod qcy;
 pub use state::Permission;
 use state::State;
 
@@ -149,9 +154,15 @@ impl Ble {
 
     pub async fn start_scan(&mut self, filter: ScanFilter) -> Result<()> {
         self.ready().await?;
-        if self.in_background { return Err(Error::NotSupported("Scanning requires foreground use".into())); }
+        if self.in_background {
+            return Err(Error::NotSupported(
+                "Scanning requires foreground use".into(),
+            ));
+        }
         if self.scanning {
-            return Err(Error::NotSupported("stop the existing scan before starting another".into()));
+            return Err(Error::NotSupported(
+                "stop the existing scan before starting another".into(),
+            ));
         }
         // Mark before awaiting: cancellation leaves cleanup necessary.
         self.scanning = true;
@@ -289,7 +300,9 @@ impl Ble {
         }
         self.peripheral = None;
         self.state.recovery_needed = false;
-        if let Some(lease) = &mut self.background { lease.release()?; }
+        if let Some(lease) = &mut self.background {
+            lease.release()?;
+        }
         self.background.take();
         Ok(())
     }
@@ -384,7 +397,9 @@ impl Ble {
         // Stop the notification/service even if native disconnect failed; errors
         // remain observable and the connection handle stays available for retry.
         if let Some(lease) = &mut self.background {
-            if let Err(error) = lease.release() { errors.push(error); }
+            if let Err(error) = lease.release() {
+                errors.push(error);
+            }
         }
         self.background.take();
         errors
@@ -395,15 +410,25 @@ impl Ble {
     /// No process-death restoration, background scanning, or implicit reconnect.
     pub async fn enable_background_connected(&mut self) -> Result<()> {
         self.ready().await?;
-        if self.in_background { return Err(Error::NotSupported("Enable background BLE while visible".into())); }
+        if self.in_background {
+            return Err(Error::NotSupported(
+                "Enable background BLE while visible".into(),
+            ));
+        }
         let p = self.peripheral.as_ref().ok_or(Error::NotConnected)?;
-        if !deadline(self.timeout, p.is_connected()).await? { return Err(Error::NotConnected); }
-        if self.background.is_none() { self.background = Some(background::Lease::acquire().await?); }
+        if !deadline(self.timeout, p.is_connected()).await? {
+            return Err(Error::NotConnected);
+        }
+        if self.background.is_none() {
+            self.background = Some(background::Lease::acquire().await?);
+        }
         Ok(())
     }
 
     pub fn check_background(&self) -> Result<()> {
-        if let Some(lease) = &self.background { lease.check()?; }
+        if let Some(lease) = &self.background {
+            lease.check()?;
+        }
         Ok(())
     }
 }
