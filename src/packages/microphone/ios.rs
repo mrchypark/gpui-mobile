@@ -78,8 +78,13 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
         ];
         if config.format == AudioFormat::Wav {
             let _: () = msg_send![settings, removeObjectForKey: nsstring("AVEncoderBitRateKey")];
-            for (key, value) in [("AVLinearPCMBitDepthKey", 16), ("AVLinearPCMIsFloatKey", 0), ("AVLinearPCMIsBigEndianKey", 0)] {
-                let _: () = msg_send![settings, setObject: number_with_int(value), forKey: nsstring(key)];
+            for (key, value) in [
+                ("AVLinearPCMBitDepthKey", 16),
+                ("AVLinearPCMIsFloatKey", 0),
+                ("AVLinearPCMIsBigEndianKey", 0),
+            ] {
+                let _: () =
+                    msg_send![settings, setObject: number_with_int(value), forKey: nsstring(key)];
             }
         }
 
@@ -207,7 +212,9 @@ pub fn get_amplitude() -> Result<f64, String> {
     let state = guard.as_ref().ok_or("Not recording")?;
     unsafe {
         let recording: bool = msg_send![state.recorder, isRecording];
-        if !recording { return Ok(0.0); }
+        if !recording {
+            return Ok(0.0);
+        }
         let _: () = msg_send![state.recorder, updateMeters];
         let level: f32 = msg_send![state.recorder, averagePowerForChannel: 0i64];
         // Convert from dB (range: -160 to 0) to linear (0.0 to 1.0)

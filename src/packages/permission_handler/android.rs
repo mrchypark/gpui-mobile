@@ -124,9 +124,14 @@ pub fn request_permissions(
         }
 
         let result_str = jni_helpers::get_string(env, &result);
-        if permissions.is_empty() { return Ok(Vec::new()); }
-        let statuses = result_str.split('|').map(str::parse::<i32>)
-            .collect::<Result<Vec<_>, _>>().map_err(|e| format!("Invalid permission result: {e}"))?;
+        if permissions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let statuses = result_str
+            .split('|')
+            .map(str::parse::<i32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Invalid permission result: {e}"))?;
         if statuses.len() != permissions.len() {
             return Err("Permission result count does not match the request".into());
         }

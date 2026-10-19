@@ -142,16 +142,22 @@ pub fn get_directory_path(initial_directory: Option<&str>) -> Result<Option<Stri
 }
 
 /// Internal GPUI adapter: return usable filesystem paths, never SAF URIs.
-pub(crate) fn prompt_paths(options: gpui::PathPromptOptions) -> Result<Option<Vec<std::path::PathBuf>>, String> {
+pub(crate) fn prompt_paths(
+    options: gpui::PathPromptOptions,
+) -> Result<Option<Vec<std::path::PathBuf>>, String> {
     if !options.files || options.directories {
         return Err("Mobile GPUI path prompts support files only; directory grants are not filesystem paths".into());
     }
     let files = if options.multiple {
         open_files(&OpenFileOptions::default())?
     } else {
-        open_file(&OpenFileOptions::default())?.into_iter().collect()
+        open_file(&OpenFileOptions::default())?
+            .into_iter()
+            .collect()
     };
-    if files.is_empty() { return Ok(None); }
+    if files.is_empty() {
+        return Ok(None);
+    }
     let mut paths = Vec::with_capacity(files.len());
     for file in files {
         let path = std::path::PathBuf::from(file.path);
@@ -163,6 +169,9 @@ pub(crate) fn prompt_paths(options: gpui::PathPromptOptions) -> Result<Option<Ve
     Ok(Some(paths))
 }
 
-pub(crate) fn prompt_new_path(_directory: &std::path::Path, _suggested_name: Option<&str>) -> Result<Option<std::path::PathBuf>, String> {
+pub(crate) fn prompt_new_path(
+    _directory: &std::path::Path,
+    _suggested_name: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
     Err("Mobile save dialogs require export contents or a ContentResolver URI; GPUI's filesystem PathBuf cannot safely represent that contract".into())
 }

@@ -62,9 +62,12 @@ pub fn pick_multi_image(
                 &cls,
                 jni::jni_str!("pickMultiImage"),
                 jni::jni_sig!("(Landroid/app/Activity;DDI)[Ljava/lang/String;"),
-                &[JValue::Object(&activity), JValue::Double(max_width.unwrap_or(0.0)),
+                &[
+                    JValue::Object(&activity),
+                    JValue::Double(max_width.unwrap_or(0.0)),
                     JValue::Double(max_height.unwrap_or(0.0)),
-                    JValue::Int(image_quality.map(i32::from).unwrap_or(-1))],
+                    JValue::Int(image_quality.map(i32::from).unwrap_or(-1)),
+                ],
             )
             .and_then(|v| v.l())
             .map_err(|e| {

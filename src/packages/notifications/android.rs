@@ -25,6 +25,16 @@ pub fn initialize() -> Result<(), String> {
 }
 
 pub fn show(notification: &Notification) -> Result<(), String> {
+    #[cfg(feature = "permission_handler")]
+    {
+        let status = crate::packages::permission_handler::check_permission(
+            crate::packages::permission_handler::Permission::Notification,
+        )?;
+        if !status.is_granted() {
+            return Err("notification permission not granted".into());
+        }
+    }
+
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;

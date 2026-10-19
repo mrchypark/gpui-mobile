@@ -47,7 +47,9 @@ pub fn is_available() -> Result<bool, String> {
     launcher::can_launch_url("maps://")
 }
 
-fn open_url(url: &str) -> Result<bool, String> { launcher::launch_url(url) }
+fn open_url(url: &str) -> Result<bool, String> {
+    launcher::launch_url(url)
+}
 /// Simple percent-encoding for URL query parameters.
 fn percent_encode(input: &str) -> String {
     let mut result = String::with_capacity(input.len() * 2);

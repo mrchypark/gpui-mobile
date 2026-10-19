@@ -87,14 +87,19 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
 }
 
 fn validate_config(config: &RecordingConfig) -> Result<(), String> {
-    if config.sample_rate == 0 || config.sample_rate > i32::MAX as u32
+    if config.sample_rate == 0
+        || config.sample_rate > i32::MAX as u32
         || !(1..=2).contains(&config.channels)
-        || (config.format != AudioFormat::Wav && (config.bit_rate == 0 || config.bit_rate > i32::MAX as u32))
+        || (config.format != AudioFormat::Wav
+            && (config.bit_rate == 0 || config.bit_rate > i32::MAX as u32))
     {
         return Err("Recording requires a positive sample/bit rate and one or two channels".into());
     }
-    if config.format == AudioFormat::Amr && (config.sample_rate != 8000 || config.channels != 1
-        || ![4750, 5150, 5900, 6700, 7400, 7950, 10200, 12200].contains(&config.bit_rate)) {
+    if config.format == AudioFormat::Amr
+        && (config.sample_rate != 8000
+            || config.channels != 1
+            || ![4750, 5150, 5900, 6700, 7400, 7950, 10200, 12200].contains(&config.bit_rate))
+    {
         return Err("AMR-NB requires 8000 Hz mono and a supported 4750–12200 bit/s mode".into());
     }
     Ok(())
@@ -114,7 +119,9 @@ mod tests {
         config.bit_rate = u32::MAX; // Ignored for fixed PCM16 encoding.
         assert!(validate_config(&config).is_ok());
         config.format = AudioFormat::Amr;
-        config.sample_rate = 8000; config.channels = 1; config.bit_rate = 12200;
+        config.sample_rate = 8000;
+        config.channels = 1;
+        config.bit_rate = 12200;
         assert!(validate_config(&config).is_ok());
         config.sample_rate = 44100;
         assert!(validate_config(&config).is_err());

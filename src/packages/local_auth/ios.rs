@@ -97,10 +97,16 @@ pub fn get_available_biometrics() -> Result<Vec<BiometricType>, String> {
 pub fn authenticate(reason: &str) -> Result<AuthResult, String> {
     objc2::rc::autoreleasepool(|_| unsafe {
         let main: bool = msg_send![class!(NSThread), isMainThread];
-        if main { return Err("Call authenticate from a worker thread".into()); }
-        if reason.trim().is_empty() { return Err("Authentication reason must not be empty".into()); }
+        if main {
+            return Err("Call authenticate from a worker thread".into());
+        }
+        if reason.trim().is_empty() {
+            return Err("Authentication reason must not be empty".into());
+        }
         let context = create_la_context();
-        if context.is_null() { return Err("Failed to create LAContext".into()); }
+        if context.is_null() {
+            return Err("Failed to create LAContext".into());
+        }
         let mut error: *mut AnyObject = std::ptr::null_mut();
         let can_evaluate: bool = msg_send![context,
             canEvaluatePolicy: LA_POLICY_DEVICE_OWNER_AUTHENTICATION_WITH_BIOMETRICS,
@@ -120,7 +126,8 @@ pub fn authenticate(reason: &str) -> Result<AuthResult, String> {
         let _: () = msg_send![context,
             evaluatePolicy: LA_POLICY_DEVICE_OWNER_AUTHENTICATION_WITH_BIOMETRICS,
             localizedReason: reason, reply: &*reply];
-        let result = receiver.recv_timeout(std::time::Duration::from_secs(120))
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(120))
             .map_err(|_| "Authentication timed out or callback disconnected".to_owned());
         let _: () = msg_send![context, invalidate];
         let _: () = msg_send![context, release];
@@ -129,8 +136,12 @@ pub fn authenticate(reason: &str) -> Result<AuthResult, String> {
 }
 
 unsafe fn auth_result(success: bool, error: *mut AnyObject) -> AuthResult {
-    if success { return AuthResult::Success; }
-    if error.is_null() { return AuthResult::Failed; }
+    if success {
+        return AuthResult::Success;
+    }
+    if error.is_null() {
+        return AuthResult::Failed;
+    }
     let code: i64 = msg_send![error, code];
     match code {
         LA_ERROR_AUTHENTICATION_FAILED => AuthResult::Failed,

@@ -134,5 +134,7 @@ pub fn cancel_all() -> Result<(), String> {
 }
 
 mod system;
-pub(crate) use system::{show_system_notification, dismiss_system_notification,
-    take_system_notification_responses, poll_system_notification_responses};
+pub(crate) use system::{
+    dismiss_system_notification, poll_system_notification_responses, show_system_notification,
+    take_system_notification_responses,
+};
