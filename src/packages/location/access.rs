@@ -45,9 +45,17 @@ pub fn request_location_access() -> Result<LocationAccess, String> {
 
 pub(super) fn request_permission(always: bool) -> Result<PermissionStatus, String> {
     #[cfg(target_os = "ios")]
-    { super::ios::request_permission(always) }
+    {
+        super::ios::request_permission(always)
+    }
     #[cfg(not(target_os = "ios"))]
-    { permission_handler::request_permission(if always { Permission::LocationAlways } else { Permission::LocationWhenInUse }) }
+    {
+        permission_handler::request_permission(if always {
+            Permission::LocationAlways
+        } else {
+            Permission::LocationWhenInUse
+        })
+    }
 }
 
 #[cfg(test)]
@@ -55,13 +63,28 @@ mod tests {
     use super::*;
     #[test]
     fn grant_does_not_override_disabled_service_or_restriction() {
-        for permission in [PermissionStatus::Granted, PermissionStatus::Denied,
-            PermissionStatus::Restricted, PermissionStatus::PermanentlyDenied] {
-            let access = LocationAccess { service_enabled: false, permission };
+        for permission in [
+            PermissionStatus::Granted,
+            PermissionStatus::Denied,
+            PermissionStatus::Restricted,
+            PermissionStatus::PermanentlyDenied,
+        ] {
+            let access = LocationAccess {
+                service_enabled: false,
+                permission,
+            };
             assert!(!access.can_request_position());
             assert!(access.guidance().contains("Enable Location Services"));
         }
-        assert!(!LocationAccess { service_enabled: true, permission: PermissionStatus::Restricted }.can_request_position());
-        assert!(LocationAccess { service_enabled: true, permission: PermissionStatus::Granted }.can_request_position());
+        assert!(!LocationAccess {
+            service_enabled: true,
+            permission: PermissionStatus::Restricted
+        }
+        .can_request_position());
+        assert!(LocationAccess {
+            service_enabled: true,
+            permission: PermissionStatus::Granted
+        }
+        .can_request_position());
     }
 }

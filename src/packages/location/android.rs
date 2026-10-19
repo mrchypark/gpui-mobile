@@ -49,7 +49,14 @@ pub fn get_last_known_position() -> Result<Option<Position>, String> {
         super::stream::parse_position(&helpers::get_string(env, &value)).map(Some)
     })
 }
-pub(super) fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms: u64, background: bool, previous: u64) -> Result<(), String> {
+pub(super) fn start(
+    id: u64,
+    settings: &LocationSettings,
+    once: bool,
+    timeout_ms: u64,
+    background: bool,
+    previous: u64,
+) -> Result<(), String> {
     let accuracy = match settings.accuracy {
         LocationAccuracy::Lowest => 0,
         LocationAccuracy::Low => 1,

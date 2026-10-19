@@ -17,7 +17,10 @@ pub enum LocationPermission {
 #[derive(Debug, Clone)]
 pub enum LocationEvent {
     /// Native update registration returned successfully; not a position fix.
-    Ready { provider: String, background: bool },
+    Ready {
+        provider: String,
+        background: bool,
+    },
     Paused,
     Permission(LocationPermission),
     Position(Position),
@@ -39,8 +42,14 @@ pub struct LocationSubscription {
     background: bool,
 }
 impl LocationSubscription {
-    #[cfg(any(test, all(target_os = "ios", target_env = "sim", debug_assertions), all(target_os = "android", debug_assertions)))]
-    pub(super) fn test_token(&self) -> u64 { self.receiver.id }
+    #[cfg(any(
+        test,
+        all(target_os = "ios", target_env = "sim", debug_assertions),
+        all(target_os = "android", debug_assertions)
+    ))]
+    pub(super) fn test_token(&self) -> u64 {
+        self.receiver.id
+    }
     pub fn cancel(&mut self) {
         if !self.stopped {
             self.receiver.close();
@@ -54,7 +63,14 @@ impl LocationSubscription {
         if self.stopped || self.receiver.is_closed() {
             return Err("Subscription cancelled".into());
         }
-        start(self.receiver.id, &self.settings, false, 0, self.background, self.receiver.id)
+        start(
+            self.receiver.id,
+            &self.settings,
+            false,
+            0,
+            self.background,
+            self.receiver.id,
+        )
     }
     /// Replace watch settings and discard queued samples from the old watch.
     /// Invalid settings leave the current watch unchanged. Native failures arrive as events.
@@ -91,10 +107,18 @@ pub fn watch_position(settings: &LocationSettings) -> Result<LocationSubscriptio
 /// Explicit background tracking. Start while the app is visible after granting
 /// location permission. Requires native background capabilities; failures are events.
 /// This does not request Always authorization or restart after process termination.
-pub fn watch_position_background(settings: &LocationSettings) -> Result<LocationSubscription, String> {
+pub fn watch_position_background(
+    settings: &LocationSettings,
+) -> Result<LocationSubscription, String> {
     subscribe(settings, false, 0, true, 0)
 }
-fn subscribe(settings: &LocationSettings, once: bool, timeout_ms: u64, background: bool, previous: u64) -> Result<LocationSubscription, String> {
+fn subscribe(
+    settings: &LocationSettings,
+    once: bool,
+    timeout_ms: u64,
+    background: bool,
+    previous: u64,
+) -> Result<LocationSubscription, String> {
     if !settings.distance_filter.is_finite()
         || settings.distance_filter < 0.0
         || settings.distance_filter > f32::MAX as f64
@@ -107,7 +131,14 @@ fn subscribe(settings: &LocationSettings, once: bool, timeout_ms: u64, backgroun
         stopped: false,
         background,
     };
-    start(subscription.receiver.id, settings, once, timeout_ms, background, previous)?;
+    start(
+        subscription.receiver.id,
+        settings,
+        once,
+        timeout_ms,
+        background,
+        previous,
+    )?;
     Ok(subscription)
 }
 /// One fresh fix; native backends enforce a 30-second timeout. Dropping this
@@ -144,7 +175,14 @@ async fn first_position(mut subscription: LocationSubscription) -> Result<Positi
     }
     Err("Location subscription ended".into())
 }
-fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms: u64, background: bool, previous: u64) -> Result<(), String> {
+fn start(
+    id: u64,
+    settings: &LocationSettings,
+    once: bool,
+    timeout_ms: u64,
+    background: bool,
+    previous: u64,
+) -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {
         return super::ios::start(id, settings, once, timeout_ms, background, previous);
@@ -158,9 +196,13 @@ fn start(id: u64, settings: &LocationSettings, once: bool, timeout_ms: u64, back
         let _ = (id, settings, once, timeout_ms, background, previous);
         // Host unit tests exercise mailbox ownership without a native runtime.
         #[cfg(test)]
-        { Ok(()) }
+        {
+            Ok(())
+        }
         #[cfg(not(test))]
-        { Err("Location not supported on this platform".into()) }
+        {
+            Err("Location not supported on this platform".into())
+        }
     }
 }
 fn stop(id: u64) {
@@ -269,17 +311,27 @@ mod tests {
         let mut subscription = test_subscription();
         let old = subscription.receiver.id;
         events::send(old, "permission|denied".into());
-        let invalid = LocationSettings { distance_filter: f64::NAN, ..Default::default() };
+        let invalid = LocationSettings {
+            distance_filter: f64::NAN,
+            ..Default::default()
+        };
         assert!(subscription.reconfigure(&invalid).is_err());
         assert_eq!(subscription.receiver.id, old);
-        subscription.reconfigure(&LocationSettings { distance_filter: 12.0, ..Default::default() }).unwrap();
+        subscription
+            .reconfigure(&LocationSettings {
+                distance_filter: 12.0,
+                ..Default::default()
+            })
+            .unwrap();
         assert_ne!(subscription.receiver.id, old);
         assert_eq!(subscription.settings.distance_filter, 12.0);
         assert!(!events::send(old, "permission|denied".into()));
         assert!(subscription.next().now_or_never().is_none());
         subscription.cancel();
         subscription.cancel();
-        assert!(subscription.reconfigure(&LocationSettings::default()).is_err());
+        assert!(subscription
+            .reconfigure(&LocationSettings::default())
+            .is_err());
     }
     #[test]
     fn pending_one_shot_drop_and_timeout_close_mailbox() {
@@ -292,14 +344,27 @@ mod tests {
         let subscription = test_subscription();
         let id = subscription.receiver.id;
         events::send(id, "error|timeout|deadline".into());
-        assert!(first_position(subscription).now_or_never().unwrap().unwrap_err().starts_with("timeout:"));
+        assert!(first_position(subscription)
+            .now_or_never()
+            .unwrap()
+            .unwrap_err()
+            .starts_with("timeout:"));
         assert!(!events::send(id, "permission|precise".into()));
     }
     #[test]
     fn invalid_timeout_is_rejected_before_native_start() {
-        for timeout in [Duration::ZERO, Duration::from_nanos(1), Duration::from_secs(86_401)] {
-            assert!(get_current_position_with_timeout(&LocationSettings::default(), timeout)
-                .now_or_never().unwrap().unwrap_err().starts_with("timeout must"));
+        for timeout in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_secs(86_401),
+        ] {
+            assert!(
+                get_current_position_with_timeout(&LocationSettings::default(), timeout)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap_err()
+                    .starts_with("timeout must")
+            );
         }
     }
     #[test]
@@ -354,7 +419,9 @@ mod tests {
     }
     #[test]
     fn permission_recovery_parses_and_continues() {
-        assert!(matches!(parse_event("ready|background|gps"), LocationEvent::Ready { background: true, provider } if provider == "gps"));
+        assert!(
+            matches!(parse_event("ready|background|gps"), LocationEvent::Ready { background: true, provider } if provider == "gps")
+        );
         assert!(matches!(parse_event("paused|"), LocationEvent::Paused));
         assert!(matches!(
             parse_event("permission|denied"),
