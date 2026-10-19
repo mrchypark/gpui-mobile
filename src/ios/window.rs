@@ -20,11 +20,11 @@ use crate::mobile_events::{
 };
 use crate::momentum::{MomentumScroller, VelocityTracker};
 use gpui::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, Capslock,
-    DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, Scene, Size, TileId, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowParams, point, px, size,
+    point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
+    Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -64,33 +64,60 @@ unsafe fn inside_native_ime_edit(this: *mut AnyObject) -> bool {
 unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, before_edit: bool) {
     let native: *mut AnyObject = msg_send![this, text];
     let utf8: *const i8 = msg_send![native, UTF8String];
-    let native = if utf8.is_null() { String::new() } else {
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+    let native = if utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
     };
     // UIKit can mutate textStorage directly before invoking insertText. Verify
     // the last acknowledged document, not this partially applied native edit.
-    let expected = if before_edit { window.proxy_text.borrow().clone() } else { native.clone() };
-    let (context, matches) = window.input_handler.call(|| !window.closed.get(), |handler| {
-        let (accepts, owner) = mobile_events::query_text_input_owner(|| handler.query_accepts_text_input());
-        if !accepts { return (None, false); }
-        let context = handler.selected_text_range(false).map(|selection| (owner, selection.range));
-        let matches = window.proxy_base.get().and_then(|base| {
-            let end = base.checked_add(expected.encode_utf16().count())?;
-            let range = base..end;
-            let mut adjusted = None;
-            let actual = handler.text_for_range(range.clone(), &mut adjusted)?;
-            Some(actual == expected && adjusted.is_none_or(|adjusted| adjusted == range))
-        }).unwrap_or(false);
-        (context, matches)
-    }).unwrap_or((None, false));
+    let expected = if before_edit {
+        window.proxy_text.borrow().clone()
+    } else {
+        native.clone()
+    };
+    let (context, matches) = window
+        .input_handler
+        .call(
+            || !window.closed.get(),
+            |handler| {
+                let (accepts, owner) =
+                    mobile_events::query_text_input_owner(|| handler.query_accepts_text_input());
+                if !accepts {
+                    return (None, false);
+                }
+                let context = handler
+                    .selected_text_range(false)
+                    .map(|selection| (owner, selection.range));
+                let matches = window
+                    .proxy_base
+                    .get()
+                    .and_then(|base| {
+                        let end = base.checked_add(expected.encode_utf16().count())?;
+                        let range = base..end;
+                        let mut adjusted = None;
+                        let actual = handler.text_for_range(range.clone(), &mut adjusted)?;
+                        Some(
+                            actual == expected && adjusted.is_none_or(|adjusted| adjusted == range),
+                        )
+                    })
+                    .unwrap_or(false);
+                (context, matches)
+            },
+        )
+        .unwrap_or((None, false));
     let changed = *window.proxy_context.borrow() != context;
-    let owner_changed = window.proxy_context.borrow().as_ref().map(|c| c.0)
-        != context.as_ref().map(|c| c.0);
+    let owner_changed =
+        window.proxy_context.borrow().as_ref().map(|c| c.0) != context.as_ref().map(|c| c.0);
     if (before_edit && changed) || owner_changed || !matches {
         native_ime_edit(this, || {
             let _: () = msg_send![this, setText: ptr::null_mut::<AnyObject>()];
         });
-        window.proxy_base.set(context.as_ref().map(|(_, range)| range.start));
+        window
+            .proxy_base
+            .set(context.as_ref().map(|(_, range)| range.start));
         window.proxy_mapping_valid.set(false);
         window.proxy_text.borrow_mut().clear();
     } else if !before_edit {
@@ -105,10 +132,19 @@ unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, befo
 // Describe one whole native edit, including textStorage mutations that precede
 // an overridden callback. Offsets are UTF-16; comparison boundaries are scalars.
 fn native_text_edit<'a>(before: &str, after: &'a str) -> (std::ops::Range<usize>, &'a str) {
-    let prefix = before.chars().zip(after.chars()).take_while(|(a, b)| a == b)
-        .map(|(ch, _)| ch.len_utf8()).sum::<usize>();
-    let suffix = before[prefix..].chars().rev().zip(after[prefix..].chars().rev())
-        .take_while(|(a, b)| a == b).map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    let prefix = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum::<usize>();
+    let suffix = before[prefix..]
+        .chars()
+        .rev()
+        .zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum::<usize>();
     let start = before[..prefix].encode_utf16().count();
     let end = before[..before.len() - suffix].encode_utf16().count();
     (start..end, &after[prefix..after.len() - suffix])
@@ -716,7 +752,12 @@ pub(crate) struct IosWindowInner {
     scale_factor: Cell<f32>,
     /// Input handler for text input
     input_handler: Callback<PlatformInputHandler>,
-    proxy_context: RefCell<Option<(Option<mobile_events::TextInputOwner>, std::ops::Range<usize>)>>,
+    proxy_context: RefCell<
+        Option<(
+            Option<mobile_events::TextInputOwner>,
+            std::ops::Range<usize>,
+        )>,
+    >,
     proxy_base: Cell<Option<usize>>,
     proxy_mapping_valid: Cell<bool>,
     proxy_text: RefCell<String>,
