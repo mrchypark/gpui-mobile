@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 
 use gpui::{div, prelude::*, px, rgb};
+use gpui_mobile::components::platform_view_element::platform_view_element;
 
 use super::{Router, BLUE, GREEN, LIGHT_CARD_BG, LIGHT_TEXT, RED, SURFACE0, SURFACE1, TEXT};
 
@@ -16,6 +17,7 @@ const APP_BAR_HEIGHT: f32 = 56.0;
 /// Thread-local state for the in-app WebView, decoupled from Router.
 pub struct WebViewState {
     pub url: String,
+    pub status: String,
     pub handle: Option<gpui_mobile::packages::webview::WebViewHandle>,
 }
 
@@ -23,6 +25,7 @@ impl Default for WebViewState {
     fn default() -> Self {
         Self {
             url: String::new(),
+            status: "Tap a link above to open the in-app browser".into(),
             handle: None,
         }
     }
@@ -40,8 +43,10 @@ pub fn dismiss_webview() -> bool {
         let mut state = s.borrow_mut();
         if let Some(handle) = state.handle.take() {
             let _ = gpui_mobile::packages::webview::dismiss(handle);
+            state.status = "WebView closed".into();
             true
         } else {
+            state.status = "Tap a link above to open the in-app browser".into();
             false
         }
     })
@@ -53,9 +58,14 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
     let card_bg = if dark { SURFACE0 } else { LIGHT_CARD_BG };
     let toolbar_bg = if dark { SURFACE1 } else { 0xDADAE0 };
 
-    let (has_webview, url_display) = WEBVIEW_STATE.with(|s| {
+    let (has_webview, url_display, status_display, view_handle) = WEBVIEW_STATE.with(|s| {
         let state = s.borrow();
-        (state.handle.is_some(), state.url.clone())
+        (
+            state.handle.is_some(),
+            state.url.clone(),
+            state.status.clone(),
+            state.handle.as_ref().and_then(|h| h.platform_view_handle()),
+        )
     });
 
     if has_webview {
@@ -80,9 +90,13 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         text_color,
                         cx.listener(|_this, _, _, cx| {
                             WEBVIEW_STATE.with(|s| {
-                                let state = s.borrow();
+                                let mut state = s.borrow_mut();
                                 if let Some(ref h) = state.handle {
-                                    let _ = gpui_mobile::packages::webview::go_back(h);
+                                    let result = gpui_mobile::packages::webview::go_back(h);
+                                    state.status = match result {
+                                        Ok(()) => "Navigated back".into(),
+                                        Err(error) => format!("Back failed: {error}"),
+                                    };
                                 }
                             });
                             cx.notify();
@@ -94,9 +108,13 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         text_color,
                         cx.listener(|_this, _, _, cx| {
                             WEBVIEW_STATE.with(|s| {
-                                let state = s.borrow();
+                                let mut state = s.borrow_mut();
                                 if let Some(ref h) = state.handle {
-                                    let _ = gpui_mobile::packages::webview::reload(h);
+                                    let result = gpui_mobile::packages::webview::reload(h);
+                                    state.status = match result {
+                                        Ok(()) => "Reload requested".into(),
+                                        Err(error) => format!("Reload failed: {error}"),
+                                    };
                                 }
                             });
                             cx.notify();
@@ -127,6 +145,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                                 let mut state = s.borrow_mut();
                                 if let Some(h) = state.handle.take() {
                                     let _ = gpui_mobile::packages::webview::dismiss(h);
+                                    state.status = "WebView closed".into();
                                 }
                             });
                             cx.notify();
@@ -135,18 +154,18 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
             )
             // The rest of the screen is behind the native WebView overlay
             .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x666666))
-                            .child("WebView overlay active"),
-                    ),
+                // The native view covers the content area, so status stays above it.
+                div().px_2().pb_1().child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x666666))
+                        .child(status_display),
+                ),
             )
+            // Hosts the native WKWebView; painting it attaches the view below the toolbar.
+            .child(div().flex_1().when_some(view_handle, |d, handle| {
+                d.child(platform_view_element(handle).size_full())
+            }))
             .into_any_element()
     } else {
         // ── No WebView: show link picker ────────────────────────────────
@@ -195,10 +214,16 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                                     WEBVIEW_STATE.with(|s| {
                                         let mut state = s.borrow_mut();
                                         state.url = "about:blank".into();
+                                        state.status = "HTML loaded".into();
                                         state.handle = Some(handle);
                                     });
                                 }
-                                Err(e) => log::error!("WebView HTML error: {e}"),
+                                Err(e) => {
+                                    log::error!("WebView HTML error: {e}");
+                                    WEBVIEW_STATE.with(|s| {
+                                        s.borrow_mut().status = format!("HTML load failed: {e}");
+                                    });
+                                }
                             }
                             cx.notify();
                         }),
@@ -215,7 +240,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         div()
                             .text_xs()
                             .text_color(rgb(0x666666))
-                            .child("Tap a link above to open the in-app browser"),
+                            .child(status_display),
                     ),
             )
             .into_any_element()
@@ -282,11 +307,17 @@ fn open_url_btn(
                         WEBVIEW_STATE.with(|s| {
                             let mut state = s.borrow_mut();
                             state.url = url.into();
+                            state.status = format!("Loaded {url}");
                             state.handle = Some(handle);
                         });
                         log::info!("WebView: loaded {url}");
                     }
-                    Err(e) => log::error!("WebView URL error: {e}"),
+                    Err(e) => {
+                        log::error!("WebView URL error: {e}");
+                        WEBVIEW_STATE.with(|s| {
+                            s.borrow_mut().status = format!("URL load failed: {e}");
+                        });
+                    }
                 }
                 cx.notify();
             }),

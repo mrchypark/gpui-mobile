@@ -164,6 +164,15 @@
             break;
         }
     }
+    if (initialURL == nil) {
+        NSArray<NSString *> *arguments = NSProcessInfo.processInfo.arguments;
+        if (arguments.count > 1) {
+            NSURL *argumentURL = [NSURL URLWithString:arguments[1]];
+            if ([argumentURL.scheme.lowercaseString isEqualToString:@"gpui"]) {
+                initialURL = argumentURL;
+            }
+        }
+    }
     self.awaitingInitialUserActivity = initialURL == nil &&
         [activities[UIApplicationLaunchOptionsUserActivityTypeKey] isEqual:NSUserActivityTypeBrowsingWeb];
     if (!self.awaitingInitialUserActivity)

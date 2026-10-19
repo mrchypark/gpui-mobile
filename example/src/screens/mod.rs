@@ -438,6 +438,7 @@ impl Router {
 
 impl Render for Router {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.safe_area = Self::query_safe_area();
         log::info!("Router: render() screen={:?}", self.current_screen);
         let show_tab_bar = self.current_screen.is_tab_root();
         let theme = gpui_mobile::components::material::MaterialTheme::from_appearance(self.dark_mode);
@@ -468,13 +469,19 @@ impl Render for Router {
             .child(self.render_nav_bar(cx))
             // ── Screen content ───────────────────────────────────────────
             .child(self.render_current_screen(window, cx))
-            // ── Bottom tab bar (only for tab-root screens) ───────────────
+            // ── Bottom tab bar + safe-area spacer ─────────────────────────
             .when(show_tab_bar, |d| {
-                d.child(self.render_tab_bar(cx))
-            })
-            // ── Bottom safe-area spacer (nav bar / gesture indicator) ────
-            .when(safe_bottom > 0.0 && show_tab_bar, |d| {
-                d.child(div().w_full().h(px(safe_bottom)).bg(rgb(bottom_color)))
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .when(safe_bottom > 0.0, |d| {
+                            d.py(px(safe_bottom / 2.0))
+                        })
+                        .bg(rgb(bottom_color))
+                        .child(self.render_tab_bar(cx)),
+                )
             })
             .into_any_element()
     }
@@ -554,6 +561,11 @@ impl Router {
             Screen::Shaders => {
                 return self.render_shaders_content(window, cx).into_any_element();
             }
+            Screen::WebViewBrowser => {
+                // The native WebView host needs a definite height; the scroll
+                // wrapper below leaves its flex_1 with none.
+                return self.render_webview_browser_screen(cx).into_any_element();
+            }
             _ => {}
         }
 
@@ -569,7 +581,6 @@ impl Router {
             Screen::Gps => gps::render(self, cx).into_any_element(),
             #[cfg(feature = "ble")]
             Screen::Ble => ble::render(self, cx).into_any_element(),
-            Screen::WebViewBrowser => self.render_webview_browser_screen(cx).into_any_element(),
             Screen::Swiper => self.render_swiper_screen(cx).into_any_element(),
             Screen::Feed => self.render_feed_screen(cx).into_any_element(),
             Screen::Chat => self.render_chat_screen(cx).into_any_element(),
@@ -579,7 +590,7 @@ impl Router {
                 // Rendered directly in render_current_screen to bypass the scroll wrapper.
                 return self.render_video_player_screen(window, cx).into_any_element();
             }
-            Screen::Animations | Screen::Shaders => unreachable!(),
+            Screen::Animations | Screen::Shaders | Screen::WebViewBrowser => unreachable!(),
         };
 
         div()
@@ -615,7 +626,7 @@ impl Router {
         let current = self.current_screen;
         let dark = self.dark_mode;
 
-        NavigationBarBuilder::new(dark)
+        let bar = NavigationBarBuilder::new(dark)
             .item(
                 "🏠",
                 "Home",
@@ -651,8 +662,10 @@ impl Router {
                     this.navigate_to(Screen::About);
                     cx.notify();
                 }),
-            )
-            .build()
+            );
+        #[cfg(target_os = "ios")]
+        let bar = bar.compact();
+        bar.build()
     }
 
     // ── Per-screen render helpers ────────────────────────────────────────────
