@@ -32,6 +32,7 @@
 //! For showcase / demo purposes, [`navigation_bar_demo`] renders a
 //! static (non-interactive) bar with four hardcoded items.
 
+use super::theme::MaterialTheme;
 use gpui::{div, prelude::*, px, rgb, AnyElement, MouseButton, MouseDownEvent, Window};
 
 // ── Navigation item descriptor ───────────────────────────────────────────────
@@ -103,6 +104,7 @@ impl NavigationItem {
 /// ```
 pub struct NavigationBarBuilder {
     dark: bool,
+    compact: bool,
     items: Vec<NavigationItemEntry>,
 }
 
@@ -113,8 +115,15 @@ impl NavigationBarBuilder {
     pub fn new(dark: bool) -> Self {
         Self {
             dark,
+            compact: false,
             items: Vec::new(),
         }
+    }
+
+    /// Use the shorter iOS tab-bar geometry.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     /// Add a navigation item with an icon, label, active state, and
@@ -153,7 +162,8 @@ impl NavigationBarBuilder {
     /// a child of a GPUI div.
     pub fn build(self) -> impl IntoElement {
         let dark = self.dark;
-        let surface = if dark { 0x211f26_u32 } else { 0xf3edf7 };
+        let compact = self.compact;
+        let surface = MaterialTheme::from_appearance(dark).surface_container;
         let active_indicator = if dark { 0x4a4458_u32 } else { 0xe8def8 };
         let active_color = if dark { 0xe6e1e5_u32 } else { 0x1c1b1f };
         let inactive_color = if dark { 0x938f99_u32 } else { 0x49454f };
@@ -172,19 +182,22 @@ impl NavigationBarBuilder {
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(4.0))
+                .gap(if compact { px(0.0) } else { px(4.0) })
                 .flex_1()
+                .py(if compact { px(2.0) } else { px(4.0) })
+                .justify_center()
                 .cursor_pointer()
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .px_5()
-                        .py(px(4.0))
+                        .when(compact, |d| d.py(px(0.0)))
+                        .when(!compact, |d| d.py(px(4.0)))
                         .rounded(px(16.0))
                         .when(entry.active, |d| d.bg(rgb(active_indicator)))
-                        .text_xl()
+                        .when(compact, |d| d.text_sm())
+                        .when(!compact, |d| d.text_xl())
                         .text_color(rgb(fg))
                         .child(entry.icon),
                 )
@@ -199,7 +212,7 @@ impl NavigationBarBuilder {
             .flex_row()
             .items_center()
             .w_full()
-            .py_3()
+            .py(if compact { px(4.0) } else { px(12.0) })
             .bg(rgb(surface));
 
         for child in children {
