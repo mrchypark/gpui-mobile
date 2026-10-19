@@ -55,15 +55,87 @@ fingerprint and internal receiver permissions through manifest merging.
 
 ## Source identity
 
-- Ely: published `https://github.com/mrchypark/Ely-GPUI-Components`,
-  `7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd`.
+- Ely: live local `ely-mobile-mrchypark/work/ely` checkout, branch
+  `feature/mobile-ui`, HEAD `f98d0005e1805405cf8f71d758e57714a6bf9a25` plus
+  owner-approved dirty changes. The previous published pin
+  `7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd` lacks the integration's required
+  `Menu::usable_bounds`, `Menu::on_open_change`, and
+  `TextInput::input_owner_observer` APIs.
 - GPUI and gpui_wgpu: Zed `1a28cff4b409169bac058bca40dfbfeb7621d19b`.
 - wgpu: crates.io `29.0.4`; no gpui-pre packages.
 
-`evidence/source-identity*.json` records actual Cargo metadata package IDs and
+This local integration requires the external live Ely checkout in this sibling
+layout; checking out HEAD alone does not reproduce its dirty changes:
+
+```text
+<parent>/gpui-mobile-mrchypark/work/gpui-mobile/examples/ely-integration/
+<parent>/ely-mobile-mrchypark/work/ely/
+```
+
+The manifest explicitly uses `../../../../../ely-mobile-mrchypark/work/ely`
+relative to this example. It uses no hidden Cargo override or immutable output
+export. The current r5 dirty-source inventory is
+`ely-mobile-mrchypark/outputs/resumed-validation-20261018/ely-live-r5.sha256`
+relative to `<parent>`, with inventory SHA-256
+`3e2e76ae70ff82879cdfc236993d3aff786b7bab2181db0534a7822a1e481b86`.
+The r4 inventory, SHA-256
+`fe296c2cb02bdb87b0d98260d8b46d303d499566c6019b41b65182b303c22de7`,
+predates the Forms caller/test-only repair; library/API code is unchanged.
+The r3 inventory, SHA-256
+`6d32847bc22e376e55994857c2c462570cec1d7e228f1ac86732d3286a32453b`,
+predates the final Tabs, Markdown, and Generative repairs.
+The earlier r2 inventory, SHA-256
+`56cd347ef941b273aec49a764a53791fe717918c3b7501e0752a9f0c58f21049`,
+predates the reviewed menu and responsive repairs.
+The earlier `ely-live-frozen.sha256` inventory, SHA-256
+`597f975e0aa89bba82a44c6a9e04587277f36b3b3c89fe0ba0562d76ef571f5a`,
+is historical: it predates the gallery `files/touch_tests.rs` lifetime fix.
+Recorded Ely source SHA-256 values are:
+
+| File | SHA-256 |
+| --- | --- |
+| `Cargo.toml` | `609589dbb8b26d7cd4e5e9cb7a9d8316fc70c3ee25bd211b0d939049819b3d25` |
+| `src/menus/model.rs` | `64ef4b673c2ac9abc9011760c2c1832b58495fe6bcb62fc95d0b47f7343100fa` |
+| `src/forms/text/owner.rs` | `37b669ca0bdd498285bb8f703dcc57e333461cc09bb43479adcb7507b9ea23eb` |
+
+A published deployment pin containing these APIs is unresolved. This path is
+for local integration only; a fresh standalone clone cannot build it without
+the matching external checkout and dirty source. The lockfile refresh changed
+only Ely's source. The locked dependency tree, macOS/iOS Simulator/Android target
+metadata, and both existing host self-check tests passed from this project path.
+An earlier unfiltered offline metadata attempt stopped on the missing Linux
+cache entry `accesskit_atspi_common v0.19.1`; it is not a source compile failure.
+
+The corrected local integration built, linked, and signed for iOS Simulator
+(executable SHA-256
+`38d9bd564e3d4fe1c5cb93d303f3a1f12c5bcfc010db825e927fc2e30be1dcd0`).
+Installed-hash verification, both startup self-check markers, real menu selection
+and outside dismissal without canvas commits, and B `나` → A → B `x` preserving
+`나x` passed. A `a` remained separate. This is bounded iOS evidence, not complete
+IME, gesture, Last-item scrolling, floating-keyboard, or lifecycle acceptance.
+
+Android Rust compilation, packaging, signature, ABI, and merged-manifest checks
+passed (APK SHA-256
+`ded6b1e975a77a3c08a5a088c2bc4cfc7f0fb1df7338cc79531cd627d6e92ec3`).
+The Gradle-only retry used installed JDK 21 after the inherited JDK 11 failed;
+Rust was not rebuilt. On the existing API 36 emulator, the installed APK hash
+matched, both startup self-checks passed, and native initialization plus the
+resumed Activity were observed. The initial Activity launch wait timed out before
+initialization completed. Codex Computer Use could not bind the emulator window,
+so Android visual/menu/input acceptance remains unverified. The owned app and
+emulator were stopped with absence verified. These results do not establish
+physical GPS/BLE operation or permission grants. The merged manifest
+does not declare Bluetooth scan/connect permissions; BLE is disabled in this
+example's build. This documentation update follows the recorded builds and did
+not change their code, manifest, or lockfile identity.
+
+Historical `evidence/source-identity*.json` records actual Cargo metadata package IDs and
 full sources for both iOS and Android. Exactly one of each package was found;
-the identities match between targets. `evidence/*-ios.txt` and
-`evidence/gpui-android.txt` are active locked dependency trees.
+the identities match between targets. These records predate the local source
+change and do not validate this local integration. The current verification
+records are in the task's `outputs/existing-integration-original-20261018` and
+`outputs/integration-original-native-20261018` directories; historical trees
+remain in `evidence/*-ios.txt` and `evidence/gpui-android.txt`.
 
 This is an independent workspace/lockfile. The app root repeats the existing
 async-task patch because dependency manifest patches are ignored. The lock
