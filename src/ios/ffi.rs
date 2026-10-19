@@ -425,17 +425,23 @@ pub extern "C" fn gpui_ios_handle_key_event(
 pub extern "C" fn gpui_ios_record_initial_url(url_ptr: *mut c_void) {
     #[cfg(feature = "deeplink")]
     {
-        let url = if url_ptr.is_null() { None } else { unsafe {
-            use objc2::msg_send;
-            let string = url_ptr as *mut objc2::runtime::AnyObject;
-            let bytes: *const u8 = msg_send![string, UTF8String];
-            let length: usize = msg_send![string, lengthOfBytesUsingEncoding: 4usize];
-            if bytes.is_null() { return; }
-            match std::str::from_utf8(std::slice::from_raw_parts(bytes, length)) {
-                Ok(url) => Some(url.to_owned()),
-                Err(_) => return,
+        let url = if url_ptr.is_null() {
+            None
+        } else {
+            unsafe {
+                use objc2::msg_send;
+                let string = url_ptr as *mut objc2::runtime::AnyObject;
+                let bytes: *const u8 = msg_send![string, UTF8String];
+                let length: usize = msg_send![string, lengthOfBytesUsingEncoding: 4usize];
+                if bytes.is_null() {
+                    return;
+                }
+                match std::str::from_utf8(std::slice::from_raw_parts(bytes, length)) {
+                    Ok(url) => Some(url.to_owned()),
+                    Err(_) => return,
+                }
             }
-        }};
+        };
         crate::packages::deeplink::ios::record_initial_link(url);
     }
     #[cfg(not(feature = "deeplink"))]

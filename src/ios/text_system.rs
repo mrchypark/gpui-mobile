@@ -5,6 +5,7 @@
 
 use anyhow::anyhow;
 use core_foundation::{
+    array::CFArray,
     attributed_string::CFMutableAttributedString,
     base::{CFRange, TCFType},
     number::CFNumber,
@@ -20,6 +21,7 @@ use core_text::{
     font::CTFont,
     font_descriptor::{
         kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait, kCTFontWidthTrait,
+        CTFontDescriptor,
     },
     line::CTLine,
     string_attributes::kCTFontAttributeName,
@@ -68,6 +70,7 @@ struct FontKey {
 struct IosTextSystemState {
     memory_source: MemSource,
     system_source: SystemSource,
+    emoji_descriptor: Option<CTFontDescriptor>,
     fonts: Vec<FontKitFont>,
     font_selections: HashMap<Font, FontId>,
     font_ids_by_postscript_name: HashMap<String, FontId>,
@@ -80,6 +83,7 @@ impl IosTextSystem {
         Self(RwLock::new(IosTextSystemState {
             memory_source: MemSource::empty(),
             system_source: SystemSource::new(),
+            emoji_descriptor: emoji_descriptor(&SystemSource::new()),
             fonts: Vec::new(),
             font_selections: HashMap::default(),
             font_ids_by_postscript_name: HashMap::default(),
@@ -257,8 +261,14 @@ impl IosTextSystemState {
                 // but we need to be able to load it for rendering Windows icons in
                 // the Storybook (on macOS).
                 let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
+                // Apple Color Emoji intentionally has no 'm' glyph, but GPUI
+                // needs it for normal emoji text and already rasterizes it as
+                // a color bitmap.
+                let postscript_name = font.native_font().postscript_name();
+                let is_apple_color_emoji =
+                    postscript_name == "AppleColorEmoji" || postscript_name == ".AppleColorEmojiUI";
 
-                if !has_m_glyph && !is_segoe_fluent_icons {
+                if !has_m_glyph && !is_segoe_fluent_icons && !is_apple_color_emoji {
                     log::warn!(
                         "font '{}' has no 'm' character and was not loaded",
                         font.full_name()
@@ -469,12 +479,12 @@ impl IosTextSystemState {
                 } else {
                     font_size
                 };
-                unsafe {
-                    string.set_attribute(
-                        cf_range,
-                        kCTFontAttributeName,
-                        &font.native_font().clone_with_font_size(font_size.into()),
-                    );
+                let native_font = font.native_font().clone_with_font_size(font_size.into());
+                if let Some(emoji_descriptor) = &self.emoji_descriptor {
+                    let font = emoji_fallback_font(native_font, font_size, emoji_descriptor);
+                    unsafe { string.set_attribute(cf_range, kCTFontAttributeName, &font) };
+                } else {
+                    unsafe { string.set_attribute(cf_range, kCTFontAttributeName, &native_font) };
                 }
                 break_ligature = !break_ligature;
             }
@@ -611,6 +621,76 @@ fn font_style_to_fontkit(style: FontStyle) -> FontkitStyle {
         FontStyle::Normal => FontkitStyle::Normal,
         FontStyle::Italic => FontkitStyle::Italic,
         FontStyle::Oblique => FontkitStyle::Oblique,
+    }
+}
+
+/// Core Text's default emoji fallback points at a missing file in the iOS
+/// Simulator. Use the actual color font descriptor when the system exposes one.
+fn emoji_descriptor(system_source: &SystemSource) -> Option<CTFontDescriptor> {
+    use core_foundation::url::CFURL;
+    use core_text::font_manager::CTFontManagerCreateFontDescriptorsFromURL;
+    use std::path::Path;
+
+    fn from_path(path: &Path) -> Option<CTFontDescriptor> {
+        let url = CFURL::from_path(path, false)?;
+        let descriptors: CFArray<CTFontDescriptor> = unsafe {
+            CFArray::wrap_under_create_rule(CTFontManagerCreateFontDescriptorsFromURL(
+                url.as_concrete_TypeRef(),
+            ))
+        };
+        descriptors.into_iter().next().map(|descriptor| unsafe {
+            CTFontDescriptor::wrap_under_get_rule(descriptor.as_concrete_TypeRef())
+        })
+    }
+
+    let simulator_path = system_source
+        .select_family_by_name("Apple Color Emoji")
+        .ok()
+        .and_then(|family| family.fonts().first().and_then(|font| font.load().ok()))
+        .and_then(|font| font.native_font().copy_descriptor().font_path())
+        .and_then(|path| {
+            path.parent()?
+                .parent()
+                .map(|fonts| fonts.join("CoreAddition/AppleColorEmoji-160px.ttc"))
+        });
+    simulator_path.as_deref().and_then(from_path).or_else(|| {
+        from_path(Path::new(
+            "/System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc",
+        ))
+    })
+}
+
+fn emoji_fallback_font(font: CTFont, size: Pixels, emoji: &CTFontDescriptor) -> CTFont {
+    use core_foundation::{
+        array::CFArray, base::TCFType, dictionary::CFDictionary, string::CFString,
+    };
+    use core_text::font_descriptor::{
+        kCTFontCascadeListAttribute, CTFontDescriptorCreateWithAttributes, CTFontDescriptorRef,
+    };
+
+    #[link(name = "CoreText", kind = "framework")]
+    unsafe extern "C" {
+        fn CTFontCreateCopyWithAttributes(
+            font: core_text::font::CTFontRef,
+            size: CGFloat,
+            matrix: *const core_graphics::geometry::CGAffineTransform,
+            attributes: CTFontDescriptorRef,
+        ) -> core_text::font::CTFontRef;
+    }
+
+    unsafe {
+        let key = CFString::wrap_under_get_rule(kCTFontCascadeListAttribute);
+        let cascade = CFArray::from_CFTypes(&[emoji.clone()]);
+        let attributes = CFDictionary::from_CFType_pairs(&[(key, cascade.as_CFType())]);
+        let descriptor = CTFontDescriptorCreateWithAttributes(attributes.as_concrete_TypeRef());
+        let descriptor = CTFontDescriptor::wrap_under_create_rule(descriptor);
+        let font = CTFontCreateCopyWithAttributes(
+            font.as_concrete_TypeRef(),
+            size.into(),
+            std::ptr::null(),
+            descriptor.as_concrete_TypeRef(),
+        );
+        CTFont::wrap_under_create_rule(font)
     }
 }
 
