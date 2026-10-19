@@ -25,10 +25,15 @@ pub async fn read_known_values(ble: &mut Ble) -> Result<Readout> {
             Err(Error::NoSuchCharacteristic) => continue,
             Err(error) => return Err(error),
         };
-        if !allowed(&c) { continue; }
+        if !allowed(&c) {
+            continue;
+        }
         let bytes = ble.read(&c).await?;
-        if id == FIRMWARE { result.firmware = Some(bytes); }
-        else { result.battery = Some(bytes); }
+        if id == FIRMWARE {
+            result.firmware = Some(bytes);
+        } else {
+            result.battery = Some(bytes);
+        }
     }
     Ok(result)
 }
@@ -37,11 +42,20 @@ mod tests {
     use super::*;
     #[test]
     fn qcy_allowlist_requires_service_identity_and_native_read_flag() {
-        let mut c = Characteristic { service_uuid: SERVICE.parse().unwrap(), uuid: BATTERY.parse().unwrap(),
-            properties: CharPropFlags::READ, descriptors: BTreeSet::new() };
+        let mut c = Characteristic {
+            service_uuid: SERVICE.parse().unwrap(),
+            uuid: BATTERY.parse().unwrap(),
+            properties: CharPropFlags::READ,
+            descriptors: BTreeSet::new(),
+        };
         assert!(allowed(&c));
-        c.properties = CharPropFlags::WRITE; assert!(!allowed(&c));
-        c.properties = CharPropFlags::READ; c.service_uuid = FIRMWARE.parse().unwrap(); assert!(!allowed(&c));
-        c.service_uuid = SERVICE.parse().unwrap(); c.uuid = SERVICE.parse().unwrap(); assert!(!allowed(&c));
+        c.properties = CharPropFlags::WRITE;
+        assert!(!allowed(&c));
+        c.properties = CharPropFlags::READ;
+        c.service_uuid = FIRMWARE.parse().unwrap();
+        assert!(!allowed(&c));
+        c.service_uuid = SERVICE.parse().unwrap();
+        c.uuid = SERVICE.parse().unwrap();
+        assert!(!allowed(&c));
     }
 }

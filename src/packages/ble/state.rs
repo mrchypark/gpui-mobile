@@ -52,7 +52,9 @@ impl State {
     pub fn admit_connection(&self, in_background: bool) -> Result<()> {
         self.allowed()?;
         if in_background {
-            return Err(Error::NotSupported("Connecting requires foreground use".into()));
+            return Err(Error::NotSupported(
+                "Connecting requires foreground use".into(),
+            ));
         }
         Ok(())
     }
@@ -130,7 +132,10 @@ mod tests {
         let mut state = super::State::new(super::Permission::Granted);
         for recovery in [false, true] {
             state.recovery_needed = recovery;
-            assert!(matches!(state.admit_connection(true), Err(super::Error::NotSupported(_))));
+            assert!(matches!(
+                state.admit_connection(true),
+                Err(super::Error::NotSupported(_))
+            ));
             assert!(!state.paused);
             assert_eq!(state.recovery_needed, recovery);
             // Resume permits reconnect even when interruption requires recovery.
@@ -140,7 +145,10 @@ mod tests {
         assert!(state.admit_connection(false).is_err());
         state.paused = false;
         state.permission = super::Permission::Denied;
-        assert!(matches!(state.admit_connection(false), Err(super::Error::PermissionDenied)));
+        assert!(matches!(
+            state.admit_connection(false),
+            Err(super::Error::PermissionDenied)
+        ));
     }
     use super::*;
     #[test]
@@ -148,15 +156,30 @@ mod tests {
         futures::executor::block_on(async {
             let ran = std::cell::Cell::new(false);
             let errors = cleanup_with_context(Some(Error::PermissionDenied), async {
-                ran.set(true); Vec::new()
-            }).await;
+                ran.set(true);
+                Vec::new()
+            })
+            .await;
             assert!(ran.get());
             assert!(matches!(errors.as_slice(), [Error::PermissionDenied]));
             let errors = cleanup_with_context(Some(Error::PermissionDenied), async {
-                vec![Error::NotConnected, Error::TimedOut(std::time::Duration::from_secs(1))]
-            }).await;
-            assert!(matches!(errors.as_slice(), [Error::PermissionDenied, Error::NotConnected, Error::TimedOut(_)]));
-            assert!(cleanup_with_context(None, async { Vec::new() }).await.is_empty());
+                vec![
+                    Error::NotConnected,
+                    Error::TimedOut(std::time::Duration::from_secs(1)),
+                ]
+            })
+            .await;
+            assert!(matches!(
+                errors.as_slice(),
+                [
+                    Error::PermissionDenied,
+                    Error::NotConnected,
+                    Error::TimedOut(_)
+                ]
+            ));
+            assert!(cleanup_with_context(None, async { Vec::new() })
+                .await
+                .is_empty());
         });
     }
     #[test]
