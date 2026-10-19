@@ -41,8 +41,8 @@
 use std::{
     ffi::c_void,
     sync::{
-        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -81,35 +81,55 @@ pub(crate) fn end_thermal_listener(generation: i64) {
 /// Java supplies only owned scalar values; no GPUI callback runs on this thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeStatusChanged(
-    _env: *mut c_void, _class: *mut c_void, generation: i64, status: i32,
+    _env: *mut c_void,
+    _class: *mut c_void,
+    generation: i64,
+    status: i32,
 ) {
-    if generation <= 0 || !(0..=6).contains(&status)
-        || THERMAL_GENERATION.load(Ordering::Acquire) != generation { return; }
+    if generation <= 0
+        || !(0..=6).contains(&status)
+        || THERMAL_GENERATION.load(Ordering::Acquire) != generation
+    {
+        return;
+    }
     THERMAL_EVENTS.lock().unwrap().push((generation, status));
-    if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+    if let Some(app) = ANDROID_APP.get() {
+        app.create_waker().wake();
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeListenerStopped(
-    _env: *mut c_void, _class: *mut c_void, generation: i64,
+    _env: *mut c_void,
+    _class: *mut c_void,
+    generation: i64,
 ) {
-    if generation > 0 && THERMAL_GENERATION.compare_exchange(
-        generation, 0, Ordering::AcqRel, Ordering::Acquire,
-    ).is_ok() {
+    if generation > 0
+        && THERMAL_GENERATION
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
         THERMAL_STOP_PENDING.store(true, Ordering::Release);
-        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+        if let Some(app) = ANDROID_APP.get() {
+            app.create_waker().wake();
+        }
     }
 }
 
 fn drain_platform_events() {
     // Outside drawing/App borrows; resolve actual installed identity before draining IME.
-    if let Some(window) = PLATFORM.get().and_then(|platform| platform.primary_window()) {
+    if let Some(window) = PLATFORM
+        .get()
+        .and_then(|platform| platform.primary_window())
+    {
         window.refresh_ime_owner();
     }
     if THERMAL_STOP_PENDING.swap(false, Ordering::AcqRel)
         && THERMAL_GENERATION.load(Ordering::Acquire) == 0
     {
-        if let Some(platform) = PLATFORM.get() { platform.on_thermal_host_destroyed(); }
+        if let Some(platform) = PLATFORM.get() {
+            platform.on_thermal_host_destroyed();
+        }
     }
     let thermal = std::mem::take(&mut *THERMAL_EVENTS.lock().unwrap());
     if let Some(platform) = PLATFORM.get() {
@@ -132,7 +152,12 @@ fn drain_platform_events() {
     {
         for (session, editor, input) in text {
             if let Some(lease) = crate::mobile_events::active_text_input_lease() {
-                if !window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.window()) { continue; }
+                if !window
+                    .gpui_handle()
+                    .is_some_and(|handle| handle.window_id().as_u64() == lease.window())
+                {
+                    continue;
+                }
             }
             log::info!("IME drain session={session} editor={editor} active={} current_session={} current_editor={} accepted={}",
                 IME_ACTIVE.load(Ordering::Acquire), IME_GENERATION.load(Ordering::Acquire),
@@ -244,8 +269,8 @@ use android_activity::{AndroidApp, MainEvent, PollEvent};
 
 use super::platform::{AndroidPlatform, SharedPlatform};
 
-use jni::JavaVM;
 use jni::objects::{JObject, JString, JValue};
+use jni::JavaVM;
 
 // ── JNI helpers (safe `jni` crate wrappers) ──────────────────────────────────
 
@@ -1523,9 +1548,18 @@ mod prompt_tests {
 pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
     let (flags, options) = IME_CONFIGURATION
         .with(|configuration| crate::mobile_events::android_input_traits(&configuration.borrow()));
-    let key = (keyboard_type, flags, options, IME_EDITOR.load(Ordering::Acquire));
-    if IME_LOGICAL_OWNER.load(Ordering::Acquire) && IME_ACTIVE.load(Ordering::Acquire)
-        && IME_SHOWN_KEY.get() == Some(key) { return; }
+    let key = (
+        keyboard_type,
+        flags,
+        options,
+        IME_EDITOR.load(Ordering::Acquire),
+    );
+    if IME_LOGICAL_OWNER.load(Ordering::Acquire)
+        && IME_ACTIVE.load(Ordering::Acquire)
+        && IME_SHOWN_KEY.get() == Some(key)
+    {
+        return;
+    }
     IME_SHOWN_KEY.set(Some(key));
     IME_TYPE.set(keyboard_type);
     IME_ACTIVE.store(true, Ordering::Release);
@@ -1640,8 +1674,11 @@ pub(crate) fn input_handler_changed() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_hasLogicalOwner(
-    _env: *mut c_void, _class: *mut c_void,
-) -> u8 { IME_LOGICAL_OWNER.load(Ordering::Acquire) as u8 }
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> u8 {
+    IME_LOGICAL_OWNER.load(Ordering::Acquire) as u8
+}
 thread_local! {
     static IME_SHOWN_KEY: std::cell::Cell<Option<(crate::KeyboardType, i32, i32, i64)>> = const { std::cell::Cell::new(None) };
     static IME_CONFIGURATION: std::cell::RefCell<gpui::TextInputConfiguration> = Default::default();
@@ -1693,7 +1730,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_committed(
         let text = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
         let text = get_string(env, &text);
         log::info!("IME JNI commit session={session} editor={editor} action={action}");
-        let Some(input) = crate::mobile_events::ime_action(action, text) else { return Ok(()); };
+        let Some(input) = crate::mobile_events::ime_action(action, text) else {
+            return Ok(());
+        };
         IME_TEXT.lock().unwrap().push((session, editor, input));
         if let Some(app) = ANDROID_APP.get() {
             app.create_waker().wake();
@@ -1705,18 +1744,32 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_committed(
 /// Marked updates preserve their originating connection/owner; never become commits.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composed(
-    _env: *mut c_void, _class: *mut c_void, session: i64, editor: i64,
-    text: *mut c_void, start: i32, end: i32,
+    _env: *mut c_void,
+    _class: *mut c_void,
+    session: i64,
+    editor: i64,
+    text: *mut c_void,
+    start: i32,
+    end: i32,
 ) {
     let _ = with_env(|env| {
         let object = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
         let text = get_string(env, &object);
         let len = text.encode_utf16().count();
-        if start < 0 || end < start || end as usize > len { return Ok(()); }
-        IME_TEXT.lock().unwrap().push((session, editor, crate::mobile_events::ImeInput::Compose {
-            text, selection: start as usize..end as usize,
-        }));
-        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+        if start < 0 || end < start || end as usize > len {
+            return Ok(());
+        }
+        IME_TEXT.lock().unwrap().push((
+            session,
+            editor,
+            crate::mobile_events::ImeInput::Compose {
+                text,
+                selection: start as usize..end as usize,
+            },
+        ));
+        if let Some(app) = ANDROID_APP.get() {
+            app.create_waker().wake();
+        }
         Ok(())
     });
 }

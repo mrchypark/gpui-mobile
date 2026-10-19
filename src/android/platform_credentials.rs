@@ -1,10 +1,10 @@
 //! Private, non-backed-up credential records authenticated by an Android Keystore key.
 
 use crate::android::jni as bridge;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use jni::{
-    Env,
     objects::{JByteArray, JObject, JValue},
+    Env,
 };
 use std::{
     fs,

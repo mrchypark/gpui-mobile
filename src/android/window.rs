@@ -43,7 +43,7 @@ use gpui::{
     PlatformDisplay, PlatformInputHandler, PlatformWindow, PromptButton, PromptLevel,
     RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
 };
-use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{wgpu, GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use parking_lot::Mutex;
 use raw_window_handle::{
     AndroidDisplayHandle, AndroidNdkWindowHandle, HasDisplayHandle, HasWindowHandle,
@@ -309,7 +309,6 @@ struct WindowState {
     /// Current appearance.
     appearance: WindowAppearance,
 
-
     /// Whether the window background should be transparent.
     transparent: bool,
 
@@ -388,9 +387,7 @@ impl AndroidWindow {
 
     fn visibility(&self) -> gpui::WindowVisibility {
         use std::sync::atomic::Ordering;
-        if self.app_resumed.load(Ordering::Relaxed)
-            && self.activity.has_surface()
-        {
+        if self.app_resumed.load(Ordering::Relaxed) && self.activity.has_surface() {
             gpui::WindowVisibility::Visible
         } else {
             gpui::WindowVisibility::Hidden
@@ -650,7 +647,6 @@ impl AndroidWindow {
 
         // Release our reference on the native window.
         state.native_window = None;
-
 
         // NOTE: We intentionally do NOT fire the close callback here.
         // On Android, term_window means the surface is being destroyed
@@ -1396,10 +1392,17 @@ impl AndroidPlatformWindow {
 
 impl Drop for AndroidPlatformWindow {
     fn drop(&mut self) {
-        let owns_ime = crate::mobile_events::active_text_input_lease().is_none_or(|lease|
-            self.window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.window()));
+        let owns_ime = crate::mobile_events::active_text_input_lease().is_none_or(|lease| {
+            self.window
+                .gpui_handle()
+                .is_some_and(|handle| handle.window_id().as_u64() == lease.window())
+        });
         if let Some(lease) = crate::mobile_events::active_text_input_lease() {
-            if self.window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.window()) {
+            if self
+                .window
+                .gpui_handle()
+                .is_some_and(|handle| handle.window_id().as_u64() == lease.window())
+            {
                 crate::mobile_events::release_text_input_owner(lease);
             }
         }
@@ -1740,16 +1743,31 @@ impl PlatformWindow for AndroidPlatformWindow {
         let refresh_handler = handler.clone();
         let weak_window = Arc::downgrade(&self.window);
         let refresh: Box<dyn FnMut()> = Box::new(move || {
-            let Some(window) = weak_window.upgrade() else { return; };
-            let Some(handle) = window.gpui_handle() else { return; };
+            let Some(window) = weak_window.upgrade() else {
+                return;
+            };
+            let Some(handle) = window.gpui_handle() else {
+                return;
+            };
             let generation = refresh_handler.generation();
-            let result = refresh_handler.call(|| true, |candidate| {
-                crate::mobile_events::query_text_input_owner(|| candidate.query_accepts_text_input())
-            });
+            let result = refresh_handler.call(
+                || true,
+                |candidate| {
+                    crate::mobile_events::query_text_input_owner(|| {
+                        candidate.query_accepts_text_input()
+                    })
+                },
+            );
             let (accepts, owner) = if refresh_handler.generation() == generation {
                 result.unwrap_or((false, None))
-            } else { (false, None) };
-            crate::mobile_events::bind_queried_text_input_owner(handle.window_id().as_u64(), accepts, owner);
+            } else {
+                (false, None)
+            };
+            crate::mobile_events::bind_queried_text_input_owner(
+                handle.window_id().as_u64(),
+                accepts,
+                owner,
+            );
         });
         // Like ime_callback, only invoked on the native GPUI owner thread.
         self.window.state.lock().ime_owner_refresh = Some(unsafe { std::mem::transmute(refresh) });
@@ -1760,49 +1778,101 @@ impl PlatformWindow for AndroidPlatformWindow {
                 }
                 if let Some(lease) = crate::mobile_events::active_text_input_lease() {
                     let generation = handler.generation();
-                    handler.call(|| super::jni::ime_delivery_current(session, editor), |candidate| {
-                        let Some(input) = crate::mobile_events::verify_owned_ime(lease, input, || candidate.query_accepts_text_input()) else { return; };
-                        let current = || super::jni::ime_delivery_current(session, editor)
-                            && handler.generation() == generation
-                            && crate::mobile_events::active_text_input_lease() == Some(lease);
-                        let verify = |candidate: &mut PlatformInputHandler| {
-                            let (accepts, owner) = crate::mobile_events::query_text_input_owner(|| candidate.query_accepts_text_input());
-                            accepts && current() && crate::mobile_events::queried_owner_matches(lease, owner)
-                        };
-                        if !current() { return; }
-                        use crate::mobile_events::ImeInput;
-                        match input {
-                            ImeInput::Commit(text) => candidate.replace_text_in_range(None, &text),
-                            ImeInput::Compose { text, selection } => candidate.replace_and_mark_text_in_range(None, &text, Some(selection)),
-                            ImeInput::FinishComposition => candidate.unmark_text(),
-                            ImeInput::Enter | ImeInput::Backspace => {
-                                let enter = matches!(input, ImeInput::Enter);
-                                let result = ime_cb.lock()(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
-                                    keystroke: gpui::Keystroke { modifiers: Default::default(), key: if enter { "enter" } else { "backspace" }.into(), key_char: None },
-                                    is_held: false, prefer_character_input: false,
-                                }));
-                                if enter && result.propagate && !result.default_prevented && verify(candidate) {
-                                    candidate.replace_text_in_range(None, "\n");
+                    handler.call(
+                        || super::jni::ime_delivery_current(session, editor),
+                        |candidate| {
+                            let Some(input) =
+                                crate::mobile_events::verify_owned_ime(lease, input, || {
+                                    candidate.query_accepts_text_input()
+                                })
+                            else {
+                                return;
+                            };
+                            let current = || {
+                                super::jni::ime_delivery_current(session, editor)
+                                    && handler.generation() == generation
+                                    && crate::mobile_events::active_text_input_lease()
+                                        == Some(lease)
+                            };
+                            let verify = |candidate: &mut PlatformInputHandler| {
+                                let (accepts, owner) =
+                                    crate::mobile_events::query_text_input_owner(|| {
+                                        candidate.query_accepts_text_input()
+                                    });
+                                accepts
+                                    && current()
+                                    && crate::mobile_events::queried_owner_matches(lease, owner)
+                            };
+                            if !current() {
+                                return;
+                            }
+                            use crate::mobile_events::ImeInput;
+                            match input {
+                                ImeInput::Commit(text) => {
+                                    candidate.replace_text_in_range(None, &text)
+                                }
+                                ImeInput::Compose { text, selection } => candidate
+                                    .replace_and_mark_text_in_range(None, &text, Some(selection)),
+                                ImeInput::FinishComposition => candidate.unmark_text(),
+                                ImeInput::Enter | ImeInput::Backspace => {
+                                    let enter = matches!(input, ImeInput::Enter);
+                                    let result = ime_cb.lock()(gpui::PlatformInput::KeyDown(
+                                        gpui::KeyDownEvent {
+                                            keystroke: gpui::Keystroke {
+                                                modifiers: Default::default(),
+                                                key: if enter { "enter" } else { "backspace" }
+                                                    .into(),
+                                                key_char: None,
+                                            },
+                                            is_held: false,
+                                            prefer_character_input: false,
+                                        },
+                                    ));
+                                    if enter
+                                        && result.propagate
+                                        && !result.default_prevented
+                                        && verify(candidate)
+                                    {
+                                        candidate.replace_text_in_range(None, "\n");
+                                    }
+                                }
+                                ImeInput::DeleteBefore { count, codepoints } => {
+                                    let Some(selection) = candidate.selected_text_range(true)
+                                    else {
+                                        return;
+                                    };
+                                    if !verify(candidate) {
+                                        return;
+                                    }
+                                    if !selection.range.is_empty() {
+                                        candidate.replace_text_in_range(Some(selection.range), "");
+                                        return;
+                                    }
+                                    let end = selection.range.start;
+                                    let start = end.saturating_sub(count.saturating_mul(2));
+                                    let mut adjusted = None;
+                                    let Some(text) =
+                                        candidate.text_for_range(start..end, &mut adjusted)
+                                    else {
+                                        return;
+                                    };
+                                    if adjusted.unwrap_or(start..end).end != end
+                                        || !verify(candidate)
+                                    {
+                                        return;
+                                    }
+                                    if let Some(units) = crate::mobile_events::ime_delete_units(
+                                        &text, count, codepoints,
+                                    ) {
+                                        candidate.replace_text_in_range(
+                                            Some(end.saturating_sub(units)..end),
+                                            "",
+                                        );
+                                    }
                                 }
                             }
-                            ImeInput::DeleteBefore { count, codepoints } => {
-                                let Some(selection) = candidate.selected_text_range(true) else { return; };
-                                if !verify(candidate) { return; }
-                                if !selection.range.is_empty() {
-                                    candidate.replace_text_in_range(Some(selection.range), "");
-                                    return;
-                                }
-                                let end = selection.range.start;
-                                let start = end.saturating_sub(count.saturating_mul(2));
-                                let mut adjusted = None;
-                                let Some(text) = candidate.text_for_range(start..end, &mut adjusted) else { return; };
-                                if adjusted.unwrap_or(start..end).end != end || !verify(candidate) { return; }
-                                if let Some(units) = crate::mobile_events::ime_delete_units(&text, count, codepoints) {
-                                    candidate.replace_text_in_range(Some(end.saturating_sub(units)..end), "");
-                                }
-                            }
-                        }
-                    });
+                        },
+                    );
                     return;
                 }
                 if let crate::mobile_events::ImeInput::DeleteBefore { count, codepoints } = &input {
@@ -2149,7 +2219,7 @@ impl PlatformWindow for AndroidPlatformWindow {
             let cb = Arc::clone(&input_cb);
             self.window.on_key_event(move |key_event| {
                 use crate::android::keyboard::{
-                    AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP, android_key_to_keystroke,
+                    android_key_to_keystroke, AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP,
                 };
 
                 // On KeyDown, dispatch text through the global callback so

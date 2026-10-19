@@ -1,5 +1,5 @@
 use super::super::jni as bridge;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use gpui::ClipboardItem;
 use jni::objects::{JByteArray, JValue};
 #[path = "../clipboard_wire.rs"]
