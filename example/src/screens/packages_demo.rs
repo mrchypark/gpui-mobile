@@ -1146,6 +1146,27 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                             })),
                         )
                         .child(
+                            action_button("Request", PEACH, cx.listener(|_this, _, _, cx| {
+                                cx.spawn(async move |this, cx| {
+                                    let result = cx.background_executor().spawn(async {
+                                        gpui_mobile::packages::permission_handler::request_permission(
+                                            gpui_mobile::packages::permission_handler::Permission::Notification,
+                                        )
+                                    }).await;
+                                    let _ = this.update(cx, |_this, cx| {
+                                        PACKAGES_STATE.with(|s| {
+                                            let mut state = s.borrow_mut();
+                                            state.notif_status = Some(match result {
+                                                Ok(status) => format!("Permission: {status:?}"),
+                                                Err(error) => format!("Error: {error}"),
+                                            });
+                                        });
+                                        cx.notify();
+                                    });
+                                }).detach();
+                            })),
+                        )
+                        .child(
                             action_button("Show", MAUVE, cx.listener(|_this, _, _, cx| {
                                 PACKAGES_STATE.with(|s| {
                                     let mut state = s.borrow_mut();
