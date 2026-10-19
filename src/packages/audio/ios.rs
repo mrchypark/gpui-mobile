@@ -93,7 +93,9 @@ pub fn set_url(id: u32, url: &str) -> Result<Option<u64>, String> {
                 entry.started = false;
             }
             let _: () = msg_send![entry.player, setActionAtItemEnd: 1isize];
-            if entry.looping { entry.loops.configure(entry.player, true)?; }
+            if entry.looping {
+                entry.loops.configure(entry.player, true)?;
+            }
             Ok(get_duration_from_player(entry.player))
         })?;
 
@@ -137,7 +139,9 @@ pub fn set_file_path(id: u32, path: &str) -> Result<Option<u64>, String> {
                 entry.started = false;
             }
             let _: () = msg_send![entry.player, setActionAtItemEnd: 1isize];
-            if entry.looping { entry.loops.configure(entry.player, true)?; }
+            if entry.looping {
+                entry.loops.configure(entry.player, true)?;
+            }
             Ok(get_duration_from_player(entry.player))
         })?;
 
@@ -220,7 +224,9 @@ pub fn set_speed(id: u32, speed: f32) -> Result<(), String> {
         unsafe {
             let rate: f32 = msg_send![entry.player, rate];
             entry.speed = speed;
-            if rate != 0.0 { let _: () = msg_send![entry.player, setRate: speed]; }
+            if rate != 0.0 {
+                let _: () = msg_send![entry.player, setRate: speed];
+            }
         }
         Ok(())
     })
@@ -228,7 +234,9 @@ pub fn set_speed(id: u32, speed: f32) -> Result<(), String> {
 
 pub fn set_loop_mode(id: u32, mode: LoopMode) -> Result<(), String> {
     with_player(id, |entry| unsafe {
-        if entry.player.is_null() { return Err("No audio source set".into()); }
+        if entry.player.is_null() {
+            return Err("No audio source set".into());
+        }
         let enabled = mode != LoopMode::Off;
         entry.loops.configure(entry.player, enabled)?;
         entry.looping = enabled;
@@ -279,12 +287,20 @@ pub fn get_state(id: u32) -> Result<PlayerState, String> {
         }
         unsafe {
             let item: *mut AnyObject = msg_send![entry.player, currentItem];
-            if item.is_null() { return Ok(PlayerState::Idle); }
+            if item.is_null() {
+                return Ok(PlayerState::Idle);
+            }
             let status: isize = msg_send![item, status];
-            if status == 0 { return Ok(PlayerState::Loading); }
-            if status == 2 { return Err("Native audio item failed".into()); }
+            if status == 0 {
+                return Ok(PlayerState::Loading);
+            }
+            if status == 2 {
+                return Err("Native audio item failed".into());
+            }
             let control: isize = msg_send![entry.player, timeControlStatus];
-            if control == 1 { return Ok(PlayerState::Loading); }
+            if control == 1 {
+                return Ok(PlayerState::Loading);
+            }
             let rate: f32 = msg_send![entry.player, rate];
             if rate > 0.0 {
                 return Ok(PlayerState::Playing);
@@ -370,8 +386,8 @@ fn cmtime_to_ms(time: CMTime) -> i64 {
     if time.flags & (4 | 8 | 16) != 0 {
         return 0;
     }
-    ((time.value as i128 * 1000) / time.timescale as i128)
-        .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    ((time.value as i128 * 1000) / time.timescale as i128).clamp(i64::MIN as i128, i64::MAX as i128)
+        as i64
 }
 
 // ── ObjC string/URL helpers ─────────────────────────────────────────────────
