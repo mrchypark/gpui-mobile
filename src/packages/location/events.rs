@@ -80,7 +80,10 @@ impl Stream for Receiver {
 }
 #[cfg(test)]
 pub(super) fn pending_polls(id: u64) -> u64 {
-    registry().lock().unwrap().get(&id)
+    registry()
+        .lock()
+        .unwrap()
+        .get(&id)
         .map_or(0, |mailbox| mailbox.pending_polls.load(Ordering::SeqCst))
 }
 /// False means the native producer must stop, even if the consumer never polls again.

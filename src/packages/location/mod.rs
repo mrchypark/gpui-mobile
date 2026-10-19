@@ -6,25 +6,34 @@
 //!
 //! Feature-gated behind `location`.
 
+#[cfg(feature = "permission_handler")]
+mod access;
 #[cfg(target_os = "android")]
 mod android;
-#[cfg(all(target_os = "android", debug_assertions, feature = "permission_handler"))]
+#[cfg(all(
+    target_os = "android",
+    debug_assertions,
+    feature = "permission_handler"
+))]
 mod android_probe;
 mod events;
 #[cfg(target_os = "ios")]
 mod ios;
 mod stream;
 #[cfg(feature = "permission_handler")]
-mod access;
-#[cfg(feature = "permission_handler")]
 pub use access::{check_location_access, request_location_access, LocationAccess};
 #[cfg(feature = "permission_handler")]
 pub mod demo;
-#[cfg(all(target_os = "ios", target_env = "sim", debug_assertions, feature = "permission_handler"))]
+#[cfg(all(
+    target_os = "ios",
+    target_env = "sim",
+    debug_assertions,
+    feature = "permission_handler"
+))]
 mod simulator_probe;
 pub use stream::{
-    get_current_position_async, get_current_position_with_timeout, watch_position, watch_position_background, LocationEvent, LocationPermission,
-    LocationSubscription,
+    get_current_position_async, get_current_position_with_timeout, watch_position,
+    watch_position_background, LocationEvent, LocationPermission, LocationSubscription,
 };
 
 /// GPS position data. Unknown optional measurements are NaN, not zero.
