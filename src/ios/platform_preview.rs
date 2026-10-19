@@ -1,6 +1,6 @@
 //! A retained Quick Look data source; UIKit owns the presented controller lifetime.
 use super::super::util::nsstring;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use objc2::{
     class, msg_send,
     runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel},
