@@ -368,7 +368,7 @@ struct AndroidPlatformState {
     headless: bool,
 
     /// Preferred GPU backend.
-    preferred_backend: AndroidBackend,
+    preferred_backend: Option<AndroidBackend>,
 }
 
 // SAFETY: `AndroidPlatformState` is only ever accessed while holding the
@@ -555,7 +555,7 @@ impl AndroidPlatform {
                 // Try loading the bundled CBDT NotoColorEmoji from APK assets.
                 if let Some(app) = crate::android::jni::android_app() {
                     match load_asset_bytes(&app, "fonts/NotoColorEmoji.ttf") {
-                        Ok(bytes) => {
+                        Ok(bytes) if font_has_cbdt_tables(&bytes) => {
                             log::info!(
                                 "loaded bundled CBDT emoji font from assets ({} bytes)",
                                 bytes.len()
@@ -563,6 +563,7 @@ impl AndroidPlatform {
                             font_data.push(std::borrow::Cow::Owned(bytes));
                             emoji_loaded = true;
                         }
+                        Ok(_) => log::warn!("bundled emoji font has no CBDT table"),
                         Err(e) => {
                             log::warn!("failed to load bundled emoji font from assets: {e:#}");
                         }
@@ -619,7 +620,7 @@ impl AndroidPlatform {
                 on_init_window_callback: None,
                 is_active: false,
                 headless,
-                preferred_backend: AndroidBackend::Vulkan,
+                preferred_backend: None,
             }),
             should_quit: AtomicBool::new(false),
         }
@@ -779,6 +780,17 @@ impl AndroidPlatform {
 
     // ── window management ─────────────────────────────────────────────────────
 
+    pub(crate) fn initialize_gpu_context(
+        &self,
+        native_window: &ndk::native_window::NativeWindow,
+    ) -> Result<()> {
+        let state = self.state.lock();
+        if let Some(backend) = state.preferred_backend {
+            AndroidWindow::initialize_gpu_context(native_window, &state.gpu_context, backend)?;
+        }
+        Ok(())
+    }
+
     /// Open a new window backed by `native_window`.
     pub fn open_window(
         &self,
@@ -787,6 +799,9 @@ impl AndroidPlatform {
         transparent: bool,
     ) -> Result<Arc<AndroidWindow>> {
         let mut state = self.state.lock();
+        if let Some(backend) = state.preferred_backend {
+            AndroidWindow::initialize_gpu_context(&native_window, &state.gpu_context, backend)?;
+        }
         let window = AndroidWindow::new(
             native_window,
             Rc::clone(&state.gpu_context),
@@ -1103,12 +1118,17 @@ impl AndroidPlatform {
     }
     /// Preferred wgpu backend.
     pub fn preferred_backend(&self) -> AndroidBackend {
-        self.state.lock().preferred_backend
+        self.state.lock().preferred_backend.unwrap_or(AndroidBackend::Vulkan)
     }
 
-    /// Override the preferred wgpu backend.
+    /// Override the wgpu backend before the first window initializes the GPU.
     pub fn set_preferred_backend(&self, backend: AndroidBackend) {
-        self.state.lock().preferred_backend = backend;
+        let mut state = self.state.lock();
+        if state.gpu_context.borrow().is_some() {
+            log::warn!("GPU backend cannot be changed after initialization");
+            return;
+        }
+        state.preferred_backend = Some(backend);
     }
 
     // ── callback registration ─────────────────────────────────────────────────
@@ -2085,6 +2105,17 @@ impl Default for AndroidPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emoji_fallback_requires_a_complete_cbdt_table_directory() {
+        let mut font = vec![0_u8; 28];
+        font[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        font[12..16].copy_from_slice(b"CBDT");
+        assert!(font_has_cbdt_tables(&font));
+        assert!(!font_has_cbdt_tables(&font[..27]));
+        font[12..16].copy_from_slice(b"COLR");
+        assert!(!font_has_cbdt_tables(&font));
+    }
 
     #[test]
     fn thermal_events_deduplicate_reject_stale_and_unknown_then_invalidate_on_destroy() {

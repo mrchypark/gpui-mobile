@@ -34,6 +34,7 @@ xcuserdata/
 *.apk
 *.ap_
 *.dex
+!src/android/accesskit_classes.dex
 *.class
 bin/
 gen/

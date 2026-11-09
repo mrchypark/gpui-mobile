@@ -1361,58 +1361,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-mobile"
-version = "0.1.0"
-dependencies = [
- "accesskit_android",
- "android-activity",
- "android_logger",
- "anyhow",
- "block2",
- "btleplug",
- "cc",
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "core-graphics",
- "core-text",
- "futures",
- "gpui-pre",
- "gpui-pre-wgpu",
- "jni 0.22.4",
- "libc",
- "log",
- "mobile-ime-core",
- "ndk",
- "ndk-context",
- "ndk-sys",
- "objc2",
- "parking_lot",
- "pathfinder_geometry",
- "raw-window-handle",
- "rustc-hash 2.1.3",
- "smallvec",
- "tokio",
- "uuid",
- "wgpu",
- "zed-font-kit",
-]
-
-[[package]]
-name = "gpui-mobile-example"
-version = "0.1.0"
-dependencies = [
- "android-activity",
- "android_logger",
- "gpui-mobile",
- "gpui-pre",
- "gpui-pre-reqwest-client",
- "log",
- "objc2",
-]
-
-[[package]]
-name = "gpui-pre"
-version = "0.3.10"
+name = "gpui-fast"
+version = "0.1.12"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -1426,9 +1376,9 @@ dependencies = [
  "etagere",
  "futures",
  "getrandom 0.3.4",
+ "gpui-fast-macros",
  "gpui-pre-collections",
  "gpui-pre-http-client",
- "gpui-pre-macros",
  "gpui-pre-refineable",
  "gpui-pre-scheduler",
  "gpui-pre-shared-string",
@@ -1469,6 +1419,93 @@ dependencies = [
  "uuid",
  "waker-fn",
  "windows",
+]
+
+[[package]]
+name = "gpui-fast-macros"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46724abd05d2c874cc31e1996bb862539c5735780dd363cb550469003a6e5140"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "gpui-fast-wgpu"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "cosmic-text",
+ "etagere",
+ "gpui-fast",
+ "gpui-pre-collections",
+ "gpui-pre-util",
+ "itertools 0.14.0",
+ "log",
+ "parking_lot",
+ "profiling",
+ "raw-window-handle",
+ "smallvec",
+ "swash",
+ "unicode-bidi",
+ "unicode-segmentation",
+ "web-sys",
+ "wgpu",
+ "zed-font-kit",
+]
+
+[[package]]
+name = "gpui-mobile"
+version = "0.1.0"
+dependencies = [
+ "accesskit_android",
+ "android-activity",
+ "android_logger",
+ "anyhow",
+ "block2",
+ "btleplug",
+ "cc",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "core-graphics",
+ "core-text",
+ "futures",
+ "gpui-fast",
+ "gpui-fast-wgpu",
+ "jni 0.22.4",
+ "libc",
+ "log",
+ "mobile-ime-core",
+ "ndk",
+ "ndk-context",
+ "ndk-sys",
+ "objc2",
+ "parking_lot",
+ "pathfinder_geometry",
+ "raw-window-handle",
+ "rustc-hash 2.1.3",
+ "smallvec",
+ "tokio",
+ "uuid",
+ "wgpu",
+ "zed-font-kit",
+]
+
+[[package]]
+name = "gpui-mobile-example"
+version = "0.1.0"
+dependencies = [
+ "android-activity",
+ "android_logger",
+ "gpui-fast",
+ "gpui-mobile",
+ "gpui-pre-reqwest-client",
+ "log",
+ "objc2",
 ]
 
 [[package]]
@@ -1522,19 +1559,6 @@ dependencies = [
  "rustls",
  "rustls-platform-verifier",
  "webpki-roots",
-]
-
-[[package]]
-name = "gpui-pre-macros"
-version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c95d70a9fe10701533606c6135f9a1d4cd96e87e4e6062b3d426eb57b415daf"
-dependencies = [
- "heck",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1660,31 +1684,6 @@ dependencies = [
  "anyhow",
  "log",
  "which",
-]
-
-[[package]]
-name = "gpui-pre-wgpu"
-version = "0.3.10"
-dependencies = [
- "anyhow",
- "bytemuck",
- "cosmic-text",
- "etagere",
- "gpui-pre",
- "gpui-pre-collections",
- "gpui-pre-util",
- "itertools 0.14.0",
- "log",
- "parking_lot",
- "profiling",
- "raw-window-handle",
- "smallvec",
- "swash",
- "unicode-bidi",
- "unicode-segmentation",
- "web-sys",
- "wgpu",
- "zed-font-kit",
 ]
 
 [[package]]
@@ -2274,9 +2273,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libdbus-sys"
@@ -3169,7 +3168,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3607,7 +3606,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4211,9 +4210,9 @@ dependencies = [
 
 [[package]]
 name = "taffy"
-version = "0.15.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31f7bd2d97198df05186f93a3a3c306845f40e8b3c22bf9279cdd7e5cf5fea7d"
+checksum = "3c8480887e8803986d96a7173729565520d4bbb721ad6b7ad6941a22897207aa"
 dependencies = [
  "serde",
  "slotmap",
@@ -5052,7 +5051,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

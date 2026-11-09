@@ -1768,7 +1768,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 [[package]]
 name = "ely-gpui-component"
 version = "0.1.1"
-source = "git+https://github.com/mrchypark/Ely-GPUI-Components?rev=937b4252ccdc4b8eb79ae0ede59be449a975390c#937b4252ccdc4b8eb79ae0ede59be449a975390c"
+source = "git+https://github.com/mrchypark/Ely-GPUI-Components?rev=3a6f4365fa88e89cb945f7d30c5706bf65757c8a#3a6f4365fa88e89cb945f7d30c5706bf65757c8a"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4394,9 +4394,9 @@ checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
 name = "libc"
-version = "0.2.189"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libdbus-sys"

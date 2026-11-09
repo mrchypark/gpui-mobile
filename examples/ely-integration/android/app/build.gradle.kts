@@ -17,6 +17,7 @@ android {
     buildFeatures { buildConfig = true }
     defaultConfig {
         applicationId = "dev.gpui.mobile.ely"
+        testInstrumentationRunner = "dev.gpui.mobile.example.ActivityLifecycleTest"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

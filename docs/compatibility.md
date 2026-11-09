@@ -55,7 +55,7 @@ All 12 build source hashes still match; dependency pins remain unchanged.
 
 Core gpui-mobile has no Ely dependency. `examples/ely-integration` composes Ely with the mobile platform using the same GPUI instance. `ios::ffi::run_app_with_assets(impl gpui::AssetSource)` accepts application assets without depending on Ely; the app supplies Ely's assets. Both startup paths retain an `ApplicationHandle` for UIKit's external run loop.
 
-Track `example/Cargo.lock` and `examples/ely-integration/Cargo.lock`; the root library lock remains ignored. The tested application locks resolve libc `0.2.189`: libc `0.2.190` plus backtrace `0.3.76` fails on unavailable iOS `_dyld_*` APIs. The direct example reqwest revision matches Zed's reqwest_client; retaining the older `c15662463bda39148ba154100dd44d3fba5873a4` creates two incompatible Client types. TLS certificate validation stays enabled through WebPKI roots.
+Track `example/Cargo.lock` and `examples/ely-integration/Cargo.lock`; the root library lock remains ignored. The application locks resolve libc `0.2.191`: it fixes Android arm64 `ucontext_t` padding and restores the iOS `_dyld_*` declarations absent from `0.2.190`. The direct example reqwest revision matches Zed's reqwest_client; retaining the older `c15662463bda39148ba154100dd44d3fba5873a4` creates two incompatible Client types. TLS certificate validation stays enabled through WebPKI roots.
 
 ## Current verification matrix
 

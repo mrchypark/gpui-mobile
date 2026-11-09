@@ -1,12 +1,33 @@
 # Native Ely mobile viewport
 
-The integration uses GPUI Kit 0.8.1, GPUI Fast 0.1.12, and a pinned
-revision of the public Ely fork. Cargo applies the local Fast overrides in the
-application workspace; dependencies do not inherit patches from other manifests.
-Update the Ely revision deliberately when adopting new component changes.
+The integration uses GPUI Kit 0.8.1, GPUI Fast 0.1.12, and a pinned public
+Ely fork revision. Cargo applies the local Fast overrides in the application
+workspace; dependencies do not inherit patches from other manifests.
 
 Earlier validation records below describe previous dependency snapshots and do
 not validate the current one.
+
+## Android Activity recreation regression
+
+Build with `GPUI_LIFECYCLE_STRESS=1` to add a delayed timer and an external
+thread wake to each Activity. Install the debug app and its Android test APK,
+then run the `recreate_stress` instrumentation scenario. The test recreates
+the Activity three times in the same process, waits for the old tasks' wakeups,
+and verifies that the last native window is ready. The separate `background`
+scenario checks foreground restoration without recreation.
+
+```sh
+GPUI_LIFECYCLE_STRESS=1 ./examples/ely-integration/android-apk.sh
+./example/android/gradle/gradlew -p examples/ely-integration/android :app:assembleDebugAndroidTest
+adb install -r examples/ely-integration/android-build/ely-integration-arm64-debug.apk
+adb install -r examples/ely-integration/android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb shell am instrument -w -e scenario recreate_stress dev.gpui.mobile.ely.test/dev.gpui.mobile.example.ActivityLifecycleTest
+```
+
+The app's `android_main` must retain its `init_platform` return value until
+`Application::run` returns. The session cancels Activity-local foreground tasks
+before releasing the native thread. Do not bypass the GPUI foreground executor
+with its hidden raw scheduler for tasks that can outlive an Activity.
 
 ## Opt-in platform smoke checks
 
@@ -107,7 +128,7 @@ the identities match between targets. `evidence/*-ios.txt` and
 
 This is an independent workspace/lockfile. The app root repeats the existing
 async-task patch because dependency manifest patches are ignored. The lock
-uses libc 0.2.189 to avoid the libc 0.2.190/backtrace iOS `_dyld_*` regression.
+uses libc 0.2.191 for the Android arm64 ABI fix and iOS `_dyld_*` declarations.
 No root/desktop lock change is required.
 
 ## Actual event wiring

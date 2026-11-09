@@ -143,7 +143,7 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeStatusChanged(
     if generation <= 0 || !(0..=6).contains(&status)
         || THERMAL_GENERATION.load(Ordering::Acquire) != generation { return; }
     THERMAL_EVENTS.lock().unwrap().push((generation, status));
-    if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+    if let Some(app) = android_app() { app.create_waker().wake(); }
 }
 
 #[unsafe(no_mangle)]
@@ -154,22 +154,22 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeListenerStopped(
         generation, 0, Ordering::AcqRel, Ordering::Acquire,
     ).is_ok() {
         THERMAL_STOP_PENDING.store(true, Ordering::Release);
-        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+        if let Some(app) = android_app() { app.create_waker().wake(); }
     }
 }
 
 fn drain_platform_events() {
     // Outside drawing/App borrows; resolve actual installed identity before draining IME.
-    if let Some(window) = PLATFORM.get().and_then(|platform| platform.primary_window()) {
+    if let Some(window) = platform().and_then(|platform| platform.primary_window()) {
         window.refresh_ime_owner();
     }
     if THERMAL_STOP_PENDING.swap(false, Ordering::AcqRel)
         && THERMAL_GENERATION.load(Ordering::Acquire) == 0
     {
-        if let Some(platform) = PLATFORM.get() { platform.on_thermal_host_destroyed(); }
+        if let Some(platform) = platform() { platform.on_thermal_host_destroyed(); }
     }
     let thermal = std::mem::take(&mut *THERMAL_EVENTS.lock().unwrap());
-    if let Some(platform) = PLATFORM.get() {
+    if let Some(platform) = platform() {
         for (generation, status) in thermal {
             if THERMAL_GENERATION.load(Ordering::Acquire) == generation {
                 platform.deliver_thermal_status(generation, status);
@@ -178,13 +178,12 @@ fn drain_platform_events() {
     }
     let urls = std::mem::take(&mut *OPEN_URLS_PENDING.lock().unwrap());
     if !urls.is_empty() {
-        if let Some(platform) = PLATFORM.get() {
+        if let Some(platform) = platform() {
             platform.deliver_open_urls(urls);
         }
     }
     let text = std::mem::take(&mut *IME_TEXT.lock().unwrap());
-    if let Some(window) = PLATFORM
-        .get()
+    if let Some(window) = platform()
         .and_then(|platform| platform.primary_window())
     {
         for (session, editor, input) in text {
@@ -215,6 +214,7 @@ fn drain_platform_events() {
 /// via JNI by a custom Activity to dismiss the splash screen, although
 /// with NativeActivity the system splash handles this automatically.
 pub static NATIVE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static NATIVE_WINDOW_FOCUSED: AtomicBool = AtomicBool::new(false);
 
 /// Deferred lifecycle flags.
 ///
@@ -232,7 +232,8 @@ pub static NATIVE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// processes them AFTER `poll_events` returns.
 static PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
 static RESUME_PENDING: AtomicBool = AtomicBool::new(false);
-static FOCUS_PENDING: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
+static FOCUS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOCUS_PENDING: std::sync::Mutex<Vec<(u64, bool)>> = std::sync::Mutex::new(Vec::new());
 static TERM_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
@@ -292,7 +293,7 @@ pub unsafe extern "system" fn Java_dev_gpui_mobile_GpuiInsets_nativeInsets(
         }),
     };
     *WINDOW_INSETS_PENDING.lock() = Some((density, insets));
-    if let Some(app) = ANDROID_APP.get() {
+    if let Some(app) = android_app() {
         app.create_waker().wake();
     }
 }
@@ -349,14 +350,20 @@ pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Resu
 /// `activity_as_ptr()` returns a JNI global reference from `android-activity`
 /// that is valid for the lifetime of the app. We wrap it in a `JObject`.
 ///
-/// Requires `&Env` because jni 0.22's `JObject::from_raw` binds the
-/// local-reference-frame lifetime.
-pub fn activity<'local>(env: &jni::Env<'local>) -> Result<JObject<'local>, String> {
-    let ptr = activity_as_ptr();
-    if ptr.is_null() {
-        return Err("Activity not available".into());
-    }
-    Ok(unsafe { JObject::from_raw(env, ptr as jni::sys::jobject) })
+/// Return a local reference so the object remains valid if the Activity ends.
+pub fn activity<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, String> {
+    let app = android_app().ok_or_else(|| "Activity not available".to_string())?;
+    let object = unsafe { JObject::from_raw(env, app.activity_as_ptr() as jni::sys::jobject) };
+    env.new_local_ref(&object).map_err(|error| error.to_string())
+}
+
+fn query_activity_focus() -> Result<bool, String> {
+    with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(&activity, jni::jni_str!("gpuiHasWindowFocus"), jni::jni_sig!("()Z"), &[])
+            .and_then(|value| value.z())
+            .map_err(|error| { env.exception_clear(); error.to_string() })
+    })
 }
 
 /// Convert a Java String (`JObject` wrapping a `java.lang.String`) to a Rust `String`.
@@ -439,13 +446,11 @@ pub fn find_app_class<'local>(
 
 /// The `AndroidApp` handle from `android-activity`.
 ///
-/// Set once in `android_main`; read-only thereafter.
-static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
+/// Registered for the lifetime of one NativeActivity.
+static ANDROID_APP: parking_lot::Mutex<Option<AndroidApp>> = parking_lot::Mutex::new(None);
 
-/// Process-global `AndroidPlatform` instance.
-///
-/// Initialised once during `android_main`; read-only thereafter.
-static PLATFORM: OnceLock<Arc<AndroidPlatform>> = OnceLock::new();
+/// Current Activity's platform, cleared before its native thread exits.
+static PLATFORM: parking_lot::Mutex<Option<Arc<AndroidPlatform>>> = parking_lot::Mutex::new(None);
 
 /// Get the unicode character produced by an Android key event via JNI.
 ///
@@ -490,8 +495,7 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 /// Uses `AndroidApp::vm_as_ptr()` from the stored `AndroidApp`.
 /// Used by `platform.rs` for JNI calls.
 pub fn java_vm() -> *mut c_void {
-    ANDROID_APP
-        .get()
+    android_app()
         .map(|app| app.vm_as_ptr())
         .unwrap_or(std::ptr::null_mut())
 }
@@ -506,22 +510,21 @@ pub fn java_vm() -> *mut c_void {
 /// Code that previously used `(*activity).clazz` should use this directly
 /// as the activity jobject.
 pub fn activity_as_ptr() -> *mut c_void {
-    ANDROID_APP
-        .get()
+    android_app()
         .map(|app| app.activity_as_ptr())
         .unwrap_or(std::ptr::null_mut())
 }
 
 /// Returns a clone of the stored `AndroidApp`, if initialised.
 pub fn android_app() -> Option<AndroidApp> {
-    ANDROID_APP.get().cloned()
+    ANDROID_APP.lock().clone()
 }
 
-/// Returns a reference to the global `AndroidPlatform`, if initialised.
+/// Returns the current Activity's platform, if initialised.
 ///
 /// Returns `None` before `android_main` has set it up.
-pub fn platform() -> Option<&'static Arc<AndroidPlatform>> {
-    PLATFORM.get()
+pub fn platform() -> Option<Arc<AndroidPlatform>> {
+    PLATFORM.lock().clone()
 }
 
 /// Returns a [`SharedPlatform`] wrapping the global `Arc<AndroidPlatform>`.
@@ -535,9 +538,7 @@ pub fn platform() -> Option<&'static Arc<AndroidPlatform>> {
 ///
 /// Returns `None` before `init_platform` has been called.
 pub fn shared_platform() -> Option<SharedPlatform> {
-    PLATFORM
-        .get()
-        .map(|arc| SharedPlatform::new(Arc::clone(arc)))
+    platform().map(SharedPlatform::new)
 }
 
 // ── input event types ─────────────────────────────────────────────────────────
@@ -571,7 +572,7 @@ pub fn query_night_mode_via_jni() -> bool {
 
 /// Process input events from the `AndroidApp` and dispatch them to the window.
 fn process_input_events(app: &AndroidApp) {
-    let platform = match PLATFORM.get() {
+    let platform = match platform() {
         Some(p) => p,
         None => {
             log::trace!("process_input_events: no platform yet");
@@ -788,6 +789,7 @@ pub fn run_event_loop(app: &AndroidApp) {
     // returned so focus/input events have already been drained.
     INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
     SURFACE_INIT.lock().unwrap().begin();
+    super::frame_source::install();
     let mut iteration: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     let mut app_is_active = false;
@@ -808,7 +810,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // Check if quit was requested.
-        if let Some(platform) = PLATFORM.get() {
+        if let Some(platform) = platform() {
             if platform.should_quit() {
                 log::info!("run_event_loop: platform requested quit");
                 platform.on_thermal_host_destroyed();
@@ -818,14 +820,14 @@ pub fn run_event_loop(app: &AndroidApp) {
             platform.tick();
         }
 
-        // ── Poll for events (non-blocking) ──
-        //
-        // Non-blocking poll: process any pending events then immediately
-        // continue to rendering. No sleep — the GPU present call
-        // (get_current_texture / Mailbox) provides natural frame pacing.
-        app.poll_events(Some(Duration::ZERO), |event| match event {
+        let can_draw = INIT_WINDOW_DONE.load(Ordering::Relaxed)
+            && app_is_active
+            && !TERM_WINDOW_PENDING.load(Ordering::Relaxed)
+            && !INIT_WINDOW_PENDING.load(Ordering::Relaxed);
+        let timeout = super::frame_source::poll_timeout(None, can_draw);
+        app.poll_events(Some(timeout), |event| match event {
             PollEvent::Main(main_event) => {
-                handle_main_event(app, main_event);
+                handle_main_event(&app, main_event);
             }
             PollEvent::Wake => {}
             PollEvent::Timeout => {}
@@ -843,7 +845,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         let drain_events = |app: &AndroidApp| {
             app.poll_events(Some(Duration::ZERO), |event| {
                 if let PollEvent::Main(main_event) = event {
-                    handle_main_event(app, main_event);
+                    handle_main_event(&app, main_event);
                 }
             });
         };
@@ -854,7 +856,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
             SURFACE_INIT.lock().unwrap().begin();
             *LAST_CHROME_STYLE.lock().unwrap() = None;
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 if let Some(win) = platform.primary_window() {
                     win.term_window();
                 }
@@ -873,7 +875,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                 surface.begin();
                 ready
             };
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 if previous_surface_ready {
                     if let Some(existing) = platform.primary_window() {
                         existing.term_window();
@@ -910,9 +912,9 @@ pub fn run_event_loop(app: &AndroidApp) {
                                 }
                             };
 
-                            let succeeded = match existing
-                                .init_window(native_window, gpu_ctx.clone())
-                            {
+                            let succeeded = match platform
+                                .initialize_gpu_context(&native_window)
+                                .and_then(|()| existing.init_window(native_window, gpu_ctx.clone())) {
                                 Ok(()) => true,
                                 Err(e) => {
                                     log::warn!(
@@ -984,7 +986,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 3. WindowResized
         if WINDOW_RESIZED_PENDING.swap(false, Ordering::Relaxed) {
             log::debug!("deferred: WindowResized");
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 if let Some(win) = platform.primary_window() {
                     win.handle_resize();
                     let cr = app.content_rect();
@@ -994,8 +996,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // 4. ConfigChanged
-        if let Some(window) = PLATFORM
-            .get()
+        if let Some(window) = platform()
             .and_then(|platform| platform.primary_window())
         {
             let pending = WINDOW_INSETS_PENDING.lock().take();
@@ -1006,7 +1007,7 @@ pub fn run_event_loop(app: &AndroidApp) {
 
         if CONFIG_CHANGED_PENDING.swap(false, Ordering::Relaxed) {
             log::debug!("deferred: ConfigChanged");
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 platform.notify_keyboard_layout_change();
                 let is_dark = query_night_mode_via_jni();
                 if let Some(win) = platform.primary_window() {
@@ -1020,17 +1021,20 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
         }
 
-        if let Some(win) = PLATFORM.get().and_then(|p| p.primary_window()) {
+        if let Some(win) = platform().and_then(|p| p.primary_window()) {
             let focus = std::mem::take(&mut *FOCUS_PENDING.lock().unwrap());
-            for active in focus {
-                win.set_active(active);
+            for (generation, active) in focus {
+                if generation == FOCUS_GENERATION.load(Ordering::Acquire) {
+                    win.set_active(active);
+                    NATIVE_WINDOW_FOCUSED.store(active, Ordering::Release);
+                }
             }
         }
 
         // 5. Pause / background
         if PAUSE_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Pause (iter={})", iteration);
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 platform.did_enter_background();
                 if let Some(win) = platform.primary_window() {
                     win.notify_app_lifecycle(false);
@@ -1043,7 +1047,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 6. Resume / foreground
         if RESUME_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Resume (iter={})", iteration);
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 platform.did_become_active();
                 if let Some(win) = platform.primary_window() {
                     win.notify_app_lifecycle(true);
@@ -1054,7 +1058,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // Track active/focused state.
-        if let Some(platform) = PLATFORM.get() {
+        if let Some(platform) = platform() {
             if let Some(win) = platform.primary_window() {
                 let is_active = win.is_active();
                 if is_active != app_is_active {
@@ -1073,7 +1077,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         if INIT_WINDOW_DONE.load(Ordering::Relaxed) {
             drain_platform_events();
         }
-        process_input_events(app);
+        process_input_events(&app);
 
         // Deferred initialisation callbacks (runs once).
         if !INIT_WINDOW_DONE.load(Ordering::Relaxed)
@@ -1081,7 +1085,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             && !TERM_WINDOW_PENDING.load(Ordering::Relaxed)
             && !INIT_WINDOW_PENDING.load(Ordering::Relaxed)
         {
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 if platform.primary_window().is_some() {
                     if let Some(finish_cb) = platform.take_finish_launching_callback() {
                         log::info!("invoking finish_launching callback (iter={})", iteration);
@@ -1095,6 +1099,12 @@ pub fn run_event_loop(app: &AndroidApp) {
                     }
 
                     INIT_WINDOW_DONE.store(true, Ordering::Relaxed);
+                    if let Ok(focused) = query_activity_focus() {
+                        if let Some(win) = platform.primary_window() {
+                            win.set_active(focused);
+                            NATIVE_WINDOW_FOCUSED.store(focused, Ordering::Release);
+                        }
+                    }
                     NATIVE_INITIALIZED.store(true, Ordering::Release);
                     log::info!("NATIVE_INITIALIZED = true");
 
@@ -1112,29 +1122,28 @@ pub fn run_event_loop(app: &AndroidApp) {
             drain_platform_events();
         }
         // ── Render ──
-        if let Some(platform) = PLATFORM.get() {
+        if let Some(platform) = platform() {
             if INIT_WINDOW_DONE.load(Ordering::Relaxed)
                 && app_is_active
                 && !TERM_WINDOW_PENDING.load(Ordering::Relaxed)
                 && !INIT_WINDOW_PENDING.load(Ordering::Relaxed)
             {
                 platform.flush_main_thread_tasks();
-                if let Some(win) = platform.primary_window() {
-                    win.request_frame();
+                if crate::TEXT_INPUT_DIRTY.load(Ordering::Acquire) {
+                    super::frame_source::schedule_frame();
                 }
-
-                // Drain lifecycle events that arrived during rendering
-                // (e.g. rotation triggers TerminateWindow while we were
-                // in get_current_texture / present).
-                drain_events(app);
-                drain_platform_events();
-                process_input_events(app);
+                if super::frame_source::take_frame() {
+                    if let Some(win) = platform.primary_window() {
+                        win.request_frame();
+                    }
+                    // Drain lifecycle events that arrived during rendering.
+                    drain_events(app);
+                    drain_platform_events();
+                    process_input_events(&app);
+                }
             }
         }
 
-        // Yield CPU to avoid starving system threads and causing ANR.
-        // Keep this short — at 120Hz the frame budget is only 8.3ms.
-        std::thread::sleep(Duration::from_micros(500));
     }
 
     log::info!("run_event_loop: exiting main loop");
@@ -1211,12 +1220,12 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 
         MainEvent::GainedFocus => {
             log::info!("MainEvent::GainedFocus");
-            FOCUS_PENDING.lock().unwrap().push(true);
+            FOCUS_PENDING.lock().unwrap().push((FOCUS_GENERATION.load(Ordering::Acquire), true));
         }
 
         MainEvent::LostFocus => {
             log::info!("MainEvent::LostFocus");
-            FOCUS_PENDING.lock().unwrap().push(false);
+            FOCUS_PENDING.lock().unwrap().push((FOCUS_GENERATION.load(Ordering::Acquire), false));
         }
 
         MainEvent::Resume { .. } => {
@@ -1261,7 +1270,7 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
             THERMAL_GENERATION.store(0, Ordering::Release);
             THERMAL_STOP_PENDING.store(true, Ordering::Release);
 
-            if let Some(platform) = PLATFORM.get() {
+            if let Some(platform) = platform() {
                 platform.quit();
             }
         }
@@ -1294,7 +1303,7 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 ///
 /// Returns `true` if the application should exit.
 pub fn poll_events(timeout_ms: i32) -> bool {
-    if let Some(platform) = PLATFORM.get() {
+    if let Some(platform) = platform() {
         if platform.should_quit() {
             platform.on_thermal_host_destroyed();
             return true;
@@ -1302,7 +1311,7 @@ pub fn poll_events(timeout_ms: i32) -> bool {
         platform.tick();
     }
 
-    let app = match ANDROID_APP.get() {
+    let app = match android_app() {
         Some(app) => app,
         None => return false,
     };
@@ -1315,17 +1324,17 @@ pub fn poll_events(timeout_ms: i32) -> bool {
 
     app.poll_events(timeout, |event| match event {
         PollEvent::Main(main_event) => {
-            handle_main_event(app, main_event);
+            handle_main_event(&app, main_event);
         }
         PollEvent::Wake => {}
         _ => {}
     });
 
     drain_platform_events();
-    process_input_events(app);
+    process_input_events(&app);
 
     // Drive the GPUI rendering pipeline (same as run_event_loop).
-    if let Some(platform) = PLATFORM.get() {
+    if let Some(platform) = platform() {
         platform.flush_main_thread_tasks();
         if let Some(win) = platform.primary_window() {
             win.request_frame();
@@ -1365,25 +1374,80 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Store the `AndroidApp` globally and create the `AndroidPlatform`.
-///
-/// Must be called exactly once from `android_main` before
-/// `run_event_loop`.  Returns a reference to the platform so the caller
-/// can register callbacks (e.g. `set_on_init_window`) before entering
-/// the event loop.
-pub fn init_platform(app: &AndroidApp) -> &'static Arc<AndroidPlatform> {
-    let _ = ANDROID_APP.set(app.clone());
-    log::info!("init_platform: stored AndroidApp");
+/// Owns one Activity's platform registration on its native thread.
+/// Keep this guard alive until the GPUI application has returned from `run`.
+#[must_use]
+pub struct PlatformSession {
+    platform: Option<Arc<AndroidPlatform>>,
+    _owner: std::marker::PhantomData<std::rc::Rc<()>>,
+}
 
+impl std::ops::Deref for PlatformSession {
+    type Target = Arc<AndroidPlatform>;
+    fn deref(&self) -> &Self::Target {
+        self.platform.as_ref().expect("active platform session")
+    }
+}
+impl Drop for PlatformSession {
+    fn drop(&mut self) {
+        IME_ACTIVE.store(false, Ordering::Release);
+        IME_LOGICAL_OWNER.store(false, Ordering::Release);
+        IME_HAS_HANDLER.store(false, Ordering::Release);
+        IME_GENERATION.fetch_add(1, Ordering::AcqRel);
+        IME_EDITOR.fetch_add(1, Ordering::AcqRel);
+        FOCUS_GENERATION.fetch_add(1, Ordering::AcqRel);
+        IME_TEXT.lock().unwrap().clear();
+        FOCUS_PENDING.lock().unwrap().clear();
+        WINDOW_INSETS_PENDING.lock().take();
+        crate::TEXT_INPUT_DIRTY.store(false, Ordering::Release);
+        super::frame_source::uninstall();
+        crate::mobile_events::clear_activity_handlers();
+        crate::mobile_dispatch::set_text_handler(None);
+        super::accessibility::close_activity();
+        NATIVE_INITIALIZED.store(false, Ordering::Release);
+        NATIVE_WINDOW_FOCUSED.store(false, Ordering::Release);
+        let stored = PLATFORM.lock().take();
+        drop(stored);
+        if let Some(platform) = self.platform.take() {
+            let dispatcher = platform.foreground_executor();
+            drop(platform);
+            while gpui::wake_android_foreground_tasks() != 0 {
+                dispatcher.cancel_foreground_queue();
+                std::thread::yield_now();
+            }
+            dispatcher.cancel_foreground_queue();
+            dispatcher.shutdown();
+        }
+        ANDROID_APP.lock().take();
+    }
+}
+
+/// Register a platform for the current Activity's native thread.
+/// Keep the returned guard alive until the application exits its event loop.
+pub fn init_platform(app: &AndroidApp) -> PlatformSession {
+    assert!(PLATFORM.lock().is_none());
+    FOCUS_GENERATION.fetch_add(1, Ordering::AcqRel);
+    *ANDROID_APP.lock() = Some(app.clone());
+    for flag in [
+        &INIT_WINDOW_DONE,
+        &NATIVE_INITIALIZED,
+        &PAUSE_PENDING,
+        &RESUME_PENDING,
+        &TERM_WINDOW_PENDING,
+        &INIT_WINDOW_PENDING,
+        &WINDOW_RESIZED_PENDING,
+        &CONFIG_CHANGED_PENDING,
+    ] {
+        flag.store(false, Ordering::Release);
+    }
+    *SURFACE_INIT.lock().unwrap() = SurfaceInit::new();
+    *LAST_CHROME_STYLE.lock().unwrap() = None;
     let platform = Arc::new(AndroidPlatform::new(false));
-    log::info!("init_platform: AndroidPlatform created");
-
-    PLATFORM
-        .set(Arc::clone(&platform))
-        .unwrap_or_else(|_| log::warn!("PLATFORM already set — duplicate init_platform?"));
-
-    // SAFETY: we just set it above.
-    PLATFORM.get().unwrap()
+    *PLATFORM.lock() = Some(platform.clone());
+    PlatformSession {
+        platform: Some(platform),
+        _owner: std::marker::PhantomData,
+    }
 }
 
 // ── system chrome (status bar / navigation bar) ───────────────────────────────
@@ -1867,7 +1931,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_committed(
         log::info!("IME JNI commit session={session} editor={editor} action={action}");
         let Some(input) = crate::mobile_events::ime_action(action, text) else { return Ok(()); };
         IME_TEXT.lock().unwrap().push((session, editor, input));
-        if let Some(app) = ANDROID_APP.get() {
+        if let Some(app) = android_app() {
             app.create_waker().wake();
         }
         Ok(())
@@ -1888,7 +1952,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composed(
         IME_TEXT.lock().unwrap().push((session, editor, crate::mobile_events::ImeInput::Compose {
             text, selection: start as usize..end as usize, region: None,
         }));
-        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+        if let Some(app) = android_app() { app.create_waker().wake(); }
         Ok(())
     });
 }
@@ -1908,7 +1972,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composingRegion(
                 text: String::new(), selection: 0..0,
                 region: Some(crate::mobile_events::ImeComposeRegion { text, start_offset, end_offset }),
             }));
-        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+        if let Some(app) = android_app() { app.create_waker().wake(); }
         Ok(())
     });
 }
@@ -1944,13 +2008,40 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_deleteBefore(
         return 0;
     };
     IME_TEXT.lock().unwrap().push((session, editor, input));
-    if let Some(app) = ANDROID_APP.get() {
+    if let Some(app) = android_app() {
         app.create_waker().wake();
     }
     1
 }
 
 // ── JNI export for GpuiActivity splash screen ────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeWindowFocusChanged(
+    _env: *mut std::ffi::c_void,
+    activity_ref: *mut std::ffi::c_void,
+    focused: u8,
+) {
+    let generation = FOCUS_GENERATION.load(Ordering::Acquire);
+    let Some(app) = android_app() else { return; };
+    let is_current = with_env(|env| {
+        let source = unsafe { JObject::from_raw(env, activity_ref as jni::sys::jobject) };
+        let current = unsafe { JObject::from_raw(env, app.activity_as_ptr() as jni::sys::jobject) };
+        env.is_same_object(&source, &current).map_err(|error| error.to_string())
+    }).unwrap_or(false);
+    if is_current {
+        FOCUS_PENDING.lock().unwrap().push((generation, focused != 0));
+        app.create_waker().wake();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeHasWindowFocus(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) -> u8 {
+    NATIVE_WINDOW_FOCUSED.load(Ordering::Acquire) as u8
+}
 
 /// Called from `GpuiActivity.nativeIsInitialized()` to check whether the
 /// native library has finished initializing (first frame rendered).
@@ -1998,7 +2089,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
         }
         log::info!("nativeOnDeepLink: {}", url_string);
         OPEN_URLS_PENDING.lock().unwrap().push(url_string.clone());
-        if let Some(app) = ANDROID_APP.get() {
+        if let Some(app) = android_app() {
             app.create_waker().wake();
         }
 

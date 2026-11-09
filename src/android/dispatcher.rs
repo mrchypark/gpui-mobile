@@ -49,6 +49,8 @@ const ALOOPER_EVENT_INPUT: i32 = 1;
 unsafe extern "C" {
     /// Returns the looper associated with the calling thread, or null.
     fn ALooper_forThread() -> *mut libc_looper_opaque;
+    fn ALooper_acquire(looper: *mut libc_looper_opaque);
+    fn ALooper_release(looper: *mut libc_looper_opaque);
     /// Adds a file-descriptor to the looper.
     fn ALooper_addFd(
         looper: *mut libc_looper_opaque,
@@ -130,7 +132,7 @@ struct DelayedTask {
 
 struct TimerQueue {
     sender: Mutex<Option<std::sync::mpsc::Sender<DelayedTask>>>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<Vec<DelayedTask>>>>,
 }
 
 impl TimerQueue {
@@ -171,6 +173,7 @@ impl TimerQueue {
                         let _ = background.send(pending.remove(0).task);
                     }
                 }
+                pending
             })
             .expect("failed to spawn timer thread");
         Self {
@@ -194,7 +197,11 @@ impl TimerQueue {
         let worker = self.worker.lock().take();
         if let Some(worker) = worker {
             if worker.thread().id() != std::thread::current().id() {
-                let _ = worker.join();
+                // Delayed tasks can wake non-Send foreground futures when dropped.
+                // Their cancellation must therefore happen on the owner thread.
+                if let Ok(pending) = worker.join() {
+                    drop(pending);
+                }
             }
         }
     }
@@ -222,6 +229,7 @@ pub struct AndroidDispatcher {
     /// main thread).
     looper: *mut libc_looper_opaque,
     owner_thread: std::thread::ThreadId,
+    registered: AtomicBool,
     /// Background thread-pool.
     pool: ThreadPool,
     timers: TimerQueue,
@@ -256,6 +264,7 @@ impl AndroidDispatcher {
             "AndroidDispatcher::new() must be called on the Android main thread"
         );
 
+        unsafe { ALooper_acquire(looper) };
         let pool_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -273,6 +282,7 @@ impl AndroidDispatcher {
             read_fd,
             looper,
             owner_thread: std::thread::current().id(),
+            registered: AtomicBool::new(false),
             pool,
             timers,
             shutdown: AtomicBool::new(false),
@@ -312,6 +322,7 @@ impl AndroidDispatcher {
             read_fd,
             looper: std::ptr::null_mut(), // no real looper in headless mode
             owner_thread: std::thread::current().id(),
+            registered: AtomicBool::new(false),
             pool,
             timers,
             shutdown: AtomicBool::new(false),
@@ -384,11 +395,20 @@ impl AndroidDispatcher {
         }
     }
 
+    pub(crate) fn cancel_foreground_queue(&self) {
+        assert!(self.is_main_thread());
+        let tasks = std::mem::take(&mut self.main_queue.lock().tasks);
+        drop(tasks);
+    }
+
     /// Stop accepting work and cancel pending timers. Already-running work may finish.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.timers.stop();
-        self.unregister_from_looper();
+        if !self.shutdown.swap(true, Ordering::SeqCst) {
+            self.timers.stop();
+            self.unregister_from_looper();
+            let tasks = std::mem::take(&mut self.main_queue.lock().tasks);
+            drop(tasks);
+        }
     }
 
     // ── private helpers ───────────────────────────────────────────────────────
@@ -398,9 +418,7 @@ impl AndroidDispatcher {
         // is a free `extern "C"` function that reconstructs the Arc from the
         // raw pointer.
         //
-        // SAFETY: `self` outlives the looper registration because we hold an
-        // `Arc<Self>` for the lifetime of the process (stored in
-        // `GLOBAL_DISPATCHER`).
+        // The registration owns this Arc until it is removed on the owner thread.
         let data_ptr = Arc::into_raw(Arc::clone(&self.main_queue)) as *mut std::ffi::c_void;
 
         let ret = unsafe {
@@ -414,7 +432,9 @@ impl AndroidDispatcher {
             )
         };
 
-        if ret != 1 {
+        if ret == 1 {
+            self.registered.store(true, Ordering::Release);
+        } else {
             unsafe {
                 drop(Arc::from_raw(data_ptr as *const Mutex<MainQueue>));
             }
@@ -426,9 +446,14 @@ impl AndroidDispatcher {
     }
 
     fn unregister_from_looper(&self) {
-        if !self.looper.is_null() {
+        if self.registered.swap(false, Ordering::AcqRel) {
+            assert!(
+                self.is_main_thread(),
+                "looper shutdown must be on its owner thread"
+            );
             unsafe {
                 ALooper_removeFd(self.looper, self.read_fd);
+                drop(Arc::from_raw(Arc::as_ptr(&self.main_queue)));
             }
         }
     }
@@ -445,8 +470,10 @@ impl Default for AndroidDispatcher {
 
 impl Drop for AndroidDispatcher {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.unregister_from_looper();
+        self.shutdown();
+        if !self.looper.is_null() {
+            unsafe { ALooper_release(self.looper) };
+        }
         // Close file descriptors.
         unsafe {
             libc_close(self.read_fd);
@@ -461,8 +488,10 @@ impl Drop for AndroidDispatcher {
 ///
 /// Drains the entire task queue before returning 1 (keep the fd registered).
 unsafe extern "C" fn looper_callback(fd: RawFd, _events: i32, data: *mut std::ffi::c_void) -> i32 {
-    // Reconstruct the Arc without dropping it (we'll re-leak at the end).
-    let queue_arc = unsafe { Arc::from_raw(data as *const Mutex<MainQueue>) };
+    // A callback may unregister itself; retain its own queue reference.
+    let queue_ptr = data as *const Mutex<MainQueue>;
+    unsafe { Arc::increment_strong_count(queue_ptr); }
+    let queue_arc = unsafe { Arc::from_raw(queue_ptr) };
 
     // Drain the wake pipe (ignore errors — just consume the byte(s)).
     let mut buf = [0u8; 64];
@@ -485,9 +514,7 @@ unsafe extern "C" fn looper_callback(fd: RawFd, _events: i32, data: *mut std::ff
         }
     }
 
-    // Leak the Arc again so it isn't freed — the data pointer lifetime is
-    // managed by `AndroidDispatcher`.
-    std::mem::forget(queue_arc);
+    drop(queue_arc);
 
     1 // keep fd registered
 }
@@ -656,6 +683,7 @@ mod tests {
             read_fd,
             looper: std::ptr::null_mut(),
             owner_thread: std::thread::current().id(),
+            registered: AtomicBool::new(false),
             pool,
             timers,
             shutdown: AtomicBool::new(false),
@@ -687,6 +715,34 @@ mod tests {
         dispatcher.shutdown();
         dispatcher.dispatch_on_main_thread(|| panic!("accepted after shutdown"));
         dispatcher.flush_main_thread_tasks();
+    }
+
+    #[test]
+    fn shutdown_releases_foreground_queue_once() {
+        let dispatcher = AndroidDispatcher::new_headless();
+        let token = Arc::new(());
+        let queued = token.clone();
+        dispatcher.dispatch_on_main_thread(move || drop(queued));
+        assert_eq!(Arc::strong_count(&token), 2);
+        dispatcher.shutdown();
+        dispatcher.shutdown();
+        assert_eq!(Arc::strong_count(&token), 1);
+    }
+
+    #[test]
+    fn shutdown_drops_pending_timer_on_owner_thread() {
+        struct DropThread(Arc<Mutex<Option<std::thread::ThreadId>>>);
+        impl Drop for DropThread {
+            fn drop(&mut self) {
+                *self.0.lock() = Some(std::thread::current().id());
+            }
+        }
+        let dispatcher = AndroidDispatcher::new_headless();
+        let dropped = Arc::new(Mutex::new(None));
+        let token = DropThread(dropped.clone());
+        dispatcher.dispatch_after(Duration::from_secs(60), move || drop(token));
+        dispatcher.shutdown();
+        assert_eq!(*dropped.lock(), Some(std::thread::current().id()));
     }
 
     #[test]

@@ -52,13 +52,7 @@ pub(crate) fn windows() -> Vec<std::rc::Rc<super::window::IosWindowInner>> {
 
 pub(crate) fn wake_windows() {
     for window in windows() {
-        window.request_frame_callback.call(
-            || window.can_render(),
-            |callback| callback(RequestFrameOptions {
-                force_render: true,
-                ..Default::default()
-            }),
-        );
+        window.frame_demand.wake();
     }
 }
 
@@ -308,19 +302,26 @@ pub extern "C" fn gpui_ios_handle_touch(
 /// The window_ptr should be the value returned by gpui_ios_get_window().
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
+    gpui_ios_request_frame_if_needed(window_ptr);
+}
+
+/// Render one tick and return whether another frame is needed.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_request_frame_if_needed(window_ptr: *mut c_void) -> bool {
     if window_ptr.is_null() {
-        return;
+        return false;
     }
 
     // Safety: window_ptr must be a valid pointer to an IosWindow
     let Some(window) = window_for_handle(window_ptr as usize) else {
-        return;
+        return false;
     };
 
     // ── Momentum scrolling ───────────────────────────────────────────────
     if !window.can_render() {
-        return;
+        return false;
     }
+    window.frame_demand.clear();
     // Pump the momentum scroller BEFORE the render callback so that any
     // synthetic ScrollWheel events are processed during this frame's
     // layout/paint cycle.  This produces the smooth, decelerating inertia
@@ -343,6 +344,20 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
             });
         },
     );
+    window.frame_demand.is_pending()
+        || crate::TEXT_INPUT_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Register a main-thread callback that resumes the host's frame source.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_frame_waker(
+    window_ptr: *mut c_void,
+    waker: Option<unsafe extern "C" fn(*mut c_void)>,
+    context: *mut c_void,
+) {
+    if let Some(window) = window_for_handle(window_ptr as usize) {
+        window.frame_demand.set_host_waker(waker.map(|waker| (waker, context)));
+    }
 }
 
 /// Show the software keyboard.

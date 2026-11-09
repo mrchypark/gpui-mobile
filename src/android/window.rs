@@ -346,6 +346,7 @@ pub struct AndroidWindow {
     legacy_multitouch: std::sync::atomic::AtomicBool,
     app_resumed: std::sync::atomic::AtomicBool,
     visibility_callback: Mutex<Option<Box<dyn FnMut(gpui::WindowVisibility) + Send>>>,
+    a11y: std::sync::Mutex<Option<super::accessibility::Handlers>>,
 }
 
 // SAFETY: `WindowState` is protected by a `Mutex`.
@@ -384,6 +385,9 @@ impl AndroidWindow {
         }
         self.emit_mobile_events(events);
         self.notify_visibility(before);
+        if resumed {
+            super::frame_source::resume();
+        }
     }
 
     fn visibility(&self) -> gpui::WindowVisibility {
@@ -506,6 +510,7 @@ impl AndroidWindow {
             legacy_multitouch: std::sync::atomic::AtomicBool::new(false),
             app_resumed: std::sync::atomic::AtomicBool::new(true),
             visibility_callback: Mutex::new(None),
+            a11y: Default::default(),
         }))
     }
 
@@ -544,6 +549,7 @@ impl AndroidWindow {
             legacy_multitouch: std::sync::atomic::AtomicBool::new(false),
             app_resumed: std::sync::atomic::AtomicBool::new(false),
             visibility_callback: Mutex::new(None),
+            a11y: Default::default(),
         })
     }
 
@@ -617,6 +623,10 @@ impl AndroidWindow {
             .surface(SurfaceLifecycle::Available, std::time::Duration::ZERO);
         self.emit_mobile_events(events);
         self.notify_visibility(previous_visibility);
+        if let Some(handlers) = self.a11y.lock().expect("poisoned").clone() {
+            super::accessibility::init(&handlers);
+        }
+        super::frame_source::resume();
         Ok(())
     }
 
@@ -1006,6 +1016,12 @@ impl AndroidWindow {
             self.state.lock().key_meta_state = 0;
         }
         self.activity.set_active(active);
+        if active {
+            if let Some(handlers) = self.a11y.lock().expect("poisoned").clone() {
+                super::accessibility::init(&handlers);
+            }
+            super::frame_source::resume();
+        }
     }
 
     // ── transparency ──────────────────────────────────────────────────────────
@@ -1282,6 +1298,39 @@ impl AndroidWindow {
         RawAndroidWindow { nw_ptr }
     }
 
+    /// Initialize the selected backend before creating a presentation surface.
+    pub(crate) fn initialize_gpu_context(
+        native_window: &NativeWindow,
+        gpu_context: &GpuContext,
+        backend: super::AndroidBackend,
+    ) -> Result<()> {
+        if gpu_context.borrow().is_some() {
+            return Ok(());
+        }
+        let raw = Self::raw_window(native_window);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: match backend {
+                super::AndroidBackend::Vulkan => wgpu::Backends::VULKAN,
+                super::AndroidBackend::Gles => wgpu::Backends::GL,
+            },
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: Some(Box::new(raw)),
+        });
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: None,
+                raw_window_handle: raw.window_handle()?.as_raw(),
+            })?
+        };
+        let context = WgpuContext::new(instance, &surface, None)?;
+        log::info!("Android GPU backend selected: {:?}", context.adapter.get_info().backend);
+        drop(surface);
+        *gpu_context.borrow_mut() = Some(context);
+        Ok(())
+    }
+
     /// Create a `WgpuRenderer` for the given `NativeWindow`.
     fn create_renderer(
         native_window: &NativeWindow,
@@ -1335,6 +1384,9 @@ impl AndroidWindow {
 
 impl Drop for AndroidWindow {
     fn drop(&mut self) {
+        if let Some(handlers) = self.a11y.lock().expect("poisoned").take() {
+            super::accessibility::close(&handlers);
+        }
         let mut state = self.state.lock();
 
         // Destroy renderer before releasing the native window.
@@ -1449,6 +1501,18 @@ impl HasDisplayHandle for AndroidPlatformWindow {
 }
 
 impl PlatformWindow for AndroidPlatformWindow {
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        let handlers = super::accessibility::Handlers::new(callbacks);
+        *self.window.a11y.lock().expect("poisoned") = Some(handlers.clone());
+        super::accessibility::init(&handlers);
+    }
+
+    fn a11y_tree_update(&self, tree: gpui::accesskit::TreeUpdate) {
+        if let Some(handlers) = self.window.a11y.lock().expect("poisoned").clone() {
+            super::accessibility::update(&handlers, tree);
+        }
+    }
+
     fn bounds(&self) -> gpui::Bounds<gpui::Pixels> {
         let state = self.window.state.lock();
         let w = state.width as f32 / state.scale_factor;
@@ -1595,6 +1659,14 @@ impl PlatformWindow for AndroidPlatformWindow {
         true
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        Some(Rc::new(super::frame_source::schedule_frame))
+    }
+
+    fn schedule_frame(&self) {
+        super::frame_source::schedule_frame();
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         // PlatformWindow gives us Box<dyn FnMut(...)> (not Send).
         // AndroidWindow::on_request_frame requires Send.  On Android the
@@ -1733,6 +1805,9 @@ impl PlatformWindow for AndroidPlatformWindow {
                 force_render: text_dirty,
                 ..Default::default()
             });
+            if !crate::mobile_events::raw_touch_only() && momentum.lock().scroller.is_active() {
+                super::frame_source::schedule_frame();
+            }
         });
     }
 
@@ -2104,8 +2179,12 @@ impl PlatformWindow for AndroidPlatformWindow {
                             }
                         }
 
+                        let needs_scroll_frame = ms.has_pending_scroll;
                         // Drop momentum lock before dispatching MouseMove.
                         drop(ms);
+                        if needs_scroll_frame {
+                            super::frame_source::schedule_frame();
+                        }
 
                         // Always emit MouseMove so interactive screens can
                         // track finger position (drag line in Animations,
@@ -2199,9 +2278,13 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 let (vx, vy) = ms.velocity_tracker.velocity();
                                 ms.velocity_tracker.reset();
                                 ms.scroller.fling(vx, vy, logical_x, logical_y);
+                                let fling_active = ms.scroller.is_active();
 
                                 // Drop momentum lock before dispatching.
                                 drop(ms);
+                                if fling_active {
+                                    super::frame_source::schedule_frame();
+                                }
 
                                 let mut guard = cb.lock();
                                 // ScrollWheel Ended for scroll containers.

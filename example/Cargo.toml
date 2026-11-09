@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-mobile = { path = ".." }
-gpui = { package = "gpui-pre", version = "=0.3.10", default-features = false }
+gpui = { package = "gpui-fast", version = "=0.1.12", default-features = false }
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.10" }
 log = "0.4"
 
@@ -31,8 +31,8 @@ android_logger = "0.15"
 android-activity = { version = "0.6", features = ["native-activity"] }
 
 [patch.crates-io]
-gpui-pre = { path = "../vendor/gpui-pre" }
-gpui-pre-wgpu = { path = "../vendor/gpui-pre-wgpu" }
+gpui-fast = { path = "../vendor/gpui-fast" }
+gpui-fast-wgpu = { path = "../vendor/gpui-fast-wgpu" }
 
 [profile.release]
 opt-level = "z"

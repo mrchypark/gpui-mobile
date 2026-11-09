@@ -13,6 +13,101 @@ pub use scheduler::{
     DedicatedExecutor, FallibleTask, LocalExecutor as SchedulerLocalExecutor, Priority, Task,
 };
 
+#[cfg(target_os = "android")]
+thread_local! {
+    static ANDROID_FOREGROUND_TASKS: std::cell::RefCell<std::collections::HashMap<u64, std::task::Waker>> = Default::default();
+    static ANDROID_FOREGROUND_NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_os = "android")]
+struct AndroidTrackedFuture<F> {
+    id: u64,
+    future: std::pin::Pin<Box<F>>,
+}
+
+#[cfg(target_os = "android")]
+impl<F> AndroidTrackedFuture<F> {
+    fn new(future: F) -> Self {
+        let id = ANDROID_FOREGROUND_NEXT.with(|next| {
+            let id = next.get();
+            next.set(id.checked_add(1).expect("foreground task id overflow"));
+            id
+        });
+        Self {
+            id,
+            future: Box::pin(future),
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl<F: Future> Future for AndroidTrackedFuture<F> {
+    type Output = F::Output;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.future.as_mut().poll(cx) {
+            std::task::Poll::Pending => {
+                ANDROID_FOREGROUND_TASKS.with(|tasks| {
+                    tasks.borrow_mut().insert(self.id, cx.waker().clone());
+                });
+                std::task::Poll::Pending
+            }
+            std::task::Poll::Ready(output) => {
+                ANDROID_FOREGROUND_TASKS.with(|tasks| {
+                    tasks.borrow_mut().remove(&self.id);
+                });
+                std::task::Poll::Ready(output)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl<F> Drop for AndroidTrackedFuture<F> {
+    fn drop(&mut self) {
+        let _ = ANDROID_FOREGROUND_TASKS.try_with(|tasks| tasks.borrow_mut().remove(&self.id));
+    }
+}
+
+/// Wake suspended Activity-local tasks so their runnables can be cancelled on their owner thread.
+#[doc(hidden)]
+#[cfg(target_os = "android")]
+pub fn wake_android_foreground_tasks() -> usize {
+    let tasks = ANDROID_FOREGROUND_TASKS.with(|tasks| {
+        tasks.borrow().values().cloned().collect::<Vec<_>>()
+    });
+    let count = tasks.len();
+    for task in tasks {
+        task.wake();
+    }
+    count
+}
+
+#[cfg(all(test, target_os = "android"))]
+mod android_task_tests {
+    use super::*;
+
+    #[test]
+    fn pending_task_is_removed_when_cancelled() {
+        let mut future = Box::pin(AndroidTrackedFuture::new(std::future::pending::<()>()));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(wake_android_foreground_tasks(), 1);
+        drop(future);
+        assert_eq!(wake_android_foreground_tasks(), 0);
+    }
+
+    #[test]
+    fn completed_task_is_not_retained() {
+        let mut future = Box::pin(AndroidTrackedFuture::new(std::future::ready(7)));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(future.as_mut().poll(&mut cx), std::task::Poll::Ready(7));
+        assert_eq!(wake_android_foreground_tasks(), 0);
+    }
+}
+
 /// A pointer to the executor that is currently running,
 /// for spawning background tasks.
 #[derive(Clone)]
@@ -355,6 +450,8 @@ impl ForegroundExecutor {
     where
         R: 'static,
     {
+        #[cfg(target_os = "android")]
+        let future = AndroidTrackedFuture::new(future);
         self.inner.spawn(future.boxed_local())
     }
 
@@ -369,6 +466,8 @@ impl ForegroundExecutor {
         R: 'static,
     {
         // Priority is ignored for foreground tasks - they run in order on the main thread
+        #[cfg(target_os = "android")]
+        let future = AndroidTrackedFuture::new(future);
         self.inner.spawn(future)
     }
 
@@ -390,6 +489,8 @@ impl ForegroundExecutor {
     where
         R: 'static,
     {
+        #[cfg(target_os = "android")]
+        let future = AndroidTrackedFuture::new(future);
         let dispatcher = self.dispatcher.clone();
         #[cfg(feature = "profiler")]
         let foreground_runnables = self.foreground_runnables.clone();

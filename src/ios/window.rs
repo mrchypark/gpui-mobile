@@ -838,6 +838,7 @@ pub(crate) struct IosWindowInner {
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: Callback<Box<dyn FnMut(RequestFrameOptions)>>,
+    pub(super) frame_demand: Rc<crate::frame_demand::FrameDemand>,
     /// Callback for input events
     input_callback: Callback<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     /// Callback for active status changes
@@ -1004,6 +1005,10 @@ impl IosWindowInner {
                 self.legacy_multitouch.set(false);
             }
             self.surface_available.set(available);
+            if available {
+                self.frame_demand.clear();
+                self.frame_demand.wake();
+            }
             let phase = if available {
                 SurfaceLifecycle::Available
             } else {
@@ -1156,6 +1161,7 @@ impl IosWindowInner {
                 proxy_text: RefCell::new(String::new()),
                 input_configuration: RefCell::new(gpui::TextInputConfiguration::default()),
                 request_frame_callback: Callback::default(),
+                frame_demand: Rc::new(crate::frame_demand::FrameDemand::default()),
                 input_callback: Callback::default(),
                 active_status_callback: Callback::default(),
                 visibility_callback: Callback::default(),
@@ -1606,6 +1612,9 @@ impl IosWindowInner {
                         self.momentum_scroller
                             .borrow_mut()
                             .fling(vx, vy, logical_x, logical_y);
+                        if self.momentum_scroller.borrow().is_active() {
+                            self.frame_demand.wake();
+                        }
                     }
                     TouchState::Idle => {}
                 }
@@ -1710,6 +1719,8 @@ impl IosWindowInner {
                 touch_phase: gpui::TouchPhase::Ended,
                 source: gpui::ScrollSource::Touch,
             }));
+        } else {
+            self.frame_demand.wake();
         }
     }
 
@@ -1942,6 +1953,10 @@ impl IosWindowInner {
 
         self.active_status_callback
             .call(|| !self.closed.get(), |callback| callback(is_active));
+        if is_active {
+            self.frame_demand.clear();
+            self.frame_demand.wake();
+        }
     }
 
     /// Handle a layout change (e.g. rotation, split-screen resize).
@@ -2036,6 +2051,7 @@ impl Drop for IosWindow {
             let _: () = msg_send![class!(NSObject), cancelPreviousPerformRequestsWithTarget: self.text_input_view];
         }
         self.request_frame_callback.set(None);
+        self.frame_demand.set_host_waker(None);
         self.input_callback.set(None);
         self.active_status_callback.set(None);
         self.visibility_callback.set(None);
@@ -2308,6 +2324,19 @@ impl PlatformWindow for IosWindow {
 
     fn is_fullscreen(&self) -> bool {
         true
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let demand = Rc::downgrade(&self.frame_demand);
+        Some(Rc::new(move || {
+            if let Some(demand) = demand.upgrade() {
+                demand.wake();
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.frame_demand.wake();
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {

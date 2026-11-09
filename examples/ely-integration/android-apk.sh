@@ -33,6 +33,9 @@ elif [ "${GPUI_PLATFORM_EXTENDED:-0}" = 1 ]; then
 elif [ "${GPUI_PLATFORM_SMOKE:-0}" = 1 ]; then
     features="${features:+$features,}platform-smoke"
 fi
+if [ "${GPUI_LIFECYCLE_STRESS:-0}" = 1 ]; then
+    features="${features:+$features,}lifecycle-stress"
+fi
 feature_arg=
 if [ -n "$features" ]; then feature_arg="--features=$features"; fi
 # Android 16 KB page devices require every ELF LOAD segment to use 16 KB alignment.

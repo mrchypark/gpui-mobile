@@ -79,6 +79,15 @@ pub fn set_mobile_event_handler(handler: Option<EventHandler>) {
     });
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn clear_activity_handlers() {
+    EVENTS.with(|queue| queue.set_handler(None));
+    APP_LIFECYCLE.with(|queue| queue.set_handler(None));
+    MEMORY_WARNING.with(|queue| queue.set_handler(None));
+    OPEN_URLS.with(|queue| queue.set_handler(None));
+    THERMAL_CHANGE.with(|queue| queue.set_handler(None));
+}
+
 pub(crate) fn dispatch(window: u64, event: &MobileEvent) {
     dispatch_batch(window, [event.clone()]);
 }

@@ -34,6 +34,7 @@ struct WgpuAtlasTextures {
     queue: Arc<wgpu::Queue>,
     max_texture_size: u32,
     color_texture_format: wgpu::TextureFormat,
+    mono_rgba: bool,
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
@@ -57,6 +58,7 @@ impl WgpuAtlas {
             queue,
             max_texture_size,
             color_texture_format,
+            mono_rgba: false,
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
@@ -64,11 +66,14 @@ impl WgpuAtlas {
     }
 
     pub fn from_context(context: &WgpuContext) -> Self {
-        Self::new(
+        let atlas = Self::new(
             context.device.clone(),
             context.queue.clone(),
             context.color_texture_format(),
-        )
+        );
+        atlas.0.lock().backend.mono_rgba = cfg!(target_os = "android")
+            && context.adapter.get_info().backend == wgpu::Backend::Gl;
+        atlas
     }
 
     pub fn before_frame(&self) {
@@ -105,6 +110,8 @@ impl WgpuAtlas {
             textures.device = context.device.clone();
             textures.queue = context.queue.clone();
             textures.color_texture_format = context.color_texture_format();
+            textures.mono_rgba = cfg!(target_os = "android")
+                && context.adapter.get_info().backend == wgpu::Backend::Gl;
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
         });
@@ -198,6 +205,7 @@ impl WgpuAtlasTextures {
 
         let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
         let format = match kind {
+            AtlasTextureKind::Monochrome if self.mono_rgba => wgpu::TextureFormat::Rgba8Unorm,
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
         };
@@ -255,11 +263,14 @@ impl WgpuAtlasTextures {
     }
 
     fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        let data = self
-            .storage
-            .get(id)
-            .map(|texture| swizzle_upload_data(bytes, texture.format))
-            .unwrap_or_else(|| bytes.to_vec());
+        let data = if id.kind == AtlasTextureKind::Monochrome && self.mono_rgba {
+            expand_monochrome(bytes)
+        } else {
+            self.storage
+                .get(id)
+                .map(|texture| swizzle_upload_data(bytes, texture.format))
+                .unwrap_or_else(|| bytes.to_vec())
+        };
 
         self.pending_uploads
             .push(PendingUpload { id, bounds, data });
@@ -377,6 +388,10 @@ impl WgpuAtlasTexture {
     fn is_unreferenced(&self) -> bool {
         self.live_atlas_keys == 0
     }
+}
+
+fn expand_monochrome(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().flat_map(|&alpha| [alpha, alpha, alpha, alpha]).collect()
 }
 
 fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
@@ -546,6 +561,11 @@ mod tests {
         assert_eq!(second_tile.texture_id, first_tile.texture_id);
         assert_ne!(second_generation, first_generation);
         Ok(())
+    }
+
+    #[test]
+    fn monochrome_rgba_upload_preserves_coverage() {
+        assert_eq!(expand_monochrome(&[0, 128, 255]), vec![0, 0, 0, 0, 128, 128, 128, 128, 255, 255, 255, 255]);
     }
 
     #[test]

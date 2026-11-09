@@ -89,7 +89,7 @@ core-graphics       = "0.24"
 core-text           = "=21.0.0"
 uuid                = { version = "1", features = ["v4", "v5"] }
 block2              = "0.6"
-libc                = "=0.2.189"
+libc                = "=0.2.191"
 
 # wgpu renderer (Metal backend on iOS/Android)
 gpui_wgpu = { package = "gpui-fast-wgpu", version = "=0.1.12", features = ["font-kit"] }
@@ -107,7 +107,7 @@ font-kit = { package = "zed-font-kit", version = "0.14.1-zed" }
 [target.'cfg(target_os = "android")'.dependencies]
 # JNI / NDK bindings
 jni         = "0.22"
-libc        = "0.2"
+libc        = "=0.2.191"
 # Keep `ndk` on the baseline `nativewindow` feature set. Enabling
 # `api-level-31` links API 31 symbols directly, so the shared library
 # fails to `dlopen` on older Android versions before our own code runs.

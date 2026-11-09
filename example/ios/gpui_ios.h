@@ -76,6 +76,8 @@ void gpui_ios_handle_touch(void* window_ptr, void* touch_ptr, void* event_ptr);
 /// This should be called from CADisplayLink callback.
 /// The window_ptr should be the value returned by gpui_ios_get_window().
 void gpui_ios_request_frame(void* window_ptr);
+bool gpui_ios_request_frame_if_needed(void* window_ptr);
+void gpui_ios_set_frame_waker(void* window_ptr, void (*waker)(void*), void* context);
 
 /// Get the most recently created GPUI window pointer.
 ///

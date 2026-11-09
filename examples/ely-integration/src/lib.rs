@@ -202,6 +202,25 @@ pub extern "C" fn gpui_ios_run_ely() {
 }
 
 fn open_window(cx: &mut App) {
+    #[cfg(all(target_os = "android", feature = "lifecycle-stress"))]
+    {
+        let timer = cx.background_executor().timer(std::time::Duration::from_secs(4));
+        cx.foreground_executor().spawn(async move { timer.await }).detach();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+        let wake = slot.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            if let Some(waker) = wake.lock().unwrap().take() {
+                waker.wake();
+            }
+        });
+        cx.foreground_executor()
+            .spawn(std::future::poll_fn(move |cx| {
+                *slot.lock().unwrap() = Some(cx.waker().clone());
+                std::task::Poll::<()>::Pending
+            }))
+            .detach();
+    }
     #[cfg(all(feature = "platform-smoke", any(target_os = "ios", target_os = "android")))]
     platform_smoke::run();
     #[cfg(all(feature = "platform-extended", any(target_os = "ios", target_os = "android")))]
@@ -356,6 +375,6 @@ fn open_window(cx: &mut App) {
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
     gpui_mobile::android::jni::install_panic_hook();
-    gpui_mobile::android::jni::init_platform(&app);
+    let _platform_session = gpui_mobile::android::jni::init_platform(&app);
     run();
 }
