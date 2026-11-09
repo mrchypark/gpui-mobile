@@ -10,12 +10,14 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.media.MediaRecorder;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.util.Size;
 import android.util.SparseArray;
 import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -33,6 +35,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -64,23 +67,33 @@ public final class GpuiCamera {
     private static final SparseArray<CameraSession> sSessions = new SparseArray<>();
 
     static class CameraSession {
-        String cameraId;
-        CameraDevice device;
-        CameraCaptureSession captureSession;
-        CaptureRequest.Builder previewRequestBuilder;
+        CameraManager manager;
+        int resolution;
+        volatile boolean disposed;
+        volatile boolean switching;
+        volatile int generation;
+        final AtomicInteger pendingOpens = new AtomicInteger();
+        CountDownLatch deviceClosed;
+        volatile String cameraId;
+        volatile CameraDevice device;
+        volatile CameraCaptureSession captureSession;
+        volatile CaptureRequest.Builder previewRequestBuilder;
         ImageReader imageReader;
-        ImageReader photoReader;
+        volatile ImageReader photoReader;
         MediaRecorder mediaRecorder;
         HandlerThread backgroundThread;
         Handler backgroundHandler;
-        TextureView textureView;
-        Surface previewSurface;
-        Size previewSize;
+        volatile TextureView textureView;
+        volatile SurfaceView surfaceView;
+        volatile Surface previewSurface;
+        boolean ownsPreviewSurface;
+        File cacheDir;
+        volatile Size previewSize;
         boolean enableAudio;
         int flashMode = FLASH_OFF;
         String videoPath;
-        boolean isRecording;
-        float maxZoom = 1.0f;
+        volatile boolean isRecording;
+        volatile float maxZoom = 1.0f;
         final Semaphore openLock = new Semaphore(1);
     }
 
@@ -119,75 +132,19 @@ public final class GpuiCamera {
      * @return Session handle ID, or -1 on failure.
      */
     public static int createCamera(Activity activity, String cameraId, int resolution, boolean enableAudio) {
+        CameraSession session = new CameraSession();
         try {
-            CameraSession session = new CameraSession();
-            session.cameraId = cameraId;
             session.enableAudio = enableAudio;
+            session.cacheDir = activity.getCacheDir();
+            session.resolution = resolution;
+            session.manager = (CameraManager) activity.getApplicationContext().getSystemService(Context.CAMERA_SERVICE);
 
             // Start background thread
             session.backgroundThread = new HandlerThread("CameraBackground");
             session.backgroundThread.start();
             session.backgroundHandler = new Handler(session.backgroundThread.getLooper());
 
-            // Get camera characteristics
-            CameraManager manager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
-            CameraCharacteristics chars = manager.getCameraCharacteristics(cameraId);
-
-            // Get max zoom
-            Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
-            if (maxZoom != null) {
-                session.maxZoom = maxZoom;
-            }
-
-            // Choose preview size based on resolution
-            StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            if (map != null) {
-                Size[] sizes = map.getOutputSizes(SurfaceTexture.class);
-                session.previewSize = chooseSize(sizes, resolution);
-            } else {
-                session.previewSize = new Size(1280, 720);
-            }
-
-            // Create photo ImageReader
-            session.photoReader = ImageReader.newInstance(
-                    session.previewSize.getWidth(),
-                    session.previewSize.getHeight(),
-                    ImageFormat.JPEG,
-                    2
-            );
-
-            // Open camera
-            CountDownLatch openLatch = new CountDownLatch(1);
-            AtomicReference<CameraDevice> deviceRef = new AtomicReference<>(null);
-
-            manager.openCamera(cameraId, new CameraDevice.StateCallback() {
-                @Override
-                public void onOpened(CameraDevice camera) {
-                    deviceRef.set(camera);
-                    openLatch.countDown();
-                }
-
-                @Override
-                public void onDisconnected(CameraDevice camera) {
-                    camera.close();
-                    openLatch.countDown();
-                }
-
-                @Override
-                public void onError(CameraDevice camera, int error) {
-                    camera.close();
-                    openLatch.countDown();
-                }
-            }, session.backgroundHandler);
-
-            if (!openLatch.await(5, TimeUnit.SECONDS)) {
-                return -1;
-            }
-
-            session.device = deviceRef.get();
-            if (session.device == null) {
-                return -1;
-            }
+            openDevice(session, cameraId);
 
             int id = sNextId.getAndIncrement();
             synchronized (sSessions) {
@@ -196,6 +153,10 @@ public final class GpuiCamera {
             return id;
 
         } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            session.disposed = true;
+            closeDevice(session);
+            quitWhenClosed(session);
             android.util.Log.e(TAG, "createCamera failed", e);
             return -1;
         }
@@ -227,15 +188,16 @@ public final class GpuiCamera {
                 tv.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
                     @Override
                     public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
-                        surface.setDefaultBufferSize(s.previewSize.getWidth(), s.previewSize.getHeight());
-                        s.previewSurface = new Surface(surface);
-                        createCaptureSession(s);
+                        attachPreviewSurface(s, surface);
                         latch.countDown();
                     }
                     @Override
                     public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int w, int h) {}
                     @Override
-                    public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) { return true; }
+                    public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
+                        releasePreviewSurface(s);
+                        return true;
+                    }
                     @Override
                     public void onSurfaceTextureUpdated(SurfaceTexture surface) {}
                 });
@@ -243,9 +205,7 @@ public final class GpuiCamera {
                 // If texture is already available
                 if (tv.isAvailable()) {
                     SurfaceTexture st = tv.getSurfaceTexture();
-                    st.setDefaultBufferSize(s.previewSize.getWidth(), s.previewSize.getHeight());
-                    s.previewSurface = new Surface(st);
-                    createCaptureSession(s);
+                    attachPreviewSurface(s, st);
                     latch.countDown();
                 }
             } catch (Exception e) {
@@ -271,22 +231,17 @@ public final class GpuiCamera {
         }
         if (session == null) return;
 
-        try {
-            if (session.captureSession != null) {
-                session.captureSession.stopRepeating();
-                session.captureSession.close();
-                session.captureSession = null;
-            }
-            if (session.textureView != null) {
-                ViewGroup parent = (ViewGroup) session.textureView.getParent();
-                if (parent != null) {
-                    parent.removeView(session.textureView);
-                }
-                session.textureView = null;
-            }
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "stopPreview failed", e);
+        synchronized (session) {
+            session.surfaceView = null;
+            releasePreviewSurface(session);
         }
+        TextureView view = session.textureView;
+        session.textureView = null;
+        if (view != null) new Handler(Looper.getMainLooper()).post(() -> {
+            view.setSurfaceTextureListener(null);
+            ViewGroup parent = (ViewGroup) view.getParent();
+            if (parent != null) parent.removeView(view);
+        });
     }
 
     /**
@@ -300,8 +255,10 @@ public final class GpuiCamera {
             session = sSessions.get(handleId);
         }
         if (session == null || session.device == null) return null;
+        if (!session.openLock.tryAcquire()) return null;
 
         try {
+            if (session.disposed || session.device == null || session.captureSession == null) return null;
             CountDownLatch latch = new CountDownLatch(1);
             AtomicReference<String> resultRef = new AtomicReference<>(null);
 
@@ -313,15 +270,13 @@ public final class GpuiCamera {
                         buffer.get(bytes);
 
                         String fileName = "photo_" + UUID.randomUUID().toString() + ".jpg";
-                        File file = new File(Environment.getExternalStoragePublicDirectory(
-                                Environment.DIRECTORY_PICTURES), fileName);
-                        // Fallback to cache dir
-                        if (!file.getParentFile().exists()) {
-                            file = new File(System.getProperty("java.io.tmpdir"), fileName);
-                        }
+                        File file = new File(session.cacheDir, fileName);
 
                         try (FileOutputStream fos = new FileOutputStream(file)) {
                             fos.write(bytes);
+                        } catch (IOException error) {
+                            if (!file.delete()) android.util.Log.w(TAG, "Failed to remove incomplete photo");
+                            throw error;
                         }
 
                         resultRef.set(file.getAbsolutePath() + "|" +
@@ -350,6 +305,8 @@ public final class GpuiCamera {
         } catch (Exception e) {
             android.util.Log.e(TAG, "takePicture failed", e);
             return null;
+        } finally {
+            session.openLock.release();
         }
     }
 
@@ -362,8 +319,10 @@ public final class GpuiCamera {
             session = sSessions.get(handleId);
         }
         if (session == null || session.device == null || session.isRecording) return;
+        if (!session.openLock.tryAcquire()) throw new IllegalStateException("Camera operation in progress");
 
         try {
+            if (session.disposed || session.device == null) throw new IllegalStateException("Camera was disposed");
             String fileName = "video_" + UUID.randomUUID().toString() + ".mp4";
             File file = new File(System.getProperty("java.io.tmpdir"), fileName);
             session.videoPath = file.getAbsolutePath();
@@ -401,32 +360,59 @@ public final class GpuiCamera {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
 
             CountDownLatch latch = new CountDownLatch(1);
+            AtomicBoolean accepted = new AtomicBoolean(true);
+            AtomicReference<String> failure = new AtomicReference<>();
+            final int generation = session.generation;
 
             session.device.createCaptureSession(surfaces, new CameraCaptureSession.StateCallback() {
                 @Override
                 public void onConfigured(CameraCaptureSession s) {
-                    session.captureSession = s;
-                    try {
-                        s.setRepeatingRequest(builder.build(), null, session.backgroundHandler);
-                        session.mediaRecorder.start();
-                        session.isRecording = true;
-                    } catch (Exception e) {
-                        android.util.Log.e(TAG, "Failed to start recording", e);
+                    synchronized (session) {
+                        try {
+                            if (!accepted.get() || session.disposed || generation != session.generation) {
+                                s.close();
+                                failure.set("Recording configuration was superseded");
+                                return;
+                            }
+                            session.captureSession = s;
+                            s.setRepeatingRequest(builder.build(), null, session.backgroundHandler);
+                            session.mediaRecorder.start();
+                            session.isRecording = true;
+                        } catch (Exception e) {
+                            failure.set(e.toString());
+                        } finally { latch.countDown(); }
                     }
-                    latch.countDown();
                 }
 
                 @Override
                 public void onConfigureFailed(CameraCaptureSession s) {
+                    s.close();
+                    failure.set("Recording session configure failed");
                     android.util.Log.e(TAG, "Recording session configure failed");
                     latch.countDown();
                 }
             }, session.backgroundHandler);
 
-            latch.await(5, TimeUnit.SECONDS);
+            try {
+                if (!latch.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Recording configuration timed out");
+                if (failure.get() != null) throw new IllegalStateException(failure.get());
+            } finally {
+                synchronized (session) { accepted.set(false); }
+            }
 
         } catch (Exception e) {
-            android.util.Log.e(TAG, "startVideoRecording failed", e);
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            synchronized (session) {
+                session.generation++;
+                if (session.captureSession != null) session.captureSession.close();
+                session.captureSession = null;
+                if (session.mediaRecorder != null) { session.mediaRecorder.release(); session.mediaRecorder = null; }
+                session.isRecording = false;
+            }
+            createCaptureSession(session);
+            throw new IllegalStateException("startVideoRecording failed", e);
+        } finally {
+            session.openLock.release();
         }
     }
 
@@ -441,6 +427,7 @@ public final class GpuiCamera {
             session = sSessions.get(handleId);
         }
         if (session == null || !session.isRecording) return null;
+        if (!session.openLock.tryAcquire()) return null;
 
         try {
             session.isRecording = false;
@@ -457,6 +444,9 @@ public final class GpuiCamera {
         } catch (Exception e) {
             android.util.Log.e(TAG, "stopVideoRecording failed", e);
             return null;
+        } finally {
+            if (session.mediaRecorder != null) { session.mediaRecorder.release(); session.mediaRecorder = null; }
+            session.openLock.release();
         }
     }
 
@@ -555,10 +545,52 @@ public final class GpuiCamera {
         }
     }
 
-    public static void setCamera(int handleId, String newCameraId) {
-        // Switch cameras requires re-creating the session
-        // For now, log a warning
-        android.util.Log.w(TAG, "setCamera: switching cameras at runtime is not yet implemented for Android");
+    public static String setCamera(int handleId, String newCameraId) {
+        CameraSession session;
+        synchronized (sSessions) { session = sSessions.get(handleId); }
+        if (session == null) return "Camera handle is not active";
+        if (Looper.myLooper() == Looper.getMainLooper() ||
+                Looper.myLooper() == session.backgroundHandler.getLooper()) {
+            return "set_camera must run off the UI and camera callback threads";
+        }
+        if (!session.openLock.tryAcquire()) return "Camera operation is already in progress";
+        String oldId = session.cameraId;
+        boolean closed = false;
+        try {
+            if (session.disposed) return "Camera was disposed";
+            if (session.isRecording) return "Stop video recording before switching cameras";
+            if (newCameraId == null || newCameraId.isEmpty()) return "Camera ID is empty";
+            if (newCameraId.equals(oldId) && session.device != null) return null;
+            // Validate the new camera before disturbing the active one.
+            session.manager.getCameraCharacteristics(newCameraId);
+            session.switching = true;
+            closed = true;
+            closeAndWait(session);
+            openDevice(session, newCameraId);
+            restartPreview(session);
+            return null;
+        } catch (Exception error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            if (closed) {
+                closeDevice(session);
+                if (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        if (session.deviceClosed != null && !session.deviceClosed.await(5, TimeUnit.SECONDS)) {
+                            throw new IllegalStateException("Previous camera did not close");
+                        }
+                        openDevice(session, oldId);
+                        restartPreview(session);
+                    } catch (Exception restore) {
+                        closeDevice(session);
+                        return "Camera switch failed: " + error + "; restoring previous camera failed: " + restore;
+                    }
+                }
+            }
+            return "Camera switch failed: " + error;
+        } finally {
+            session.switching = false;
+            session.openLock.release();
+        }
     }
 
     public static void dispose(int handleId) {
@@ -569,65 +601,224 @@ public final class GpuiCamera {
         }
         if (session == null) return;
 
+        session.openLock.acquireUninterruptibly();
         try {
+            session.disposed = true;
             if (session.isRecording && session.mediaRecorder != null) {
-                session.mediaRecorder.stop();
-                session.mediaRecorder.release();
+                try { session.mediaRecorder.stop(); }
+                catch (RuntimeException error) { android.util.Log.w(TAG, "Recorder stop failed", error); }
             }
-            if (session.captureSession != null) {
-                session.captureSession.close();
-            }
-            if (session.device != null) {
-                session.device.close();
-            }
-            if (session.photoReader != null) {
-                session.photoReader.close();
-            }
-            if (session.backgroundThread != null) {
-                session.backgroundThread.quitSafely();
-            }
-        } catch (Exception e) {
-            android.util.Log.e(TAG, "dispose failed", e);
+            if (session.mediaRecorder != null) { session.mediaRecorder.release(); session.mediaRecorder = null; }
+        } finally {
+            closeDevice(session);
+            releasePreviewSurface(session);
+            TextureView view = session.textureView;
+            session.textureView = null;
+            session.surfaceView = null;
+            if (view != null) new Handler(Looper.getMainLooper()).post(() -> {
+                view.setSurfaceTextureListener(null);
+                ViewGroup parent = (ViewGroup) view.getParent();
+                if (parent != null) parent.removeView(view);
+            });
+            quitWhenClosed(session);
+            session.openLock.release();
         }
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────
 
-    private static void createCaptureSession(CameraSession session) {
+    private static void attachPreviewSurface(CameraSession session, SurfaceTexture texture) {
+        synchronized (session) {
+            if (session.disposed || texture == null) return;
+            if (session.previewSurface != null && session.ownsPreviewSurface) session.previewSurface.release();
+            texture.setDefaultBufferSize(session.previewSize.getWidth(), session.previewSize.getHeight());
+            session.previewSurface = new Surface(texture);
+            session.ownsPreviewSurface = true;
+            createCaptureSession(session);
+        }
+    }
+
+    private static void releasePreviewSurface(CameraSession session) {
+        synchronized (session) {
+            session.generation++;
+            if (session.captureSession != null) session.captureSession.close();
+            session.captureSession = null;
+            session.previewRequestBuilder = null;
+            if (session.previewSurface != null && session.ownsPreviewSurface) session.previewSurface.release();
+            session.previewSurface = null;
+            session.ownsPreviewSurface = false;
+        }
+    }
+
+    private static void openDevice(CameraSession session, String cameraId) throws Exception {
+        CameraCharacteristics chars = session.manager.getCameraCharacteristics(cameraId);
+        StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        if (map == null) throw new IllegalStateException("Camera has no stream configurations");
+        Size preview = chooseSize(map.getOutputSizes(SurfaceTexture.class), session.resolution);
+        Size photo = chooseSize(map.getOutputSizes(ImageFormat.JPEG), session.resolution);
+        Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+        session.previewSize = preview;
+        session.maxZoom = maxZoom == null ? 1.0f : maxZoom;
+        session.photoReader = ImageReader.newInstance(photo.getWidth(), photo.getHeight(), ImageFormat.JPEG, 2);
+        CountDownLatch opened = new CountDownLatch(1);
+        AtomicReference<String> failure = new AtomicReference<>();
+        final int generation = session.generation;
+        CountDownLatch deviceClosed = new CountDownLatch(1);
+        session.deviceClosed = deviceClosed;
+        AtomicBoolean pending = new AtomicBoolean(true);
+        session.pendingOpens.incrementAndGet();
         try {
+        session.manager.openCamera(cameraId, new CameraDevice.StateCallback() {
+            @Override public void onOpened(CameraDevice device) {
+                synchronized (session) {
+                    if (session.disposed || session.generation != generation) device.close();
+                    else session.device = device;
+                }
+                finished();
+                opened.countDown();
+            }
+            @Override public void onClosed(CameraDevice device) { deviceClosed.countDown(); }
+            @Override public void onDisconnected(CameraDevice device) { failed(device, "Camera disconnected"); }
+            @Override public void onError(CameraDevice device, int error) { failed(device, "Camera error " + error); }
+            private void failed(CameraDevice device, String error) {
+                synchronized (session) {
+                    device.close();
+                    if (session.device == device) session.device = null;
+                    failure.set(error);
+                }
+                finished();
+                opened.countDown();
+            }
+            private void finished() {
+                if (pending.compareAndSet(true, false)) session.pendingOpens.decrementAndGet();
+                quitWhenClosed(session);
+            }
+        }, session.backgroundHandler);
+        } catch (Exception error) {
+            if (pending.compareAndSet(true, false)) session.pendingOpens.decrementAndGet();
+            deviceClosed.countDown();
+            throw error;
+        }
+        if (!opened.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Opening camera timed out");
+        synchronized (session) {
+            if (session.device == null || failure.get() != null) throw new IllegalStateException(failure.get());
+            session.cameraId = cameraId;
+        }
+    }
+
+    private static void quitWhenClosed(CameraSession session) {
+        // Keep the callback looper alive until late opens can close their device.
+        if (session.disposed && session.pendingOpens.get() == 0 && session.backgroundThread != null) {
+            session.backgroundThread.quitSafely();
+        }
+    }
+
+    private static void closeAndWait(CameraSession session) throws InterruptedException {
+        CountDownLatch closed = session.deviceClosed;
+        closeDevice(session);
+        if (closed != null && !closed.await(5, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("Camera close timed out");
+        }
+    }
+
+    private static void closeDevice(CameraSession session) {
+        synchronized (session) {
+            session.generation++;
+            if (session.captureSession != null) session.captureSession.close();
+            session.captureSession = null;
+            session.previewRequestBuilder = null;
+            if (session.device != null) session.device.close();
+            session.device = null;
+            if (session.photoReader != null) session.photoReader.close();
+            session.photoReader = null;
+        }
+    }
+
+    private static void restartPreview(CameraSession session) throws Exception {
+        if (session.previewSurface == null) return;
+        if (session.surfaceView != null) {
+            if (!session.previewSurface.isValid()) throw new IllegalStateException("Preview surface was destroyed");
+        } else {
+            TextureView view = session.textureView;
+            SurfaceTexture texture = view == null ? null : view.getSurfaceTexture();
+            if (texture == null) throw new IllegalStateException("Preview surface was destroyed");
+            texture.setDefaultBufferSize(session.previewSize.getWidth(), session.previewSize.getHeight());
+        }
+        CountDownLatch configured = new CountDownLatch(1);
+        AtomicReference<String> error = new AtomicReference<>();
+        createCaptureSession(session, configured, error);
+        if (!configured.await(5, TimeUnit.SECONDS)) throw new IllegalStateException("Preview configuration timed out");
+        if (error.get() != null) throw new IllegalStateException(error.get());
+    }
+
+    private static void createCaptureSession(CameraSession session) {
+        if (session.switching || session.disposed) return;
+        createCaptureSession(session, new CountDownLatch(0), new AtomicReference<>());
+    }
+
+    private static void createCaptureSession(CameraSession session, CountDownLatch configured,
+                                              AtomicReference<String> error) {
+        final int generation = session.generation;
+        try {
+            if (session.device == null || session.previewSurface == null || session.photoReader == null) {
+                throw new IllegalStateException("Camera preview is unavailable");
+            }
             List<Surface> surfaces = new ArrayList<>();
             surfaces.add(session.previewSurface);
             surfaces.add(session.photoReader.getSurface());
 
-            session.previewRequestBuilder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            session.previewRequestBuilder.addTarget(session.previewSurface);
-            session.previewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+            CaptureRequest.Builder builder = session.device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            builder.addTarget(session.previewSurface);
+            builder.set(CaptureRequest.CONTROL_AF_MODE,
                     CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            applyFlashMode(session.previewRequestBuilder, session.flashMode);
+            applyFlashMode(builder, session.flashMode);
 
             session.device.createCaptureSession(surfaces, new CameraCaptureSession.StateCallback() {
                 @Override
                 public void onConfigured(CameraCaptureSession s) {
-                    session.captureSession = s;
-                    try {
-                        s.setRepeatingRequest(session.previewRequestBuilder.build(), null, session.backgroundHandler);
-                    } catch (CameraAccessException e) {
-                        android.util.Log.e(TAG, "Failed to start preview", e);
+                    synchronized (session) {
+                        try {
+                            if (session.disposed || generation != session.generation) {
+                                s.close();
+                                error.set("Preview configuration was superseded");
+                                return;
+                            }
+                            s.setRepeatingRequest(builder.build(), null, session.backgroundHandler);
+                            session.captureSession = s;
+                            session.previewRequestBuilder = builder;
+                        } catch (Exception e) {
+                            s.close();
+                            error.set(e.toString());
+                            android.util.Log.e(TAG, "Failed to start preview", e);
+                        } finally { configured.countDown(); }
                     }
                 }
 
                 @Override
                 public void onConfigureFailed(CameraCaptureSession s) {
+                    s.close();
+                    error.set("Capture session configure failed");
+                    configured.countDown();
                     android.util.Log.e(TAG, "Capture session configure failed");
                 }
             }, session.backgroundHandler);
 
-        } catch (CameraAccessException e) {
+        } catch (Exception e) {
+            error.set(e.toString());
+            configured.countDown();
             android.util.Log.e(TAG, "createCaptureSession failed", e);
         }
     }
 
     private static Size chooseSize(Size[] sizes, int resolution) {
+        if (sizes == null || sizes.length == 0) throw new IllegalArgumentException("No supported stream size");
+        if (resolution == RES_MAX) {
+            Size best = sizes[0];
+            for (Size size : sizes) {
+                if ((long) size.getWidth() * size.getHeight() > (long) best.getWidth() * best.getHeight()) best = size;
+            }
+            return best;
+        }
         int targetWidth, targetHeight;
         switch (resolution) {
             case RES_LOW:       targetWidth = 320;  targetHeight = 240;  break;
@@ -673,15 +864,15 @@ public final class GpuiCamera {
     }
 
     /**
-     * Create a TextureView for camera preview.
+     * Create a SurfaceView for camera preview.
      *
-     * <p>The TextureView is wired to the CameraSession. When the surface
+     * <p>The SurfaceView is wired to the CameraSession. When the surface
      * becomes available, a capture session is created automatically.
      * The view is NOT added to the hierarchy — the caller (GpuiPlatformView) handles that.</p>
      *
      * @param activity  The current Activity.
      * @param handleId  Camera session handle ID.
-     * @return A configured TextureView, or an empty FrameLayout if the session is not found.
+     * @return A configured SurfaceView, or an empty FrameLayout if the session is not found.
      */
     public static android.view.View createPreviewSurface(Activity activity, int handleId) {
         CameraSession session;
@@ -694,41 +885,26 @@ public final class GpuiCamera {
         }
 
         final CameraSession s = session;
-        android.view.TextureView tv = new android.view.TextureView(activity);
-        s.textureView = tv;
-
-        tv.setSurfaceTextureListener(new android.view.TextureView.SurfaceTextureListener() {
-            @Override
-            public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surface, int width, int height) {
-                surface.setDefaultBufferSize(s.previewSize.getWidth(), s.previewSize.getHeight());
-                s.previewSurface = new android.view.Surface(surface);
-                createCaptureSession(s);
+        SurfaceView view = new SurfaceView(activity);
+        view.setZOrderOnTop(true);
+        s.surfaceView = view;
+        view.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                synchronized (s) {
+                    if (s.disposed || s.surfaceView != view) return;
+                    s.previewSurface = holder.getSurface();
+                    s.ownsPreviewSurface = false;
+                    createCaptureSession(s);
+                }
             }
-
-            @Override
-            public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture surface, int w, int h) {}
-
-            @Override
-            public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surface) {
-                return true;
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                synchronized (s) {
+                    if (s.surfaceView == view) releasePreviewSurface(s);
+                }
             }
-
-            @Override
-            public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture surface) {}
         });
-
-        // If texture is already available
-        if (tv.isAvailable()) {
-            android.graphics.SurfaceTexture st = tv.getSurfaceTexture();
-            st.setDefaultBufferSize(s.previewSize.getWidth(), s.previewSize.getHeight());
-            s.previewSurface = new android.view.Surface(st);
-            createCaptureSession(s);
-        }
-
-        // Start the session running
-        // (capture session creation is async via the SurfaceTextureListener)
-
-        return tv;
+        return view;
     }
 
     private GpuiCamera() {}

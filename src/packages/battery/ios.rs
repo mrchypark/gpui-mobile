@@ -3,23 +3,27 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 
 pub fn battery_level() -> i32 {
-    unsafe {
+    crate::ios::platform_view::on_main(|| unsafe {
         let device: *mut AnyObject = msg_send![class!(UIDevice), currentDevice];
+        let monitoring: bool = msg_send![device, isBatteryMonitoringEnabled];
         let _: () = msg_send![device, setBatteryMonitoringEnabled: true];
         let level: f32 = msg_send![device, batteryLevel];
-        if level < 0.0 {
+        let _: () = msg_send![device, setBatteryMonitoringEnabled: monitoring];
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
             -1
         } else {
             (level * 100.0).round() as i32
         }
-    }
+    })
 }
 
 pub fn battery_state() -> BatteryState {
-    unsafe {
+    crate::ios::platform_view::on_main(|| unsafe {
         let device: *mut AnyObject = msg_send![class!(UIDevice), currentDevice];
+        let monitoring: bool = msg_send![device, isBatteryMonitoringEnabled];
         let _: () = msg_send![device, setBatteryMonitoringEnabled: true];
         let state: i64 = msg_send![device, batteryState];
+        let _: () = msg_send![device, setBatteryMonitoringEnabled: monitoring];
         // UIDeviceBatteryState: 0=unknown, 1=unplugged, 2=charging, 3=full
         match state {
             1 => BatteryState::Discharging,
@@ -27,7 +31,7 @@ pub fn battery_state() -> BatteryState {
             3 => BatteryState::Full,
             _ => BatteryState::Unknown,
         }
-    }
+    })
 }
 
 pub fn is_battery_save_mode() -> bool {

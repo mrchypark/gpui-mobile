@@ -16,7 +16,9 @@ fn permission_to_android_string(permission: Permission) -> &'static str {
         Permission::Reminders => "android.permission.READ_CALENDAR", // No separate Android permission
         Permission::Photos => "android.permission.READ_MEDIA_IMAGES",
         Permission::MediaLibrary => "android.permission.READ_MEDIA_AUDIO",
-        Permission::Sensors => "android.permission.BODY_SENSORS",
+        // BODY_SENSORS governs health/body measurements, not this enum's raw
+        // accelerometer/gyroscope scope. Do not request unrelated permission.
+        Permission::Sensors => "",
         Permission::Bluetooth => "android.permission.BLUETOOTH_CONNECT",
         Permission::Notification => "android.permission.POST_NOTIFICATIONS",
         Permission::Storage => "android.permission.READ_EXTERNAL_STORAGE",
@@ -35,7 +37,7 @@ fn permission_to_android_string(permission: Permission) -> &'static str {
 pub fn check_permission(permission: Permission) -> Result<PermissionStatus, String> {
     let perm_string = permission_to_android_string(permission);
     if perm_string.is_empty() {
-        return Ok(PermissionStatus::Granted); // Not applicable on Android
+        return Err("This permission is not applicable on Android".into());
     }
 
     jni_helpers::with_env(|env| {
@@ -63,7 +65,7 @@ pub fn check_permission(permission: Permission) -> Result<PermissionStatus, Stri
 pub fn request_permission(permission: Permission) -> Result<PermissionStatus, String> {
     let perm_string = permission_to_android_string(permission);
     if perm_string.is_empty() {
-        return Ok(PermissionStatus::Granted);
+        return Err("This permission is not applicable on Android".into());
     }
 
     jni_helpers::with_env(|env| {
@@ -118,18 +120,16 @@ pub fn request_permissions(
             })?;
 
         if result.is_null() {
-            // Fallback: request one by one
-            return Ok(permissions
-                .iter()
-                .map(|&p| (p, PermissionStatus::Denied))
-                .collect());
+            return Err("Permission helper returned no batch result".into());
         }
 
         let result_str = jni_helpers::get_string(env, &result);
-        let statuses: Vec<i32> = result_str
-            .split('|')
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        if permissions.is_empty() { return Ok(Vec::new()); }
+        let statuses = result_str.split('|').map(str::parse::<i32>)
+            .collect::<Result<Vec<_>, _>>().map_err(|e| format!("Invalid permission result: {e}"))?;
+        if statuses.len() != permissions.len() {
+            return Err("Permission result count does not match the request".into());
+        }
 
         Ok(permissions
             .iter()
@@ -232,6 +232,7 @@ fn int_to_status(status: i32) -> PermissionStatus {
         1 => PermissionStatus::Denied,
         2 => PermissionStatus::PermanentlyDenied,
         3 => PermissionStatus::Restricted,
+        4 => PermissionStatus::Limited,
         _ => PermissionStatus::Denied,
     }
 }

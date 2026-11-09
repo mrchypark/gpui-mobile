@@ -13,6 +13,18 @@ import android.webkit.WebChromeClient;
 import android.widget.FrameLayout;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
+import com.google.android.gms.maps.MapView;
+import com.google.android.gms.maps.GoogleMap;
+import com.google.android.gms.maps.CameraUpdateFactory;
+import com.google.android.gms.maps.model.LatLng;
+import com.google.android.gms.maps.model.Marker;
+import com.google.android.gms.maps.model.MarkerOptions;
+import com.google.android.gms.common.GoogleApiAvailability;
 
 /**
  * Helper class for managing native platform views embedded in the GPUI render tree.
@@ -37,6 +49,87 @@ public class GpuiPlatformView {
 
     /** The root FrameLayout that hosts all platform views */
     private static FrameLayout rootContainer;
+    private static final Map<Long, Boolean> requestedVisibility = new HashMap<>();
+    private static boolean paused;
+
+    // A timeout must distinguish queued work (no effects) from native work already running.
+    // Do not interrupt Android UI operations. Retire their instance when late work returns.
+    static final class MainCall<T> implements Runnable {
+        private enum State { QUEUED, RUNNING, COMPLETE, CANCELLED, ABANDONED }
+        private State state = State.QUEUED;
+        private final Callable<T> action;
+        private final Runnable lateCleanup;
+        private final CountDownLatch done = new CountDownLatch(1);
+        private T result;
+        private Throwable error;
+
+        MainCall(Callable<T> action, Runnable lateCleanup) {
+            this.action = action;
+            this.lateCleanup = lateCleanup;
+        }
+
+        public void run() {
+            synchronized (this) {
+                if (state != State.QUEUED) return;
+                state = State.RUNNING;
+            }
+            T value = null;
+            Throwable failure = null;
+            try { value = action.call(); } catch (Throwable e) { failure = e; }
+            boolean abandoned;
+            synchronized (this) {
+                abandoned = state == State.ABANDONED;
+                if (!abandoned) {
+                    result = value;
+                    error = failure;
+                    state = State.COMPLETE;
+                }
+            }
+            try { if (abandoned) lateCleanup.run(); }
+            catch (RuntimeException e) { Log.e(TAG, "Late native cleanup failed", e); }
+            finally { done.countDown(); }
+        }
+
+        T await(long milliseconds) throws Exception {
+            try { done.await(milliseconds, TimeUnit.MILLISECONDS); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                synchronized (this) {
+                    if (state == State.QUEUED) state = State.CANCELLED;
+                    else if (state == State.RUNNING) state = State.ABANDONED;
+                    else if (state == State.COMPLETE) return completed();
+                }
+                throw e;
+            }
+            synchronized (this) {
+                if (state == State.COMPLETE) return completed();
+                boolean queued = state == State.QUEUED;
+                state = queued ? State.CANCELLED : State.ABANDONED;
+                throw new TimeoutException(queued
+                    ? "Android UI dispatch timed out before execution; operation cancelled"
+                    : "Android UI operation timed out while running; late effects are possible; instance will be disposed");
+            }
+        }
+
+        private T completed() throws ExecutionException {
+            if (error != null) throw new ExecutionException(error);
+            return result;
+        }
+    }
+
+    private static <T> T onMain(Callable<T> action, Runnable lateCleanup) throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper()) return action.call();
+        MainCall<T> task = new MainCall<>(action, lateCleanup);
+        if (!mainHandler.post(task)) throw new IllegalStateException("Android UI thread is unavailable");
+        try { return task.await(1000); }
+        finally { mainHandler.removeCallbacks(task); }
+    }
+
+    private static String failure(Exception error) {
+        Throwable cause = error;
+        while (cause.getCause() != null) cause = cause.getCause();
+        return cause.getClass().getSimpleName() + ": " + cause.getMessage();
+    }
 
     /**
      * Ensure the root container exists in the activity's view hierarchy.
@@ -47,7 +140,7 @@ public class GpuiPlatformView {
             return;
         }
 
-        mainHandler.post(() -> {
+        {
             if (rootContainer != null) return;
 
             rootContainer = new FrameLayout(activity);
@@ -74,7 +167,20 @@ public class GpuiPlatformView {
             }
 
             Log.i(TAG, "Root container created and added to activity");
-        });
+            activity.getApplication().registerActivityLifecycleCallbacks(new android.app.Application.ActivityLifecycleCallbacks() {
+                public void onActivityCreated(Activity a, android.os.Bundle state) {}
+                public void onActivityStarted(Activity a) {}
+                public void onActivityResumed(Activity a) { if (a == activity) resumeAll(); }
+                public void onActivityPaused(Activity a) { if (a == activity) pauseAll(); }
+                public void onActivityStopped(Activity a) {}
+                public void onActivitySaveInstanceState(Activity a, android.os.Bundle state) {}
+                public void onActivityDestroyed(Activity a) {
+                    if (a != activity) return;
+                    disposeAll();
+                    activity.getApplication().unregisterActivityLifecycleCallbacks(this);
+                }
+            });
+        }
     }
 
     /**
@@ -98,17 +204,21 @@ public class GpuiPlatformView {
             float width, float height,
             String creationParams) {
 
-        Log.i(TAG, "createView: type=" + viewType + " id=" + viewId
-                + " bounds=(" + x + ", " + y + ", " + width + ", " + height + ")"
-                + " params=" + creationParams);
+        return createViewChecked(activity, viewType, viewId, x, y, width, height, creationParams) == null;
+    }
 
-        ensureRootContainer(activity);
-
-        // Parse creation params
-        Map<String, String> params = parseCreationParams(creationParams);
-
-        mainHandler.post(() -> {
-            try {
+    public static String createViewChecked(Activity activity, String viewType, long viewId,
+            float x, float y, float width, float height, String creationParams) {
+        final View[] created = new View[1];
+        try {
+            return onMain(() -> {
+                if (activity == null || activity.isFinishing() || activity.isDestroyed())
+                    throw new IllegalStateException("No active Activity for platform view");
+                if (views.containsKey(viewId)) throw new IllegalArgumentException("Duplicate view ID");
+                Map<String, String> params = parseCreationParams(creationParams);
+                ensureRootContainer(activity);
+                if (rootContainer.getContext() != activity)
+                    throw new IllegalStateException("Platform views belong to a different Activity");
                 float density = activity.getResources().getDisplayMetrics().density;
 
                 // Create a container FrameLayout for this platform view
@@ -123,29 +233,32 @@ public class GpuiPlatformView {
 
                 // Create the actual view based on type
                 View view = createViewForType(activity, viewType, params);
-                if (view != null) {
+                created[0] = view;
+                try {
+                    if (view == null) throw new IllegalStateException("Native view factory returned null");
                     container.addView(view, new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
                     ));
-                }
-
-                // Store references
-                views.put(viewId, view != null ? view : container);
-                containers.put(viewId, container);
-
-                // Add to root container
-                if (rootContainer != null) {
+                    views.put(viewId, view);
+                    containers.put(viewId, container);
+                    requestedVisibility.put(viewId, true);
+                    container.setVisibility(paused ? View.INVISIBLE : View.VISIBLE);
                     rootContainer.addView(container);
+                    Log.i(TAG, "View created: id=" + viewId + " type=" + viewType);
+                    return null;
+                } catch (RuntimeException e) {
+                    views.remove(viewId); containers.remove(viewId);
+                    requestedVisibility.remove(viewId);
+                    rootContainer.removeView(container); container.removeAllViews();
+                    destroyNative(view);
+                    throw e;
                 }
-
-                Log.i(TAG, "View created: id=" + viewId + " type=" + viewType);
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to create view: " + e.getMessage(), e);
-            }
-        });
-
-        return true;
+            }, () -> {
+                if (created[0] != null && views.get(viewId) == created[0]) disposeViewOnMain(viewId);
+            });
+        } catch (Exception e) { return failure(e); }
+        catch (LinkageError e) { return "Native map SDK missing: add com.google.android.gms:play-services-maps:20.0.0 (" + e + ")"; }
     }
 
     /**
@@ -158,10 +271,189 @@ public class GpuiPlatformView {
         for (String pair : params.split("\\|")) {
             int eq = pair.indexOf('=');
             if (eq > 0) {
-                map.put(pair.substring(0, eq), pair.substring(eq + 1));
+                map.put(decode(pair.substring(0, eq)), decode(pair.substring(eq + 1)));
             }
         }
         return map;
+    }
+
+    private static String decode(String value) {
+        return value.replace("%3D", "=").replace("%7C", "|").replace("%25", "%");
+    }
+
+    private static Activity checkedMapActivity(Activity activity, Map<String, String> params) {
+        try {
+            android.content.pm.ApplicationInfo info = activity.getPackageManager()
+                .getApplicationInfo(activity.getPackageName(), android.content.pm.PackageManager.GET_META_DATA);
+            String key = info.metaData == null ? null : info.metaData.getString("com.google.android.geo.API_KEY");
+            if (key == null || key.trim().isEmpty() || key.contains("${") || key.equals("YOUR_API_KEY"))
+                throw new IllegalStateException("Maps requires host manifest com.google.android.geo.API_KEY");
+            int status = GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(activity);
+            if (status != 0) throw new IllegalStateException("Google Play services unavailable: " + status);
+            if (Boolean.parseBoolean(params.getOrDefault("my_location", "false"))
+                    && activity.checkSelfPermission("android.permission.ACCESS_FINE_LOCATION") != 0
+                    && activity.checkSelfPermission("android.permission.ACCESS_COARSE_LOCATION") != 0)
+                throw new SecurityException("Map user location requires existing location permission");
+            coordinate(params.get("latitude"), params.get("longitude"));
+            zoomLevel(params.get("zoom"));
+            nativeMapType(Integer.parseInt(params.getOrDefault("map_type", "0")));
+            return activity;
+        } catch (Exception e) { throw new IllegalStateException("Map configuration: " + failure(e), e); }
+    }
+
+    private static final class NativeMap extends MapView {
+        GoogleMap map;
+        String error;
+        boolean disposed;
+        boolean resumed;
+        final Map<String, Marker> markers = new HashMap<>();
+
+        NativeMap(Activity activity, Map<String, String> params) {
+            super(checkedMapActivity(activity, params));
+            try {
+                boolean location = Boolean.parseBoolean(params.getOrDefault("my_location", "false"));
+                onCreate(null);
+                resumeMap();
+                getMapAsync(ready -> {
+                    if (disposed) return;
+                    try {
+                        ready.getUiSettings().setZoomGesturesEnabled(Boolean.parseBoolean(params.getOrDefault("zoom_gestures", "true")));
+                        ready.getUiSettings().setScrollGesturesEnabled(Boolean.parseBoolean(params.getOrDefault("scroll_gestures", "true")));
+                        ready.getUiSettings().setRotateGesturesEnabled(Boolean.parseBoolean(params.getOrDefault("rotate_gestures", "true")));
+                        ready.setMapType(nativeMapType(Integer.parseInt(params.getOrDefault("map_type", "0"))));
+                        ready.setMyLocationEnabled(location);
+                        ready.moveCamera(CameraUpdateFactory.newLatLngZoom(
+                            coordinate(params.get("latitude"), params.get("longitude")),
+                            zoomLevel(params.get("zoom"))));
+                        map = ready;
+                    } catch (Exception e) { error = failure(e); }
+                });
+            } catch (Exception e) {
+                disposed = true;
+                pauseMap();
+                onDestroy();
+                throw new IllegalStateException("Map creation failed: " + failure(e), e);
+            }
+        }
+        void resumeMap() { if (!resumed && !disposed) { onStart(); onResume(); resumed = true; } }
+        void pauseMap() { if (resumed) { onPause(); onStop(); resumed = false; } }
+        void destroyMap() {
+            if (disposed) return;
+            pauseMap(); disposed = true; markers.clear(); map = null; onDestroy();
+        }
+        GoogleMap ready() {
+            if (disposed) throw new IllegalStateException("Map is disposed");
+            if (error != null) throw new IllegalStateException(error);
+            if (map == null) throw new IllegalStateException("Map is not ready; retry after native map initialization");
+            return map;
+        }
+    }
+
+    private static int nativeMapType(int kind) {
+        switch (kind) {
+            case 0: return GoogleMap.MAP_TYPE_NORMAL;
+            case 1: return GoogleMap.MAP_TYPE_SATELLITE;
+            case 2: return GoogleMap.MAP_TYPE_HYBRID;
+            case 3: return GoogleMap.MAP_TYPE_TERRAIN;
+            default: throw new IllegalArgumentException("Invalid map type");
+        }
+    }
+
+    private static LatLng coordinate(String latitude, String longitude) {
+        double lat = Double.parseDouble(latitude), lng = Double.parseDouble(longitude);
+        if (!Double.isFinite(lat) || !Double.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180)
+            throw new IllegalArgumentException("Invalid map coordinate");
+        return new LatLng(lat, lng);
+    }
+    private static float zoomLevel(String text) {
+        float zoom = Float.parseFloat(text);
+        if (!Float.isFinite(zoom) || zoom < 0 || zoom > 20) throw new IllegalArgumentException("Invalid map zoom");
+        return zoom;
+    }
+
+    /** Null means native completion; any non-null value is an error returned to Rust. */
+    public static String command(long id, String name, String payload) {
+        String[] args = payload.split("\\|", -1);
+        for (int i = 0; i < args.length; i++) args[i] = decode(args[i]);
+        if (name.equals("webview.evaluate")) return evaluate(id, args[0]);
+        try {
+            return onMain(() -> {
+                View view = views.get(id);
+                if (view == null) throw new IllegalStateException("Platform view is disposed or missing");
+                if (name.startsWith("webview.")) {
+                    if (!(view instanceof WebView)) throw new IllegalArgumentException("View is not a WebView");
+                    WebView web = (WebView) view;
+                    switch (name) {
+                        case "webview.back":
+                            if (!web.canGoBack()) throw new IllegalStateException("WebView has no back history");
+                            web.goBack(); break;
+                        case "webview.reload": web.reload(); break;
+                        case "webview.stop": web.stopLoading(); break;
+                        default: throw new IllegalArgumentException("Unknown WebView command");
+                    }
+                } else {
+                    if (!(view instanceof NativeMap)) throw new IllegalArgumentException("View is not a map");
+                    NativeMap state = (NativeMap) view;
+                    GoogleMap map = state.ready();
+                    switch (name) {
+                        case "map.center": map.moveCamera(CameraUpdateFactory.newLatLng(coordinate(args[0], args[1]))); break;
+                        case "map.zoom": map.moveCamera(CameraUpdateFactory.zoomTo(zoomLevel(args[0]))); break;
+                        case "map.type": map.setMapType(nativeMapType(Integer.parseInt(args[0]))); break;
+                        case "map.add":
+                            if (args[0].isEmpty()) throw new IllegalArgumentException("Marker ID must not be empty");
+                            Marker marker = map.addMarker(new MarkerOptions().position(coordinate(args[1], args[2]))
+                                .title(args[3]).snippet(args[4]));
+                            if (marker == null) throw new IllegalStateException("Native marker creation failed");
+                            Marker old = state.markers.put(args[0], marker);
+                            if (old != null) old.remove();
+                            break;
+                        case "map.remove":
+                            Marker removed = state.markers.remove(args[0]);
+                            if (removed == null) throw new IllegalArgumentException("Unknown marker ID");
+                            removed.remove(); break;
+                        case "map.clear":
+                            for (Marker item : state.markers.values()) item.remove();
+                            state.markers.clear(); break;
+                        default: throw new IllegalArgumentException("Unknown map command");
+                    }
+                }
+                return null;
+            }, () -> disposeViewOnMain(id));
+        } catch (Exception e) { return failure(e); }
+    }
+
+    private static String evaluate(long id, String script) {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            return "Synchronous JavaScript evaluation must run off the Android UI thread";
+        java.util.concurrent.CompletableFuture<String> completion = new java.util.concurrent.CompletableFuture<>();
+        try {
+            onMain(() -> {
+                View view = views.get(id);
+                if (!(view instanceof WebView)) throw new IllegalStateException("No active WebView instance");
+                WebView web = (WebView) view;
+                if (!web.getSettings().getJavaScriptEnabled()) throw new IllegalStateException("JavaScript is disabled");
+                // Android's callback has no exception argument; evaluate in a wrapper that reports thrown errors.
+                String source = "(function(){try{(0,eval)(" + org.json.JSONObject.quote(script)
+                    + ");return {ok:true};}catch(e){return {ok:false,error:String(e)};}})()";
+                web.evaluateJavascript(source, result -> {
+                    try {
+                        if (views.get(id) != web) { completion.complete("WebView was disposed during evaluation"); return; }
+                        org.json.JSONObject status = new org.json.JSONObject(result);
+                        completion.complete(status.getBoolean("ok") ? null : status.getString("error"));
+                    } catch (Exception e) { completion.complete("Invalid JavaScript completion: " + failure(e)); }
+                });
+                return null;
+            }, () -> disposeViewOnMain(id));
+            try { return completion.get(1, TimeUnit.SECONDS); }
+            catch (TimeoutException e) {
+                disposeView(id);
+                return "JavaScript completion timed out; execution may have occurred; instance scheduled for disposal";
+            } catch (InterruptedException e) {
+                disposeView(id);
+                Thread.currentThread().interrupt();
+                return "JavaScript wait interrupted; execution may have occurred; instance scheduled for disposal";
+            }
+        } catch (Exception e) { return failure(e); }
     }
 
     /**
@@ -184,10 +476,7 @@ public class GpuiPlatformView {
                 return createCameraPreviewView(activity, params);
 
             case "map":
-                // Placeholder — MapView requires Google Play Services SDK
-                FrameLayout mapContainer = new FrameLayout(activity);
-                mapContainer.setBackgroundColor(0xFFE0E0E0);
-                return mapContainer;
+                return new NativeMap(activity, params);
 
             default:
                 Log.w(TAG, "Unknown view type: " + viewType + ", creating empty container");
@@ -227,6 +516,7 @@ public class GpuiPlatformView {
         if (zoom) settings.setDisplayZoomControls(false);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
+        if (params.containsKey("user_agent")) settings.setUserAgentString(params.get("user_agent"));
 
         wv.setWebViewClient(new WebViewClient());
         wv.setWebChromeClient(new WebChromeClient());
@@ -284,7 +574,8 @@ public class GpuiPlatformView {
         mainHandler.post(() -> {
             FrameLayout container = containers.get(viewId);
             if (container == null) return;
-            container.setVisibility(visible ? View.VISIBLE : View.GONE);
+            requestedVisibility.put(viewId, visible);
+            container.setVisibility(paused ? View.INVISIBLE : visible ? View.VISIBLE : View.GONE);
         });
     }
 
@@ -304,7 +595,15 @@ public class GpuiPlatformView {
      * Remove and dispose a platform view.
      */
     public static void disposeView(long viewId) {
-        mainHandler.post(() -> {
+        // NativeActivity teardown may be waiting for the native caller. Never wait back on it.
+        if (Looper.myLooper() == Looper.getMainLooper()) disposeViewOnMain(viewId);
+        else if (!mainHandler.post(() -> disposeViewOnMain(viewId)))
+            Log.e(TAG, "UI queue unavailable for platform view disposal: " + viewId);
+    }
+
+    private static void disposeViewOnMain(long viewId) {
+            View view = views.remove(viewId);
+            requestedVisibility.remove(viewId);
             FrameLayout container = containers.get(viewId);
             if (container != null) {
                 if (rootContainer != null) {
@@ -313,9 +612,20 @@ public class GpuiPlatformView {
                 container.removeAllViews();
                 containers.remove(viewId);
             }
-            views.remove(viewId);
+            destroyNative(view);
             Log.i(TAG, "View disposed: id=" + viewId);
-        });
+    }
+
+    private static void destroyNative(View view) {
+        try {
+            if (view instanceof WebView) {
+                WebView web = (WebView) view;
+                try { web.stopLoading(); web.setWebChromeClient(null); web.setWebViewClient(null); }
+                finally { web.destroy(); }
+            } else if (view instanceof NativeMap) {
+                ((NativeMap) view).destroyMap();
+            }
+        } catch (RuntimeException error) { Log.e(TAG, "Native view destruction failed", error); }
     }
 
     /**
@@ -339,6 +649,11 @@ public class GpuiPlatformView {
      */
     public static void pauseAll() {
         mainHandler.post(() -> {
+            paused = true;
+            for (View view : views.values()) {
+                if (view instanceof WebView) ((WebView) view).onPause();
+                if (view instanceof NativeMap) ((NativeMap) view).pauseMap();
+            }
             for (FrameLayout container : containers.values()) {
                 container.setVisibility(View.INVISIBLE);
             }
@@ -352,8 +667,14 @@ public class GpuiPlatformView {
      */
     public static void resumeAll() {
         mainHandler.post(() -> {
-            for (FrameLayout container : containers.values()) {
-                container.setVisibility(View.VISIBLE);
+            paused = false;
+            for (View view : views.values()) {
+                if (view instanceof WebView) ((WebView) view).onResume();
+                if (view instanceof NativeMap) ((NativeMap) view).resumeMap();
+            }
+            for (Map.Entry<Long, FrameLayout> entry : containers.entrySet()) {
+                entry.getValue().setVisibility(Boolean.TRUE.equals(requestedVisibility.get(entry.getKey()))
+                    ? View.VISIBLE : View.GONE);
             }
             Log.i(TAG, "All platform views resumed");
         });
@@ -363,17 +684,29 @@ public class GpuiPlatformView {
      * Dispose all platform views. Called during activity cleanup.
      */
     public static void disposeAll() {
-        mainHandler.post(() -> {
+        if (Looper.myLooper() == Looper.getMainLooper()) disposeAllOnMain();
+        else if (!mainHandler.post(GpuiPlatformView::disposeAllOnMain))
+            Log.e(TAG, "UI queue unavailable for platform view cleanup");
+    }
+
+    private static void disposeAllOnMain() {
             for (FrameLayout container : containers.values()) {
                 if (rootContainer != null) {
                     rootContainer.removeView(container);
                 }
                 container.removeAllViews();
             }
+            for (View view : views.values()) destroyNative(view);
             views.clear();
             containers.clear();
+            requestedVisibility.clear();
+            paused = false;
+            if (rootContainer != null) {
+                android.view.ViewParent parent = rootContainer.getParent();
+                if (parent instanceof ViewGroup) ((ViewGroup) parent).removeView(rootContainer);
+                rootContainer = null;
+            }
             Log.i(TAG, "All platform views disposed");
-        });
     }
 
     /**

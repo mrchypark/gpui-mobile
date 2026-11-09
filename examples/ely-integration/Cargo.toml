@@ -1,0 +1,40 @@
+[package]
+name = "gpui-mobile-ely-integration"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Independent lockfile and patches: the parent repository is not a workspace.
+[workspace]
+
+[features]
+ble = ["gpui-mobile/ble"]
+platform-smoke = []
+platform-extended = ["platform-smoke"]
+platform-device = ["platform-smoke"]
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+gpui-mobile = { path = "../.." }
+gpui = { package = "gpui-fast", version = "=0.1.12", default-features = false }
+gpui-kit = { version = "=0.8.1", default-features = false, features = ["component", "gpui-fast"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "937b4252ccdc4b8eb79ae0ede59be449a975390c", default-features = false }
+# Devices cannot read Ely assets from the build machine's filesystem in debug builds.
+rust-embed = { version = "8.12", features = ["debug-embed"] }
+
+[dev-dependencies]
+gpui = { package = "gpui-fast", version = "=0.1.12", features = ["test-support"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "937b4252ccdc4b8eb79ae0ede59be449a975390c", features = ["test-support"] }
+naga = { version = "=30.0.1", features = ["wgsl-in"] }
+
+# Cargo only honors patches at the invoking workspace root.
+[patch.crates-io]
+gpui-fast = { path = "../../vendor/gpui-fast" }
+gpui-fast-wgpu = { path = "../../vendor/gpui-fast-wgpu" }
+gpui-pre = { path = "../../vendor/gpui-pre" }
+gpui-pre-wgpu = { path = "../../vendor/gpui-pre-wgpu" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }

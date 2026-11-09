@@ -2,7 +2,7 @@
 
 Mobile platform layer for [GPUI](https://github.com/zed-industries/zed) — run Rust UI apps natively on **iOS** and **Android**.
 
-[![Build & Test](https://github.com/itsbalamurali/gpui-mobile/actions/workflows/ci.yml/badge.svg)](https://github.com/itsbalamurali/gpui-mobile/actions/workflows/ci.yml)
+[![Build & Test](https://github.com/mrchypark/gpui-mobile/actions/workflows/ci.yml/badge.svg)](https://github.com/mrchypark/gpui-mobile/actions/workflows/ci.yml)
 
 ## Overview
 
@@ -19,7 +19,7 @@ Implements the `gpui::Platform` trait for mobile targets, following the same arc
 
 ### Prerequisites
 
-- **Rust** 1.75+
+- **Rust** 1.97.1 for the documented mobile builds; host desktop tests may require 1.99.0.
 - **iOS**: macOS + Xcode 15+, [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
 - **Android**: Android SDK + NDK r25+, [cargo-ndk](https://github.com/nickelc/cargo-ndk) (`cargo install cargo-ndk`)
 
@@ -57,9 +57,59 @@ cd android/gradle && ./gradlew assembleDebug
 
 | Platform | Status | Min Version | GPU Backend |
 |----------|--------|-------------|-------------|
-| iOS (device + sim) | ✅ | iOS 13.0+ | Metal |
+| iOS simulator | Partially validated | iOS 16.0+ | Metal |
+| iOS device | Hardware validation pending | iOS 16.0+ | Metal |
 | Android (arm64) | ✅ | API 26+ | Vulkan (preferred), GL ES 3.0 |
 | Android (armv7/x86_64) | ⚠️ Untested | API 26+ | Vulkan / GL ES |
+
+### Distribution and dependency sources
+
+Use a Git dependency for the validated mobile sources. They contain changes that
+are not in the corresponding crates.io releases:
+
+| Dependency | Registry source | Local change |
+|------------|-----------------|--------------|
+| `gpui-fast` | `=0.1.12` | Deferred draw-phase invalidation fix. |
+| `gpui-fast-wgpu` | `=0.1.12` | Mobile present-mode selection and unaligned path buffer handling. |
+| `btleplug` | `=0.13.5` | Android service-addressed GATT identity and disconnect handling. |
+
+`gpui-kit` 0.8.1 uses its `gpui-fast` feature. Its unconditional dependencies
+still include `gpui-pre`, but the mobile application and renderer use `gpui-fast`.
+Fast scroll-layer caching is not compiled for Android or iOS upstream.
+
+Cargo rewrites a `path` dependency to its accompanying registry version and
+removes `[patch]` sections when it packages this crate. A crates.io consumer
+therefore gets the three unpatched releases above. The publish workflow runs a
+package-content check and blocks that distribution until the differences are
+available in compatible registry versions. The published `gpui-mobile` crate is
+also owned by `itsbalamurali`; this fork cannot publish a new version without an
+ownership transfer or a different package name.
+
+The minimal crates.io release path is:
+
+1. Get compatible registry releases containing the `gpui-fast`, `gpui-fast-wgpu`,
+   and `btleplug` fixes.
+2. Update the pins, remove the three local overrides, and require the packaged
+   dependency check to pass.
+3. Publish under `gpui-mobile` after an ownership transfer, or publish under a
+   new package name and update the crate imports for consumers.
+
+The Git consumer gets the patched `btleplug` path dependency inside this
+repository. Cargo still ignores dependency-level `[patch]` sections, so apply
+the GPUI patches at the consuming workspace root. Replace `<commit>` with the
+same full commit SHA in every entry:
+
+```toml
+[dependencies]
+gpui-mobile = { git = "https://github.com/mrchypark/gpui-mobile.git", rev = "<commit>", features = ["ble"] }
+
+[patch.crates-io]
+gpui-fast = { git = "https://github.com/mrchypark/gpui-mobile.git", rev = "<commit>" }
+gpui-fast-wgpu = { git = "https://github.com/mrchypark/gpui-mobile.git", rev = "<commit>" }
+```
+
+The Git dependency includes its patched `btleplug` path dependency. Enable BLE
+only when the host also includes the matching native Java setup and permissions.
 
 ## Screenshots
 

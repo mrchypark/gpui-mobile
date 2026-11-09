@@ -124,17 +124,24 @@ void gpui_ios_handle_text_input(void* window_ptr, void* text_ptr);
 
 /// Handle a key event from an external keyboard.
 ///
+/// Call this from the app delegate after UIKit has offered the press to the
+/// focused responder. This keeps text input and IME behavior intact.
+///
 /// Parameters:
 /// - window_ptr: Pointer to the IosWindow
 /// - key_code: The key code from UIKeyboardHIDUsage
 /// - modifiers: Modifier flags from UIKeyModifierFlags
+/// - unmodified: UTF-8 charactersIgnoringModifiers (nullable)
+/// - characters: UTF-8 characters produced by the key (nullable)
 /// - is_key_down: true for key down, false for key up
-void gpui_ios_handle_key_event(void* window_ptr, uint32_t key_code, uint32_t modifiers, _Bool is_key_down);
+void gpui_ios_handle_key_event(void* window_ptr, uint32_t key_code, uint32_t modifiers, const char* unmodified, const char* characters, _Bool is_key_down);
 
 /// Called when the app receives a URL to open (deep link).
 /// Parameters:
 /// - url_ptr: Pointer to NSString containing the URL
 void gpui_ios_handle_open_url(void* url_ptr);
+// Cold launch only: NSString URL, or NULL for an ordinary launch.
+void gpui_ios_record_initial_url(void* url_ptr);
 
 #ifdef __cplusplus
 }

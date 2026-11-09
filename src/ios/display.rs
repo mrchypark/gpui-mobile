@@ -67,7 +67,7 @@ impl IosDisplay {
 impl PlatformDisplay for IosDisplay {
     fn id(&self) -> DisplayId {
         // iOS doesn't have display IDs like macOS, so we use the screen pointer as an ID
-        DisplayId::new(self.screen as u32)
+        DisplayId::new(self.screen as u64)
     }
 
     fn uuid(&self) -> Result<Uuid> {
@@ -93,6 +93,13 @@ impl PlatformDisplay for IosDisplay {
         Bounds {
             origin: Default::default(),
             size: size(px(bounds.width as f32), px(bounds.height as f32)),
+        }
+    }
+
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        unsafe {
+            let hertz: i64 = msg_send![self.screen, maximumFramesPerSecond];
+            gpui::refresh_interval_from_hz(hertz as f64)
         }
     }
 }

@@ -1,6 +1,5 @@
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
-use std::ffi::CStr;
 
 pub struct IosSharedPreferences;
 
@@ -13,11 +12,15 @@ impl IosSharedPreferences {
         unsafe {
             let defaults = user_defaults();
             let ns_key = nsstring(key);
-            let value: *mut AnyObject = msg_send![defaults, stringForKey: ns_key];
+            let value: *mut AnyObject = msg_send![defaults, objectForKey: ns_key];
             if value.is_null() {
                 None
             } else {
-                Some(nsstring_to_string(value))
+                let is_string: bool = msg_send![value, isKindOfClass: class!(NSString)];
+                if !is_string {
+                    return None;
+                }
+                nsstring_to_string(value)
             }
         }
     }
@@ -28,7 +31,6 @@ impl IosSharedPreferences {
             let ns_key = nsstring(key);
             let ns_value = nsstring(value);
             let _: () = msg_send![defaults, setObject: ns_value, forKey: ns_key];
-            let _: () = msg_send![defaults, synchronize];
             Ok(())
         }
     }
@@ -41,6 +43,14 @@ impl IosSharedPreferences {
             if obj.is_null() {
                 None
             } else {
+                let is_number: bool = msg_send![obj, isKindOfClass: class!(NSNumber)];
+                if !is_number || CFGetTypeID(obj) == CFBooleanGetTypeID() {
+                    return None;
+                }
+                let kind: *const i8 = msg_send![obj, objCType];
+                if kind.is_null() || !b"csilqCSILQ".contains(&(*kind as u8)) {
+                    return None;
+                }
                 let val: i64 = msg_send![defaults, integerForKey: ns_key];
                 Some(val)
             }
@@ -52,7 +62,6 @@ impl IosSharedPreferences {
             let defaults = user_defaults();
             let ns_key = nsstring(key);
             let _: () = msg_send![defaults, setInteger: value, forKey: ns_key];
-            let _: () = msg_send![defaults, synchronize];
             Ok(())
         }
     }
@@ -65,6 +74,9 @@ impl IosSharedPreferences {
             if obj.is_null() {
                 None
             } else {
+                if CFGetTypeID(obj) != CFBooleanGetTypeID() {
+                    return None;
+                }
                 let val: bool = msg_send![defaults, boolForKey: ns_key];
                 Some(val)
             }
@@ -76,7 +88,6 @@ impl IosSharedPreferences {
             let defaults = user_defaults();
             let ns_key = nsstring(key);
             let _: () = msg_send![defaults, setBool: value, forKey: ns_key];
-            let _: () = msg_send![defaults, synchronize];
             Ok(())
         }
     }
@@ -86,7 +97,6 @@ impl IosSharedPreferences {
             let defaults = user_defaults();
             let ns_key = nsstring(key);
             let _: () = msg_send![defaults, removeObjectForKey: ns_key];
-            let _: () = msg_send![defaults, synchronize];
             Ok(())
         }
     }
@@ -94,17 +104,12 @@ impl IosSharedPreferences {
     pub fn clear(&self) -> Result<(), String> {
         unsafe {
             let defaults = user_defaults();
-            let dict: *mut AnyObject = msg_send![defaults, dictionaryRepresentation];
-            if dict.is_null() {
-                return Ok(());
+            let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+            let domain: *mut AnyObject = msg_send![bundle, bundleIdentifier];
+            if domain.is_null() {
+                return Err("No application preferences domain".into());
             }
-            let keys: *mut AnyObject = msg_send![dict, allKeys];
-            let count: u64 = msg_send![keys, count];
-            for i in 0..count {
-                let key: *mut AnyObject = msg_send![keys, objectAtIndex: i];
-                let _: () = msg_send![defaults, removeObjectForKey: key];
-            }
-            let _: () = msg_send![defaults, synchronize];
+            let _: () = msg_send![defaults, removePersistentDomainForName: domain];
             Ok(())
         }
     }
@@ -123,12 +128,38 @@ unsafe fn user_defaults() -> *mut AnyObject {
     msg_send![class!(NSUserDefaults), standardUserDefaults]
 }
 
+extern "C" {
+    fn CFGetTypeID(value: *const AnyObject) -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn typed_roundtrip_does_not_coerce_other_types() {
+        let prefs = IosSharedPreferences::new();
+        let key = format!("gpui_test_{}", std::process::id());
+        prefs.set_string(&key, "42").unwrap();
+        assert_eq!(prefs.get_int(&key), None);
+        prefs.set_int(&key, i64::MAX).unwrap();
+        assert_eq!(prefs.get_int(&key), Some(i64::MAX));
+        assert_eq!(prefs.get_bool(&key), None);
+        prefs.set_bool(&key, false).unwrap();
+        assert_eq!(prefs.get_bool(&key), Some(false));
+        assert_eq!(prefs.get_int(&key), None);
+        prefs.remove(&key).unwrap();
+        assert!(!prefs.contains_key(&key));
+    }
+}
+
 use crate::ios::util::nsstring;
 
-unsafe fn nsstring_to_string(ns: *mut AnyObject) -> String {
+unsafe fn nsstring_to_string(ns: *mut AnyObject) -> Option<String> {
     let utf8: *const i8 = msg_send![ns, UTF8String];
     if utf8.is_null() {
-        return String::new();
+        return None;
     }
-    CStr::from_ptr(utf8).to_string_lossy().into_owned()
+    let length: usize = msg_send![ns, lengthOfBytesUsingEncoding: 4usize];
+    String::from_utf8(std::slice::from_raw_parts(utf8 as *const u8, length).to_vec()).ok()
 }

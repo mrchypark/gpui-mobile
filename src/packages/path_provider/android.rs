@@ -1,9 +1,10 @@
 use crate::android::jni as app_jni;
+use crate::android::jni::JniExt;
 use std::path::PathBuf;
 
 pub fn temporary_directory() -> Result<PathBuf, String> {
     // Use cache dir + "tmp" subdirectory
-    cache_directory().map(|p| p.join("tmp"))
+    super::directories::temporary_directory(cache_directory()?)
 }
 
 pub fn documents_directory() -> Result<PathBuf, String> {
@@ -15,18 +16,38 @@ pub fn documents_directory() -> Result<PathBuf, String> {
 }
 
 pub fn cache_directory() -> Result<PathBuf, String> {
-    // No direct NDK API for cache dir. Derive from internal_data_path:
-    // getFilesDir() = /data/data/<pkg>/files
-    // getCacheDir() = /data/data/<pkg>/cache
-    let app = app_jni::android_app().ok_or_else(|| "AndroidApp not initialised".to_string())?;
-    let files_dir = app
-        .internal_data_path()
-        .ok_or_else(|| "internal_data_path() returned None".to_string())?;
-    // Go up from "files" to the app data root, then into "cache"
-    let parent = files_dir
-        .parent()
-        .ok_or_else(|| "internal_data_path has no parent".to_string())?;
-    Ok(parent.join("cache"))
+    app_jni::with_env(|env| {
+        let activity = app_jni::activity(env)?;
+        let directory = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getCacheDir"),
+                jni::jni_sig!("()Ljava/io/File;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .e()?;
+        if directory.is_null() {
+            return Err("Context.getCacheDir returned null".into());
+        }
+        let path = env
+            .call_method(
+                &directory,
+                jni::jni_str!("getAbsolutePath"),
+                jni::jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .and_then(|v| v.l())
+            .e()?;
+        if path.is_null() {
+            return Err("Cache directory path is null".into());
+        }
+        let path = app_jni::get_string(env, &path);
+        if path.is_empty() {
+            return Err("Cache directory path is empty".into());
+        }
+        Ok(PathBuf::from(path))
+    })
 }
 
 pub fn support_directory() -> Result<PathBuf, String> {

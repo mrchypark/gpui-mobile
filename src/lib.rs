@@ -67,14 +67,24 @@
 
 // ── Re-export the gpui crate so consumers can access types through us ────────
 
+pub use futures;
 pub use gpui;
 
 // ── shared modules ───────────────────────────────────────────────────────────
 
 pub mod components;
+#[allow(dead_code)]
+pub(crate) mod fling_guard;
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) mod frame_demand;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) mod frame_pacer;
+mod mobile_dispatch;
+pub mod mobile_events;
 pub mod momentum;
 pub mod packages;
 pub mod platform_view;
+pub mod render_request;
 pub mod target_platform;
 
 // ── System chrome (status bar / navigation bar) styling ──────────────────────
@@ -138,7 +148,6 @@ pub fn set_system_chrome(style: &SystemChromeStyle) {
 
 // ── Text input callback ──────────────────────────────────────────────────────
 
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 type TextInputCallbackFn = Box<dyn FnMut(&str)>;
@@ -152,10 +161,15 @@ type TextInputCallbackFn = Box<dyn FnMut(&str)>;
 /// which in turn calls `drain_pending_text()` and updates the UI.
 pub static TEXT_INPUT_DIRTY: AtomicBool = AtomicBool::new(false);
 
-thread_local! {
-    /// Global text input callback — set by the active text input component.
-    /// When the software keyboard sends text, this callback is invoked.
-    static TEXT_INPUT_CALLBACK: RefCell<Option<TextInputCallbackFn>> = RefCell::new(None);
+/// Marks text input as waiting and asks the platform for the frame that will
+/// process it — a host that paused its frame source on an idle screen has
+/// to be woken, since typing does not go through GPUI's invalidator.
+pub(crate) fn mark_text_input_dirty() {
+    TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+    #[cfg(target_os = "ios")]
+    ios::ffi::wake_windows();
+    #[cfg(target_os = "android")]
+    android::frame_source::wake();
 }
 
 /// Register a callback that receives text from the software keyboard.
@@ -163,9 +177,7 @@ thread_local! {
 /// Only one callback can be active at a time. Call with `None` to clear it.
 /// This is typically called by the text input component when it gains focus.
 pub fn set_text_input_callback(callback: Option<TextInputCallbackFn>) {
-    TEXT_INPUT_CALLBACK.with(|cb| {
-        *cb.borrow_mut() = callback;
-    });
+    mobile_dispatch::set_text_handler(callback);
 }
 
 /// Dispatch text input to the registered callback.
@@ -174,15 +186,11 @@ pub fn set_text_input_callback(callback: Option<TextInputCallbackFn>) {
 /// Returns true if a callback handled the text. Also sets `TEXT_INPUT_DIRTY`
 /// so the platform frame callback forces a re-render.
 pub fn dispatch_text_input(text: &str) -> bool {
-    TEXT_INPUT_CALLBACK.with(|cb| {
-        if let Some(callback) = cb.borrow_mut().as_mut() {
-            callback(text);
-            TEXT_INPUT_DIRTY.store(true, Ordering::Release);
-            true
-        } else {
-            false
-        }
-    })
+    let handled = mobile_dispatch::dispatch_text(text);
+    if handled {
+        mark_text_input_dirty();
+    }
+    handled
 }
 
 // ── Software keyboard control ────────────────────────────────────────────────
@@ -225,13 +233,8 @@ pub fn show_keyboard() {
 pub fn show_keyboard_with_type(keyboard_type: KeyboardType) {
     #[cfg(target_os = "ios")]
     {
-        if let Some(wrapper) = ios::ffi::IOS_WINDOW_LIST.get() {
-            unsafe {
-                let windows = &*wrapper.0.get();
-                if let Some(&window) = windows.last() {
-                    (*window).show_keyboard_with_type(keyboard_type);
-                }
-            }
+        if let Some(window) = ios::ffi::windows().last() {
+            window.show_keyboard_with_type(keyboard_type);
         }
     }
     #[cfg(target_os = "android")]
@@ -252,13 +255,8 @@ pub fn show_keyboard_with_type(keyboard_type: KeyboardType) {
 pub fn hide_keyboard() {
     #[cfg(target_os = "ios")]
     {
-        if let Some(wrapper) = ios::ffi::IOS_WINDOW_LIST.get() {
-            unsafe {
-                let windows = &*wrapper.0.get();
-                if let Some(&window) = windows.last() {
-                    (*window).hide_keyboard();
-                }
-            }
+        if let Some(window) = ios::ffi::windows().last() {
+            window.hide_keyboard();
         }
     }
     #[cfg(target_os = "android")]
@@ -291,7 +289,7 @@ pub fn set_keyboard_height(height: f32) {
     let prev = f32::from_bits(KEYBOARD_HEIGHT_BITS.load(Ordering::Relaxed));
     if (prev - height).abs() > 0.5 {
         KEYBOARD_HEIGHT_BITS.store(height.to_bits(), Ordering::Release);
-        TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+        mark_text_input_dirty();
     }
 }
 
@@ -306,13 +304,8 @@ pub fn set_keyboard_height(height: f32) {
 pub fn safe_area_insets() -> (f32, f32, f32, f32) {
     #[cfg(target_os = "ios")]
     {
-        if let Some(wrapper) = ios::ffi::IOS_WINDOW_LIST.get() {
-            unsafe {
-                let windows = &*wrapper.0.get();
-                if let Some(&window) = windows.last() {
-                    return (*window).safe_area_insets();
-                }
-            }
+        if let Some(window) = ios::ffi::windows().last() {
+            return window.safe_area_insets();
         }
     }
     #[cfg(not(target_os = "ios"))]

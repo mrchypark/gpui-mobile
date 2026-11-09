@@ -41,8 +41,8 @@
 use std::{
     ffi::c_void,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -52,6 +52,162 @@ use std::{
 /// Reset to `false` on `TerminateWindow` so that when the surface is
 /// recreated on resume the init callbacks run again.
 static INIT_WINDOW_DONE: AtomicBool = AtomicBool::new(false);
+
+const SURFACE_INIT_MAX_ATTEMPTS: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceInitState {
+    Idle,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceInitAttempt {
+    Ready,
+    Retry,
+    Failed,
+}
+
+struct SurfaceInit {
+    state: SurfaceInitState,
+    attempts: u8,
+}
+
+impl SurfaceInit {
+    const fn new() -> Self {
+        Self {
+            state: SurfaceInitState::Idle,
+            attempts: 0,
+        }
+    }
+
+    fn begin(&mut self) {
+        *self = Self::new();
+    }
+
+    fn record(&mut self, succeeded: bool) -> SurfaceInitAttempt {
+        self.attempts = self.attempts.saturating_add(1);
+        if succeeded {
+            self.state = SurfaceInitState::Ready;
+            SurfaceInitAttempt::Ready
+        } else if self.attempts >= SURFACE_INIT_MAX_ATTEMPTS {
+            self.state = SurfaceInitState::Failed;
+            SurfaceInitAttempt::Failed
+        } else {
+            SurfaceInitAttempt::Retry
+        }
+    }
+
+    fn mark_failed(&mut self) {
+        self.state = SurfaceInitState::Failed;
+    }
+
+    fn blocks_initialization(&self) -> bool {
+        self.state != SurfaceInitState::Ready
+    }
+}
+
+static SURFACE_INIT: std::sync::Mutex<SurfaceInit> = std::sync::Mutex::new(SurfaceInit::new());
+
+thread_local! {
+    static NATIVE_TOUCH_ROUTE: std::cell::RefCell<crate::mobile_dispatch::NativeTouchRoute> = Default::default();
+    static PLATFORM_EVENTS: std::cell::RefCell<Vec<Option<gpui::AppLifecyclePhase>>> = Default::default();
+}
+
+fn queue_platform_event(phase: Option<gpui::AppLifecyclePhase>) {
+    PLATFORM_EVENTS.with(|events| events.borrow_mut().push(phase));
+}
+
+static THERMAL_NEXT_GENERATION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+static THERMAL_GENERATION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static THERMAL_STOP_PENDING: AtomicBool = AtomicBool::new(false);
+static THERMAL_EVENTS: std::sync::Mutex<Vec<(i64, i32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Invalidate the previous registration before scheduling Java-main registration.
+pub(crate) fn begin_thermal_listener() -> i64 {
+    let generation = THERMAL_NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    THERMAL_GENERATION.store(generation, Ordering::Release);
+    generation
+}
+
+pub(crate) fn end_thermal_listener(generation: i64) {
+    let _ = THERMAL_GENERATION.compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// Java supplies only owned scalar values; no GPUI callback runs on this thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeStatusChanged(
+    _env: *mut c_void, _class: *mut c_void, generation: i64, status: i32,
+) {
+    if generation <= 0 || !(0..=6).contains(&status)
+        || THERMAL_GENERATION.load(Ordering::Acquire) != generation { return; }
+    THERMAL_EVENTS.lock().unwrap().push((generation, status));
+    if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeListenerStopped(
+    _env: *mut c_void, _class: *mut c_void, generation: i64,
+) {
+    if generation > 0 && THERMAL_GENERATION.compare_exchange(
+        generation, 0, Ordering::AcqRel, Ordering::Acquire,
+    ).is_ok() {
+        THERMAL_STOP_PENDING.store(true, Ordering::Release);
+        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+    }
+}
+
+fn drain_platform_events() {
+    // Outside drawing/App borrows; resolve actual installed identity before draining IME.
+    if let Some(window) = PLATFORM.get().and_then(|platform| platform.primary_window()) {
+        window.refresh_ime_owner();
+    }
+    if THERMAL_STOP_PENDING.swap(false, Ordering::AcqRel)
+        && THERMAL_GENERATION.load(Ordering::Acquire) == 0
+    {
+        if let Some(platform) = PLATFORM.get() { platform.on_thermal_host_destroyed(); }
+    }
+    let thermal = std::mem::take(&mut *THERMAL_EVENTS.lock().unwrap());
+    if let Some(platform) = PLATFORM.get() {
+        for (generation, status) in thermal {
+            if THERMAL_GENERATION.load(Ordering::Acquire) == generation {
+                platform.deliver_thermal_status(generation, status);
+            }
+        }
+    }
+    let urls = std::mem::take(&mut *OPEN_URLS_PENDING.lock().unwrap());
+    if !urls.is_empty() {
+        if let Some(platform) = PLATFORM.get() {
+            platform.deliver_open_urls(urls);
+        }
+    }
+    let text = std::mem::take(&mut *IME_TEXT.lock().unwrap());
+    if let Some(window) = PLATFORM
+        .get()
+        .and_then(|platform| platform.primary_window())
+    {
+        for (session, editor, input) in text {
+            if let Some(lease) = crate::mobile_events::active_text_input_lease() {
+                if !window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.owner().window) { continue; }
+            }
+            log::info!("IME drain session={session} editor={editor} active={} current_session={} current_editor={} accepted={}",
+                IME_ACTIVE.load(Ordering::Acquire), IME_GENERATION.load(Ordering::Acquire),
+                IME_EDITOR.load(Ordering::Acquire), ime_delivery_current(session, editor));
+            if ime_delivery_current(session, editor) {
+                window.handle_ime_input(session, editor, input);
+            }
+        }
+    }
+    let events = PLATFORM_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()));
+    for phase in events {
+        if let Some(phase) = phase {
+            crate::mobile_events::dispatch_app_lifecycle(phase);
+        } else {
+            crate::mobile_events::dispatch_memory_warning();
+        }
+    }
+}
 
 /// Whether the GPUI native library has completed initialization.
 ///
@@ -76,17 +232,77 @@ pub static NATIVE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// processes them AFTER `poll_events` returns.
 static PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
 static RESUME_PENDING: AtomicBool = AtomicBool::new(false);
+static FOCUS_PENDING: std::sync::Mutex<Vec<bool>> = std::sync::Mutex::new(Vec::new());
 static TERM_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
 static CONFIG_CHANGED_PENDING: AtomicBool = AtomicBool::new(false);
+static WINDOW_INSETS_PENDING: parking_lot::Mutex<
+    Option<(f32, crate::mobile_events::WindowInsets)>,
+> = parking_lot::Mutex::new(None);
+
+/// Java UI callbacks only publish data; GPUI dispatch runs on its native thread.
+#[no_mangle]
+pub unsafe extern "system" fn Java_dev_gpui_mobile_GpuiInsets_nativeInsets(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    density: f32,
+    top: i32,
+    bottom: i32,
+    left: i32,
+    right: i32,
+    ime_top: i32,
+    ime_bottom: i32,
+    ime_left: i32,
+    ime_right: i32,
+    ime_visible: jni::sys::jboolean,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    if !density.is_finite()
+        || density <= 0.0
+        || [
+            top, bottom, left, right, ime_top, ime_bottom, ime_left, ime_right, x, y, width, height,
+        ]
+        .iter()
+        .any(|value| *value < 0)
+    {
+        return;
+    }
+    let logical = |value: i32| gpui::px(value as f32 / density);
+    let insets = crate::mobile_events::WindowInsets {
+        safe_area: gpui::Edges {
+            top: logical(top),
+            bottom: logical(bottom),
+            left: logical(left),
+            right: logical(right),
+        },
+        keyboard: (ime_visible && width > 0 && height > 0).then(|| gpui::Bounds {
+            origin: gpui::point(logical(x), logical(y)),
+            size: gpui::size(logical(width), logical(height)),
+        }),
+        keyboard_visible: Some(ime_visible),
+        keyboard_insets: Some(gpui::Edges {
+            top: logical(ime_top),
+            bottom: logical(ime_bottom),
+            left: logical(ime_left),
+            right: logical(ime_right),
+        }),
+    };
+    *WINDOW_INSETS_PENDING.lock() = Some((density, insets));
+    if let Some(app) = ANDROID_APP.get() {
+        app.create_waker().wake();
+    }
+}
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 
 use super::platform::{AndroidPlatform, SharedPlatform};
 
-use jni::objects::{JObject, JString, JValue};
 use jni::JavaVM;
+use jni::objects::{JObject, JString, JValue};
 
 // ── JNI helpers (safe `jni` crate wrappers) ──────────────────────────────────
 
@@ -330,6 +546,7 @@ pub fn shared_platform() -> Option<SharedPlatform> {
 const AMOTION_EVENT_ACTION_DOWN: u32 = 0;
 const AMOTION_EVENT_ACTION_UP: u32 = 1;
 const AMOTION_EVENT_ACTION_MOVE: u32 = 2;
+const AMOTION_EVENT_ACTION_CANCEL: u32 = 3;
 
 // ── night mode query via NDK Configuration ───────────────────────────────────
 
@@ -380,6 +597,14 @@ fn process_input_events(app: &AndroidApp) {
                         InputEvent::MotionEvent(motion_event) => {
                             let action = motion_event.action();
                             let pointer_count = motion_event.pointer_count();
+                            // Cancellation belongs to the existing stream even over a native view,
+                            // and may arrive without a usable pointer array.
+                            if action == MotionAction::Cancel {
+                                let native = NATIVE_TOUCH_ROUTE.with(|route| route.borrow_mut().route(false, true, || false));
+                                if native { return android_activity::InputStatus::Unhandled; }
+                                win.handle_touch(crate::android::TouchPoint { id: 0, x: 0.0, y: 0.0, action: AMOTION_EVENT_ACTION_CANCEL });
+                                return android_activity::InputStatus::Handled;
+                            }
 
                             log::debug!(
                                 "process_input_events: MotionEvent action={:?} pointers={}",
@@ -398,25 +623,24 @@ fn process_input_events(app: &AndroidApp) {
                             // We use the primary pointer for the hit-test on DOWN
                             // actions. Physical pixel coordinates are converted to
                             // logical pixels to match PlatformViewBounds.
-                            let hits_platform_view = {
-                                let registry = crate::platform_view::PlatformViewRegistry::global();
-                                if registry.active_view_count() > 0 {
-                                    let primary = motion_event.pointer_at_index(
-                                        match action {
-                                            MotionAction::PointerDown | MotionAction::PointerUp => {
-                                                motion_event.pointer_index()
-                                            }
-                                            _ => 0,
+                            let hits_platform_view = NATIVE_TOUCH_ROUTE.with(|route| {
+                                route.borrow_mut().route(
+                                    action == MotionAction::Down,
+                                    action == MotionAction::Up,
+                                    || {
+                                        if pointer_count == 0 {
+                                            return false;
                                         }
-                                    );
-                                    let scale = win.scale_factor();
-                                    let logical_x = primary.x() / scale;
-                                    let logical_y = primary.y() / scale;
-                                    registry.hit_test(logical_x, logical_y)
-                                } else {
-                                    false
-                                }
-                            };
+                                        let registry = crate::platform_view::PlatformViewRegistry::global();
+                                        if registry.active_view_count() == 0 {
+                                            return false;
+                                        }
+                                        let primary = motion_event.pointer_at_index(0);
+                                        let scale = win.scale_factor();
+                                        registry.hit_test(primary.x() / scale, primary.y() / scale)
+                                    },
+                                )
+                            });
 
                             if hits_platform_view {
                                 log::debug!(
@@ -449,7 +673,7 @@ fn process_input_events(app: &AndroidApp) {
                                         AMOTION_EVENT_ACTION_UP
                                     }
                                     MotionAction::Move => AMOTION_EVENT_ACTION_MOVE,
-                                    MotionAction::Cancel => AMOTION_EVENT_ACTION_UP,
+                                    MotionAction::Cancel => AMOTION_EVENT_ACTION_CANCEL,
                                     _ => continue,
                                 };
 
@@ -531,6 +755,25 @@ fn process_input_events(app: &AndroidApp) {
 /// Called from `android_main` after the platform is initialised.
 /// Runs until the platform requests quit or the activity is destroyed.
 pub fn run_event_loop(app: &AndroidApp) {
+    app.run_on_java_main_thread(Box::new(|| {
+        if let Err(error) = with_env(|env| {
+            let class = find_app_class(env, "dev.gpui.mobile.GpuiInsets")?;
+            let activity = activity(env)?;
+            env.call_static_method(
+                &class,
+                jni::jni_str!("install"),
+                jni::jni_sig!("(Landroid/app/Activity;)V"),
+                &[JValue::Object(&activity)],
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })
+        }) {
+            log::error!("WindowInsets observer installation failed: {error}");
+        }
+    }));
     log::info!("run_event_loop: entering main loop");
 
     // Track whether the on_init_window callback has already been invoked.
@@ -544,6 +787,7 @@ pub fn run_event_loop(app: &AndroidApp) {
     // the callback is still pending, invoke it *after* poll_events has
     // returned so focus/input events have already been drained.
     INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
+    SURFACE_INIT.lock().unwrap().begin();
     let mut iteration: u64 = 0;
     let mut last_heartbeat = std::time::Instant::now();
     let mut app_is_active = false;
@@ -567,6 +811,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         if let Some(platform) = PLATFORM.get() {
             if platform.should_quit() {
                 log::info!("run_event_loop: platform requested quit");
+                platform.on_thermal_host_destroyed();
                 dispose_all_platform_views();
                 break;
             }
@@ -607,6 +852,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         if TERM_WINDOW_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: TerminateWindow (iter={})", iteration);
             INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
+            SURFACE_INIT.lock().unwrap().begin();
             *LAST_CHROME_STYLE.lock().unwrap() = None;
             if let Some(platform) = PLATFORM.get() {
                 if let Some(win) = platform.primary_window() {
@@ -620,7 +866,19 @@ pub fn run_event_loop(app: &AndroidApp) {
         // 2. InitWindow — replace surface on existing renderer, or create new
         if INIT_WINDOW_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: InitWindow (iter={})", iteration);
+            INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
+            let previous_surface_ready = {
+                let mut surface = SURFACE_INIT.lock().unwrap();
+                let ready = !surface.blocks_initialization();
+                surface.begin();
+                ready
+            };
             if let Some(platform) = PLATFORM.get() {
+                if previous_surface_ready {
+                    if let Some(existing) = platform.primary_window() {
+                        existing.term_window();
+                    }
+                }
                 if let Some(native_window) = app.native_window() {
                     let width = native_window.width();
                     let height = native_window.height();
@@ -635,27 +893,65 @@ pub fn run_event_loop(app: &AndroidApp) {
 
                     if let Some(existing) = platform.primary_window() {
                         let gpu_ctx = platform.gpu_context();
-                        match existing.init_window(native_window, gpu_ctx) {
-                            Ok(()) => {
-                                log::info!("InitWindow: reinitialised existing window");
-                            }
-                            Err(e) => {
-                                log::error!("failed to reinit window surface: {e:#}");
+                        let mut pending_native_window = Some(native_window);
+                        let mut surface_ready = false;
+
+                        for attempt in 1..=SURFACE_INIT_MAX_ATTEMPTS {
+                            let native_window = match pending_native_window
+                                .take()
+                                .or_else(|| app.native_window())
+                            {
+                                Some(native_window) => native_window,
+                                None => {
+                                    log::error!(
+                                        "InitWindow: native window unavailable on attempt {attempt}"
+                                    );
+                                    break;
+                                }
+                            };
+
+                            let succeeded = match existing
+                                .init_window(native_window, gpu_ctx.clone())
+                            {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    log::warn!(
+                                        "InitWindow: surface attempt {attempt}/{SURFACE_INIT_MAX_ATTEMPTS} failed: {e:#}"
+                                    );
+                                    false
+                                }
+                            };
+
+                            match SURFACE_INIT.lock().unwrap().record(succeeded) {
+                                SurfaceInitAttempt::Ready => {
+                                    surface_ready = true;
+                                    log::info!(
+                                        "InitWindow: reinitialised existing window on attempt {attempt}"
+                                    );
+                                    break;
+                                }
+                                SurfaceInitAttempt::Retry => {}
+                                SurfaceInitAttempt::Failed => {
+                                    log::error!(
+                                        "InitWindow: surface reinitialization failed after {attempt} attempts; rendering remains disabled"
+                                    );
+                                    break;
+                                }
                             }
                         }
 
-                        // Trigger GPUI resize so layout adapts to new dimensions.
-                        existing.handle_resize();
-
-                        let cr = app.content_rect();
-                        existing.update_safe_area_from_content_rect(
-                            cr.left, cr.top, cr.right, cr.bottom,
-                        );
-
-                        INIT_WINDOW_DONE.store(true, Ordering::Relaxed);
+                        if surface_ready {
+                            let cr = app.content_rect();
+                            existing.update_safe_area_from_content_rect(
+                                cr.left, cr.top, cr.right, cr.bottom,
+                            );
+                        } else {
+                            SURFACE_INIT.lock().unwrap().mark_failed();
+                        }
                     } else {
                         match platform.open_window(native_window, scale_factor, false) {
                             Ok(win) => {
+                                SURFACE_INIT.lock().unwrap().record(true);
                                 log::info!(
                                     "window opened — id={:#x} scale={:.1}",
                                     win.id(),
@@ -668,11 +964,18 @@ pub fn run_event_loop(app: &AndroidApp) {
                                 );
                             }
                             Err(e) => {
+                                SURFACE_INIT.lock().unwrap().mark_failed();
                                 log::error!("failed to open window: {e:#}");
                             }
                         }
                     }
+                } else {
+                    SURFACE_INIT.lock().unwrap().mark_failed();
+                    log::error!("InitWindow: native window unavailable");
                 }
+            } else {
+                SURFACE_INIT.lock().unwrap().mark_failed();
+                log::error!("InitWindow: platform unavailable");
             }
             // Drain — Java thread may have queued ConfigChanged/WindowResized.
             drain_events(app);
@@ -691,6 +994,16 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // 4. ConfigChanged
+        if let Some(window) = PLATFORM
+            .get()
+            .and_then(|platform| platform.primary_window())
+        {
+            let pending = WINDOW_INSETS_PENDING.lock().take();
+            if let Some((density, insets)) = pending {
+                window.update_window_insets(density, insets);
+            }
+        }
+
         if CONFIG_CHANGED_PENDING.swap(false, Ordering::Relaxed) {
             log::debug!("deferred: ConfigChanged");
             if let Some(platform) = PLATFORM.get() {
@@ -707,13 +1020,20 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
         }
 
+        if let Some(win) = PLATFORM.get().and_then(|p| p.primary_window()) {
+            let focus = std::mem::take(&mut *FOCUS_PENDING.lock().unwrap());
+            for active in focus {
+                win.set_active(active);
+            }
+        }
+
         // 5. Pause / background
         if PAUSE_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Pause (iter={})", iteration);
             if let Some(platform) = PLATFORM.get() {
                 platform.did_enter_background();
                 if let Some(win) = platform.primary_window() {
-                    win.set_active(false);
+                    win.notify_app_lifecycle(false);
                 }
             }
             // Pause platform views
@@ -726,7 +1046,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             if let Some(platform) = PLATFORM.get() {
                 platform.did_become_active();
                 if let Some(win) = platform.primary_window() {
-                    win.set_active(true);
+                    win.notify_app_lifecycle(true);
                 }
             }
             // Resume platform views
@@ -749,11 +1069,18 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
         }
 
-        // Process input events.
+        // Deliver queued IME edits before a touch can change the focused owner.
+        if INIT_WINDOW_DONE.load(Ordering::Relaxed) {
+            drain_platform_events();
+        }
         process_input_events(app);
 
         // Deferred initialisation callbacks (runs once).
-        if !INIT_WINDOW_DONE.load(Ordering::Relaxed) {
+        if !INIT_WINDOW_DONE.load(Ordering::Relaxed)
+            && !SURFACE_INIT.lock().unwrap().blocks_initialization()
+            && !TERM_WINDOW_PENDING.load(Ordering::Relaxed)
+            && !INIT_WINDOW_PENDING.load(Ordering::Relaxed)
+        {
             if let Some(platform) = PLATFORM.get() {
                 if platform.primary_window().is_some() {
                     if let Some(finish_cb) = platform.take_finish_launching_callback() {
@@ -780,9 +1107,17 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
         }
 
+        // Dispatch only after poll_events releases android-activity's locks.
+        if INIT_WINDOW_DONE.load(Ordering::Relaxed) {
+            drain_platform_events();
+        }
         // ── Render ──
         if let Some(platform) = PLATFORM.get() {
-            if INIT_WINDOW_DONE.load(Ordering::Relaxed) && app_is_active {
+            if INIT_WINDOW_DONE.load(Ordering::Relaxed)
+                && app_is_active
+                && !TERM_WINDOW_PENDING.load(Ordering::Relaxed)
+                && !INIT_WINDOW_PENDING.load(Ordering::Relaxed)
+            {
                 platform.flush_main_thread_tasks();
                 if let Some(win) = platform.primary_window() {
                     win.request_frame();
@@ -792,6 +1127,7 @@ pub fn run_event_loop(app: &AndroidApp) {
                 // (e.g. rotation triggers TerminateWindow while we were
                 // in get_current_texture / present).
                 drain_events(app);
+                drain_platform_events();
                 process_input_events(app);
             }
         }
@@ -875,20 +1211,22 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 
         MainEvent::GainedFocus => {
             log::info!("MainEvent::GainedFocus");
-            RESUME_PENDING.store(true, Ordering::Relaxed);
+            FOCUS_PENDING.lock().unwrap().push(true);
         }
 
         MainEvent::LostFocus => {
             log::info!("MainEvent::LostFocus");
-            PAUSE_PENDING.store(true, Ordering::Relaxed);
+            FOCUS_PENDING.lock().unwrap().push(false);
         }
 
         MainEvent::Resume { .. } => {
+            queue_platform_event(Some(gpui::AppLifecyclePhase::Active));
             log::info!("MainEvent::Resume");
             RESUME_PENDING.store(true, Ordering::Relaxed);
         }
 
         MainEvent::Pause => {
+            queue_platform_event(Some(gpui::AppLifecyclePhase::Inactive));
             log::info!("MainEvent::Pause");
             // set_active uses AtomicBool so it never blocks.
             PAUSE_PENDING.store(true, Ordering::Relaxed);
@@ -900,10 +1238,12 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
         }
 
         MainEvent::Start => {
+            queue_platform_event(Some(gpui::AppLifecyclePhase::Foreground));
             log::info!("MainEvent::Start");
         }
 
         MainEvent::Stop => {
+            queue_platform_event(Some(gpui::AppLifecyclePhase::Background));
             log::info!("MainEvent::Stop");
         }
 
@@ -912,11 +1252,14 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
         }
 
         MainEvent::LowMemory => {
+            queue_platform_event(None);
             log::warn!("MainEvent::LowMemory — consider releasing cached resources");
         }
 
         MainEvent::Destroy => {
             log::info!("MainEvent::Destroy");
+            THERMAL_GENERATION.store(0, Ordering::Release);
+            THERMAL_STOP_PENDING.store(true, Ordering::Release);
 
             if let Some(platform) = PLATFORM.get() {
                 platform.quit();
@@ -953,6 +1296,7 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 pub fn poll_events(timeout_ms: i32) -> bool {
     if let Some(platform) = PLATFORM.get() {
         if platform.should_quit() {
+            platform.on_thermal_host_destroyed();
             return true;
         }
         platform.tick();
@@ -977,6 +1321,7 @@ pub fn poll_events(timeout_ms: i32) -> bool {
         _ => {}
     });
 
+    drain_platform_events();
     process_input_events(app);
 
     // Drive the GPUI rendering pipeline (same as run_event_loop).
@@ -1200,34 +1545,410 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
 
 // ── software keyboard (IME) control ───────────────────────────────────────────
 
-/// Show the software keyboard on Android with a specific keyboard type.
+type PromptSender = futures::channel::oneshot::Sender<usize>;
+static PROMPTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<i64, PromptSender>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static NEXT_PROMPT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+pub(crate) fn show_prompt(
+    message: &str,
+    detail: Option<&str>,
+    answers: &[gpui::PromptButton],
+) -> Option<futures::channel::oneshot::Receiver<usize>> {
+    let app = android_app()?;
+    if answers.is_empty() || answers.len() > i32::MAX as usize {
+        return None;
+    }
+    let message = message.to_owned();
+    let detail = detail.unwrap_or_default().to_owned();
+    let labels: Vec<String> = answers
+        .iter()
+        .map(|answer| answer.label().to_string())
+        .collect();
+    let cancel = answers
+        .iter()
+        .position(|answer| answer.is_cancel())
+        .map_or(-1, |index| index as i32);
+    let id = NEXT_PROMPT.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = futures::channel::oneshot::channel();
+    PROMPTS.lock().unwrap().insert(id, sender);
+    app.run_on_java_main_thread(Box::new(move || {
+        let result = with_env(|env| {
+            let class = find_app_class(env, "dev.gpui.mobile.GpuiPrompt")?;
+            let activity = activity(env)?;
+            let message = env.new_string(message).map_err(|e| e.to_string())?;
+            let detail = env.new_string(detail).map_err(|e| e.to_string())?;
+            let string_class = env.find_class(jni::jni_str!("java/lang/String")).map_err(|e| e.to_string())?;
+            let array = env.new_object_array(labels.len() as i32, &string_class, JObject::null()).map_err(|e| e.to_string())?;
+            for (index, label) in labels.iter().enumerate() {
+                let label = env.new_string(label).map_err(|e| e.to_string())?;
+                env.set_object_array_element(&array, index, &label).map_err(|e| e.to_string())?;
+            }
+            env.call_static_method(&class, jni::jni_str!("show"),
+                jni::jni_sig!("(Landroid/app/Activity;JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)V"),
+                &[JValue::Object(&activity), JValue::Long(id), JValue::Object(&message), JValue::Object(&detail), JValue::Object(&array), JValue::Int(cancel)])
+                .map(|_| ()).map_err(|e| { env.exception_clear(); e.to_string() })
+        });
+        if let Err(error) = result {
+            PROMPTS.lock().unwrap().remove(&id);
+            log::warn!("Android prompt failed: {error}");
+        }
+    }));
+    Some(receiver)
+}
+
+/// Java only completes a channel; user callbacks run on their executor, outside this lock.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_dev_gpui_mobile_GpuiPrompt_complete(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    id: i64,
+    answer: i32,
+) {
+    let sender = PROMPTS.lock().unwrap().remove(&id);
+    if let Some(sender) = sender {
+        if answer >= 0 {
+            let _ = sender.send(answer as usize);
+        }
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_completion_is_once_and_cancellation_disconnects() {
+        let id = NEXT_PROMPT.fetch_add(1, Ordering::Relaxed);
+        let (sender, mut receiver) = futures::channel::oneshot::channel();
+        PROMPTS.lock().unwrap().insert(id, sender);
+        Java_dev_gpui_mobile_GpuiPrompt_complete(std::ptr::null_mut(), std::ptr::null_mut(), id, 2);
+        Java_dev_gpui_mobile_GpuiPrompt_complete(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            id,
+            -1,
+        );
+        assert_eq!(receiver.try_recv().unwrap(), Some(2));
+        let id = NEXT_PROMPT.fetch_add(1, Ordering::Relaxed);
+        let (sender, mut receiver) = futures::channel::oneshot::channel();
+        PROMPTS.lock().unwrap().insert(id, sender);
+        Java_dev_gpui_mobile_GpuiPrompt_complete(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            id,
+            -1,
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
 /// Show the software keyboard on Android.
 ///
-/// Uses the NDK `ANativeActivity_showSoftInput` via `android-activity`.
-/// The previous EditText/JNI approach silently failed with
-/// `CalledFromWrongThreadException` because all JNI View operations
-/// must run on the Android UI thread, not the native Rust thread.
-/// The NDK function handles the UI-thread dispatch internally.
-///
-/// Text input arrives via `KeyEvent`s through `process_input_events()`.
-pub fn show_keyboard_android(_keyboard_type: crate::KeyboardType) {
+/// `android-activity` accesses InputMethodManager and Views through JNI on the
+/// calling thread, so schedule the operation on Java's main thread explicitly.
+pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
+    let (flags, options) = IME_CONFIGURATION
+        .with(|configuration| crate::mobile_events::android_input_traits(&configuration.borrow()));
+    let secure = IME_PASSWORD.get();
+    let (flags, options) = crate::mobile_events::android_password_traits(flags, options, secure);
+    let key = (keyboard_type, flags, options, IME_EDITOR.load(Ordering::Acquire));
+    if IME_LOGICAL_OWNER.load(Ordering::Acquire) && IME_ACTIVE.load(Ordering::Acquire)
+        && IME_SHOWN_KEY.get() == Some(key) { return; }
+    IME_SHOWN_KEY.set(Some(key));
+    IME_TYPE.set(keyboard_type);
+    IME_ACTIVE.store(true, Ordering::Release);
+    IME_LEGACY_ENABLED.store(
+        crate::mobile_dispatch::has_text_handler(),
+        Ordering::Release,
+    );
+    let session = IME_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    IME_LEGACY_GENERATION.set(crate::mobile_dispatch::text_handler_generation());
     if let Some(app) = android_app() {
-        log::info!("show_keyboard_android: using NDK show_soft_input");
-        app.show_soft_input(false);
+        app.run_on_java_main_thread(Box::new(move || {
+            if IME_GENERATION.load(Ordering::Acquire) != session {
+                return;
+            }
+            let result = with_env(|env| {
+                let class = find_app_class(env, "dev.gpui.mobile.GpuiKeyboard")?;
+                let activity = activity(env)?;
+                let mut input_type = if secure { 0x81 } else { match keyboard_type {
+                    crate::KeyboardType::Default => 1,
+                    crate::KeyboardType::EmailAddress => 0x21,
+                    crate::KeyboardType::Phone => 3,
+                    crate::KeyboardType::NumberPad => 2,
+                    crate::KeyboardType::URL => 0x11,
+                    crate::KeyboardType::Decimal => 0x2002,
+                }};
+                if input_type & 0xf == 1 {
+                    input_type |= flags;
+                }
+                env.call_static_method(
+                    &class,
+                    jni::jni_str!("show"),
+                    jni::jni_sig!("(Landroid/app/Activity;IIJ)V"),
+                    &[
+                        JValue::Object(&activity),
+                        JValue::Int(input_type),
+                        JValue::Int(options),
+                        JValue::Long(session),
+                    ],
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    env.exception_clear();
+                    error.to_string()
+                })
+            });
+            if let Err(error) = result {
+                log::warn!("show_keyboard_android: {error}");
+            }
+        }));
     }
 }
 
 /// Hide the software keyboard on Android.
 ///
-/// Uses the NDK `ANativeActivity_hideSoftInput` via `android-activity`.
+/// Schedule JNI InputMethodManager/View access on Java's main thread.
 pub fn hide_keyboard_android() {
+    IME_ACTIVE.store(false, Ordering::Release);
+    IME_HAS_HANDLER.store(false, Ordering::Release);
+    IME_LEGACY_ENABLED.store(false, Ordering::Release);
+    let session = IME_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     if let Some(app) = android_app() {
-        log::info!("hide_keyboard_android: using NDK hide_soft_input");
-        app.hide_soft_input(false);
+        app.run_on_java_main_thread(Box::new(move || {
+            if IME_GENERATION.load(Ordering::Acquire) != session {
+                return;
+            }
+            let result = with_env(|env| {
+                let class = find_app_class(env, "dev.gpui.mobile.GpuiKeyboard")?;
+                let activity = activity(env)?;
+                env.call_static_method(
+                    &class,
+                    jni::jni_str!("hide"),
+                    jni::jni_sig!("(Landroid/app/Activity;)V"),
+                    &[JValue::Object(&activity)],
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    env.exception_clear();
+                    error.to_string()
+                })
+            });
+            if let Err(error) = result {
+                log::warn!("hide_keyboard_android: {error}");
+            }
+        }));
     }
 }
 
+static IME_TEXT: std::sync::Mutex<Vec<(i64, i64, crate::mobile_events::ImeInput)>> =
+    std::sync::Mutex::new(Vec::new());
+static IME_GENERATION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static IME_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub(crate) static IME_HAS_HANDLER: AtomicBool = AtomicBool::new(false);
+static IME_LEGACY_ENABLED: AtomicBool = AtomicBool::new(false);
+pub(crate) static IME_EDITOR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static IME_LOGICAL_OWNER: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn logical_input_owner_changed(active: bool) {
+    IME_LOGICAL_OWNER.store(active, Ordering::Release);
+    IME_EDITOR.fetch_add(1, Ordering::AcqRel);
+    if active {
+        show_keyboard_android(IME_TYPE.get());
+    } else {
+        hide_keyboard_android();
+    }
+}
+
+pub(crate) fn input_handler_changed() {
+    if crate::mobile_events::active_text_input_lease().is_none() {
+        IME_EDITOR.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_hasLogicalOwner(
+    _env: *mut c_void, _class: *mut c_void,
+) -> u8 { IME_LOGICAL_OWNER.load(Ordering::Acquire) as u8 }
+thread_local! {
+    static IME_PASSWORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IME_SHOWN_KEY: std::cell::Cell<Option<(crate::KeyboardType, i32, i32, i64)>> = const { std::cell::Cell::new(None) };
+    static IME_CONFIGURATION: std::cell::RefCell<gpui::TextInputConfiguration> = Default::default();
+    static IME_TYPE: std::cell::Cell<crate::KeyboardType> = const { std::cell::Cell::new(crate::KeyboardType::Default) };
+    static IME_LEGACY_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// Set the current Android editor's password mode on the GPUI event thread.
+pub fn set_password_input(enabled: bool) {
+    if IME_PASSWORD.replace(enabled) != enabled && enabled && IME_ACTIVE.load(Ordering::Acquire) {
+        show_keyboard_android(IME_TYPE.get());
+    }
+}
+pub(crate) fn ime_session_current(session: i64) -> bool {
+    IME_ACTIVE.load(Ordering::Acquire)
+        && IME_GENERATION.load(Ordering::Acquire) == session
+        && (IME_LOGICAL_OWNER.load(Ordering::Acquire)
+            || IME_LEGACY_GENERATION.get() == crate::mobile_dispatch::text_handler_generation())
+}
+pub(crate) fn ime_delivery_current(session: i64, editor: i64) -> bool {
+    ime_session_current(session) && IME_EDITOR.load(Ordering::Acquire) == editor
+}
+
+/// Invalidate only a verified current editor, then ask Android for a fresh connection.
+pub(crate) fn restart_ime_connection(session: i64, editor: i64) -> bool {
+    if !ime_delivery_current(session, editor) || !IME_LOGICAL_OWNER.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(next_editor) = editor.checked_add(1) else { return false; };
+    if IME_EDITOR.compare_exchange(editor, next_editor, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
+    }
+    if let Some(app) = android_app() {
+        app.run_on_java_main_thread(Box::new(move || {
+            if !ime_delivery_current(session, next_editor)
+                || !IME_LOGICAL_OWNER.load(Ordering::Acquire) {
+                return;
+            }
+            let result = with_env(|env| {
+                let class = find_app_class(env, "dev.gpui.mobile.GpuiKeyboard")?;
+                let activity = activity(env)?;
+                env.call_static_method(
+                    &class,
+                    jni::jni_str!("restart"),
+                    jni::jni_sig!("(Landroid/app/Activity;JJ)V"),
+                    &[JValue::Object(&activity), JValue::Long(session), JValue::Long(next_editor)],
+                )
+                .map(|_| ())
+                .map_err(|error| { env.exception_clear(); error.to_string() })
+            });
+            if let Err(error) = result {
+                log::warn!("restart_ime_connection: {error}");
+            }
+        }));
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_editorEpoch(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> i64 {
+    IME_EDITOR.load(Ordering::Acquire)
+}
+pub(crate) fn configure_text_input(configuration: gpui::TextInputConfiguration) {
+    let changed = IME_CONFIGURATION.with(|stored| {
+        if *stored.borrow() == configuration {
+            return false;
+        }
+        *stored.borrow_mut() = configuration;
+        true
+    });
+    if changed && IME_ACTIVE.load(Ordering::Acquire) {
+        show_keyboard_android(IME_TYPE.get());
+    }
+}
+static OPEN_URLS_PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Copy the JNI string now; dispatch only on the native event-loop thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_committed(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    session: i64,
+    editor: i64,
+    action: i32,
+    text: *mut c_void,
+) {
+    let _ = with_env(|env| {
+        let text = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
+        let text = get_string(env, &text);
+        log::info!("IME JNI commit session={session} editor={editor} action={action}");
+        let Some(input) = crate::mobile_events::ime_action(action, text) else { return Ok(()); };
+        IME_TEXT.lock().unwrap().push((session, editor, input));
+        if let Some(app) = ANDROID_APP.get() {
+            app.create_waker().wake();
+        }
+        Ok(())
+    });
+}
+
+/// Marked updates preserve their originating connection/owner; never become commits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composed(
+    _env: *mut c_void, _class: *mut c_void, session: i64, editor: i64,
+    text: *mut c_void, start: i32, end: i32,
+) {
+    let _ = with_env(|env| {
+        let object = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
+        let text = get_string(env, &object);
+        let len = text.encode_utf16().count();
+        if start < 0 || end < start || end as usize > len { return Ok(()); }
+        IME_TEXT.lock().unwrap().push((session, editor, crate::mobile_events::ImeInput::Compose {
+            text, selection: start as usize..end as usize, region: None,
+        }));
+        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+        Ok(())
+    });
+}
+
+/// Preserve an IME-declared composing region until its following marked update.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composingRegion(
+    _env: *mut c_void, _class: *mut c_void, session: i64, editor: i64,
+    text: *mut c_void, start_offset: i32, end_offset: i32,
+) {
+    let _ = with_env(|env| {
+        let object = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
+        let text = get_string(env, &object);
+        if start_offset > end_offset { return Ok(()); }
+        IME_TEXT.lock().unwrap().push((session, editor,
+            crate::mobile_events::ImeInput::Compose {
+                text: String::new(), selection: 0..0,
+                region: Some(crate::mobile_events::ImeComposeRegion { text, start_offset, end_offset }),
+            }));
+        if let Some(app) = ANDROID_APP.get() { app.create_waker().wake(); }
+        Ok(())
+    });
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+/// Queue an explicitly unit-tagged backward deletion; no Java references escape.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_deleteBefore(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    session: i64,
+    editor: i64,
+    count: i32,
+    codepoints: u8,
+) -> u8 {
+    if count < 0
+        || !IME_ACTIVE.load(Ordering::Acquire)
+        || IME_GENERATION.load(Ordering::Acquire) != session
+        || IME_EDITOR.load(Ordering::Acquire) != editor
+    {
+        return 0;
+    }
+    if count == 0 {
+        return 1;
+    }
+    let Some(input) = crate::mobile_events::ime_delete_request(
+        count as usize,
+        codepoints != 0,
+        IME_HAS_HANDLER.load(Ordering::Acquire),
+        IME_LEGACY_ENABLED.load(Ordering::Acquire),
+    ) else {
+        return 0;
+    };
+    IME_TEXT.lock().unwrap().push((session, editor, input));
+    if let Some(app) = ANDROID_APP.get() {
+        app.create_waker().wake();
+    }
+    1
+}
 
 // ── JNI export for GpuiActivity splash screen ────────────────────────────────
 
@@ -1276,6 +1997,10 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
             return Ok(());
         }
         log::info!("nativeOnDeepLink: {}", url_string);
+        OPEN_URLS_PENDING.lock().unwrap().push(url_string.clone());
+        if let Some(app) = ANDROID_APP.get() {
+            app.create_waker().wake();
+        }
 
         #[cfg(feature = "deeplink")]
         {
@@ -1369,5 +2094,45 @@ mod tests {
     #[test]
     fn platform_returns_none_before_init() {
         assert!(platform().is_none());
+    }
+
+    #[test]
+    fn failed_surface_reinitialization_is_bounded_and_blocks_initialization() {
+        let mut init = SurfaceInit::new();
+        init.begin();
+
+        assert_eq!(init.record(false), SurfaceInitAttempt::Retry);
+        assert_eq!(init.record(false), SurfaceInitAttempt::Retry);
+        assert_eq!(init.record(false), SurfaceInitAttempt::Failed);
+        assert_eq!(init.state, SurfaceInitState::Failed);
+        assert!(init.blocks_initialization());
+    }
+
+    #[test]
+    fn surface_lifecycle_gates_initialization_until_ready() {
+        let mut init = SurfaceInit::new();
+        assert!(init.blocks_initialization());
+        assert_eq!(init.record(true), SurfaceInitAttempt::Ready);
+        assert!(!init.blocks_initialization());
+        init.begin(); // TerminateWindow or a new InitWindow.
+        assert!(init.blocks_initialization());
+        init.mark_failed(); // Native window unavailable.
+        assert!(init.blocks_initialization());
+        init.begin();
+        assert_eq!(init.record(false), SurfaceInitAttempt::Retry);
+        assert!(init.blocks_initialization());
+        assert_eq!(init.record(true), SurfaceInitAttempt::Ready);
+        assert!(!init.blocks_initialization());
+    }
+
+    #[test]
+    fn successful_surface_reinitialization_allows_initialization() {
+        let mut init = SurfaceInit::new();
+        init.begin();
+
+        assert_eq!(init.record(false), SurfaceInitAttempt::Retry);
+        assert_eq!(init.record(true), SurfaceInitAttempt::Ready);
+        assert_eq!(init.state, SurfaceInitState::Ready);
+        assert!(!init.blocks_initialization());
     }
 }

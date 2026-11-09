@@ -2,7 +2,7 @@ package dev.gpui.mobile;
 
 import android.app.Activity;
 import android.content.Intent;
-import android.os.Build;
+import androidx.biometric.BiometricManager;
 
 import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Biometric authentication helper for GPUI.
  *
- * <p>Uses BiometricManager (API 29+) for availability checks and launches
+ * <p>Uses AndroidX BiometricManager for availability checks and launches
  * {@link GpuiAuthActivity} (a transparent FragmentActivity) to show the
  * BiometricPrompt dialog.</p>
  *
@@ -20,14 +20,20 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class GpuiLocalAuth {
 
-    /** Latch that the calling (native) thread waits on. */
-    static CountDownLatch sLatch;
-
-    /** Authentication result code (see int constants below). */
-    static AtomicInteger sResult = new AtomicInteger(7);
-
-    /** Reason string displayed in the biometric prompt. */
-    static String sReason;
+    private static Session active;
+    private static long nextId;
+    static final class Session {
+        final long id;
+        final String reason;
+        final CountDownLatch latch = new CountDownLatch(1);
+        final AtomicInteger result = new AtomicInteger(-1);
+        volatile java.lang.ref.WeakReference<GpuiAuthActivity> owner = new java.lang.ref.WeakReference<>(null);
+        Session(long id, String reason) { this.id = id; this.reason = reason; }
+        void complete(int value) { if (result.compareAndSet(-1, value)) latch.countDown(); }
+    }
+    static synchronized Session session(long id) {
+        return active != null && active.id == id && active.result.get() == -1 ? active : null;
+    }
 
     // Result codes (must match Rust int_to_auth_result)
     // 0 = success, 1 = failed, 2 = not_available, 3 = not_enrolled,
@@ -39,17 +45,10 @@ public final class GpuiLocalAuth {
      * @return {@code true} if biometric hardware is present (even if not enrolled).
      */
     public static boolean isDeviceSupported(Activity activity) {
-        if (Build.VERSION.SDK_INT >= 29) {
-            android.hardware.biometrics.BiometricManager bm =
-                activity.getSystemService(android.hardware.biometrics.BiometricManager.class);
-            if (bm != null) {
-                int result = bm.canAuthenticate();
-                return result != android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE
-                    && result != android.hardware.biometrics.BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE;
-            }
-        }
-        // Fallback for API < 29: check for fingerprint hardware
-        return activity.getPackageManager().hasSystemFeature("android.hardware.fingerprint");
+        int status = availability(activity);
+        return status == BiometricManager.BIOMETRIC_SUCCESS
+            || status == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED
+            || status == BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE;
     }
 
     /**
@@ -58,14 +57,20 @@ public final class GpuiLocalAuth {
      * @return {@code true} if the user can authenticate right now.
      */
     public static boolean canAuthenticate(Activity activity) {
-        if (Build.VERSION.SDK_INT >= 29) {
-            android.hardware.biometrics.BiometricManager bm =
-                activity.getSystemService(android.hardware.biometrics.BiometricManager.class);
-            if (bm != null) {
-                return bm.canAuthenticate() == android.hardware.biometrics.BiometricManager.BIOMETRIC_SUCCESS;
-            }
-        }
-        return false;
+        return availability(activity) == BiometricManager.BIOMETRIC_SUCCESS;
+    }
+
+    private static int availability(Activity activity) {
+        return BiometricManager.from(activity).canAuthenticate(
+            BiometricManager.Authenticators.BIOMETRIC_WEAK);
+    }
+
+    static int availabilityResult(int status) {
+        if (status == BiometricManager.BIOMETRIC_SUCCESS) return 0;
+        if (status == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED) return 3;
+        if (status == BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE
+                || status == BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE) return 2;
+        return 7;
     }
 
     /**
@@ -104,30 +109,44 @@ public final class GpuiLocalAuth {
      * @return result code (0=success, 1=failed, 2=not_available, etc.)
      */
     public static int authenticate(Activity activity, String reason) {
-        if (!canAuthenticate(activity)) {
-            if (!isDeviceSupported(activity)) {
-                return 2; // not available
-            }
-            return 3; // not enrolled
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            throw new IllegalStateException("Call authenticate from a worker thread");
         }
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return 4;
+        if (reason == null || reason.trim().isEmpty()) throw new IllegalArgumentException("Authentication reason must not be empty");
+        int available = availabilityResult(availability(activity));
+        if (available != 0) return available;
 
-        CountDownLatch latch = new CountDownLatch(1);
-        sLatch = latch;
-        sResult.set(7); // default: other error
-        sReason = reason;
-
-        // Launch GpuiAuthActivity which will show BiometricPrompt
-        Intent intent = new Intent(activity, GpuiAuthActivity.class);
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        activity.startActivity(intent);
+        final Session request;
+        synchronized (GpuiLocalAuth.class) {
+            if (active != null) throw new IllegalStateException("Authentication already in progress");
+            request = new Session(++nextId, reason);
+            active = request;
+        }
 
         try {
-            latch.await();
+            activity.runOnUiThread(() -> {
+                if (session(request.id) != request) return;
+                try {
+                    if (activity.isFinishing() || activity.isDestroyed()) { request.complete(4); return; }
+                    Intent intent = new Intent(activity, GpuiAuthActivity.class);
+                    intent.putExtra("gpui.auth.request", request.id);
+                    activity.startActivity(intent);
+                } catch (RuntimeException error) { request.complete(7); }
+            });
+            if (!request.latch.await(120, java.util.concurrent.TimeUnit.SECONDS)) request.complete(7);
+            return request.result.get();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return 7; // other error
+            request.complete(4);
+            return 4;
+        } finally {
+            synchronized (GpuiLocalAuth.class) { if (active == request) active = null; }
+            activity.runOnUiThread(() -> {
+                GpuiAuthActivity owner = request.owner.get();
+                if (owner != null) owner.cancelAndFinish();
+            });
         }
-        return sResult.get();
     }
 
     private GpuiLocalAuth() {}

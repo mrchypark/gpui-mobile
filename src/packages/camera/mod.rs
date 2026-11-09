@@ -120,12 +120,20 @@ fn ensure_factory_registered() {
     }
 }
 
-/// Get the raw AVCaptureSession pointer for a given session ID (iOS only).
+/// Retain the AVCaptureSession for a given session ID (iOS only).
 ///
-/// Used by `IosPlatformView` to create `AVCaptureVideoPreviewLayer`.
+/// The caller owns the returned reference and must release it after use.
 #[cfg(target_os = "ios")]
 pub fn ios_get_session(id: usize) -> Option<*mut objc2::runtime::AnyObject> {
     ios::get_session_ptr(id)
+}
+
+/// Retain the AVCaptureSession for a session ID (iOS only).
+///
+/// The caller owns the returned reference and must release it after use.
+#[cfg(target_os = "ios")]
+pub fn ios_retain_session(id: usize) -> Option<*mut objc2::runtime::AnyObject> {
+    ios::retain_session_ptr(id)
 }
 
 /// Result of a photo capture.
@@ -192,6 +200,7 @@ pub fn create_camera(
 }
 
 /// Start the camera preview (creates a native preview platform view).
+/// On iOS, call this off the main thread; session startup can block.
 pub fn start_preview(handle: &mut CameraHandle) -> Result<(), String> {
     // Dispose existing preview if any
     stop_preview(handle)?;
@@ -206,19 +215,34 @@ pub fn start_preview(handle: &mut CameraHandle) -> Result<(), String> {
         creation_params,
     };
 
-    let pv_handle = PlatformViewRegistry::global().create_view("camera_preview", params)?;
+    #[cfg(target_os = "ios")]
+    {
+        ios::start_preview_session(handle)?;
+    }
+
+    let pv_handle = match PlatformViewRegistry::global().create_view("camera_preview", params) {
+        Ok(handle) => handle,
+        Err(err) => {
+            #[cfg(target_os = "ios")]
+            {
+                let _ = ios::stop_preview_session(handle);
+            }
+            return Err(err);
+        }
+    };
     handle.preview_handle = Some(Arc::new(pv_handle));
     Ok(())
 }
 
 /// Stop the camera preview.
+/// On iOS, call this off the main thread; session shutdown can block.
 pub fn stop_preview(handle: &mut CameraHandle) -> Result<(), String> {
-    if let Some(pv) = handle.preview_handle.take() {
-        pv.dispose();
-    }
     #[cfg(target_os = "ios")]
     {
         ios::stop_preview_session(handle)?;
+    }
+    if let Some(pv) = handle.preview_handle.take() {
+        pv.dispose();
     }
     #[cfg(target_os = "android")]
     {
@@ -235,6 +259,7 @@ pub fn preview_platform_view_handle(handle: &CameraHandle) -> Option<Arc<Platfor
 }
 
 /// Capture a still photo, save to temp dir, return path + dimensions.
+/// This waits for the native callback or a timeout; call it off the main thread.
 pub fn take_picture(handle: &CameraHandle) -> Result<CapturedImage, String> {
     #[cfg(target_os = "ios")]
     {
@@ -269,6 +294,7 @@ pub fn start_video_recording(handle: &CameraHandle) -> Result<(), String> {
 }
 
 /// Stop recording video and return the recorded file.
+/// This waits for native finalization or a timeout; call it off the main thread.
 pub fn stop_video_recording(handle: &CameraHandle) -> Result<RecordedVideo, String> {
     #[cfg(target_os = "ios")]
     {
@@ -388,6 +414,8 @@ pub fn set_zoom(handle: &CameraHandle, zoom: f64) -> Result<(), String> {
 }
 
 /// Switch to a different camera (e.g. front <-> back).
+/// On Android, run off the UI thread and stop recording before switching. The
+/// existing preview handle is retained; failures attempt to restore the old device.
 pub fn set_camera(handle: &CameraHandle, camera: &CameraDescription) -> Result<(), String> {
     #[cfg(target_os = "ios")]
     {
@@ -405,6 +433,7 @@ pub fn set_camera(handle: &CameraHandle, camera: &CameraDescription) -> Result<(
 }
 
 /// Release camera resources.
+/// On iOS this can wait for video finalization; call it off the main thread.
 pub fn dispose(mut handle: CameraHandle) -> Result<(), String> {
     // Dispose preview platform view first
     if let Some(pv) = handle.preview_handle.take() {

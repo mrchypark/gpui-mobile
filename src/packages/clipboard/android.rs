@@ -49,11 +49,7 @@ pub fn get_text() -> Result<Option<String>, String> {
         }
 
         let text = get_string(env, &result);
-        if text.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(text))
-        }
+        Ok(Some(text))
     })
 }
 

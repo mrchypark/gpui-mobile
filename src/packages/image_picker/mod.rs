@@ -8,10 +8,13 @@
 //!
 //! Feature-gated behind `image_picker`.
 
+// iOS synchronous picker calls require the main thread and service its run loop.
+// Android synchronous picker calls require a worker thread.
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "ios")]
 mod ios;
+mod options;
 
 /// Source for picking an image or video.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +75,7 @@ pub struct PickedFile {
 ///
 /// Returns `Ok(None)` if the user cancelled.
 pub fn pick_image(options: &ImagePickerOptions) -> Result<Option<PickedFile>, String> {
+    self::options::validate(options.max_width, options.max_height, options.image_quality)?;
     #[cfg(target_os = "ios")]
     {
         ios::pick_image(options)
@@ -95,6 +99,7 @@ pub fn pick_multi_image(
     max_height: Option<f64>,
     image_quality: Option<u8>,
 ) -> Result<Vec<PickedFile>, String> {
+    options::validate(max_width, max_height, image_quality)?;
     #[cfg(target_os = "ios")]
     {
         ios::pick_multi_image(max_width, max_height, image_quality)

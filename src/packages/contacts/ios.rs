@@ -3,10 +3,13 @@ use objc2::runtime::{AnyObject, Bool};
 use objc2::{class, msg_send};
 
 pub fn get_contacts() -> Result<Vec<Contact>, String> {
-    unsafe { fetch_contacts(std::ptr::null_mut()) }
+    objc2::rc::autoreleasepool(|_| unsafe { fetch_contacts(std::ptr::null_mut()) })
 }
 
 pub fn search_contacts(query: &str) -> Result<Vec<Contact>, String> {
+    objc2::rc::autoreleasepool(|_| search_contacts_inner(query))
+}
+fn search_contacts_inner(query: &str) -> Result<Vec<Contact>, String> {
     unsafe {
         // CNContact.predicateForContactsMatchingName:
         let ns_query = new_nsstring(query);
@@ -23,6 +26,9 @@ pub fn search_contacts(query: &str) -> Result<Vec<Contact>, String> {
 }
 
 pub fn get_contact(id: &str) -> Result<Option<Contact>, String> {
+    objc2::rc::autoreleasepool(|_| get_contact_inner(id))
+}
+fn get_contact_inner(id: &str) -> Result<Option<Contact>, String> {
     unsafe {
         let ns_id = new_nsstring(id);
         if ns_id.is_null() {
@@ -100,16 +106,20 @@ unsafe fn fetch_contacts(predicate: *mut AnyObject) -> Result<Vec<Contact>, Stri
     if predicate.is_null() {
         // For all contacts, we need to use enumerateContactsWithFetchRequest:error:usingBlock:
         // This requires a block. We'll use the block crate.
-        let error: *mut AnyObject = std::ptr::null_mut();
-        let error_ptr: *mut *mut AnyObject = &error as *const _ as *mut *mut AnyObject;
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        let error_ptr: *mut *mut AnyObject = &mut error;
 
         // Use a simpler approach: fetch contacts matching an empty name predicate
         // Actually CNContact doesn't have such a predicate. Let's use the block-based enumerate.
         let success: bool = enumerate_contacts(store, request, error_ptr, &mut contacts);
 
-        if !success && !error.is_null() {
-            let desc: *mut AnyObject = msg_send![error, localizedDescription];
-            let err_msg = nsstring_to_string(desc);
+        if !success {
+            let err_msg = if error.is_null() {
+                "Native contact enumeration failed".into()
+            } else {
+                let desc: *mut AnyObject = msg_send![error, localizedDescription];
+                nsstring_to_string(desc)
+            };
             let _: () = msg_send![contacts_array, release];
             let _: () = msg_send![request, release];
             let _: () = msg_send![store, release];
@@ -117,8 +127,8 @@ unsafe fn fetch_contacts(predicate: *mut AnyObject) -> Result<Vec<Contact>, Stri
         }
     } else {
         // Use unifiedContactsMatchingPredicate:keysToFetch:error:
-        let error: *mut AnyObject = std::ptr::null_mut();
-        let error_ptr: *mut *mut AnyObject = &error as *const _ as *mut *mut AnyObject;
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        let error_ptr: *mut *mut AnyObject = &mut error;
 
         let results: *mut AnyObject = msg_send![store,
             unifiedContactsMatchingPredicate: predicate,
@@ -198,16 +208,19 @@ unsafe fn parse_cn_contact(cn_contact: *mut AnyObject) -> Option<Contact> {
     let family_name_ns: *mut AnyObject = msg_send![cn_contact, familyName];
     let family_name = nsstring_to_string(family_name_ns);
 
-    // Build display name from given + family
-    let display_name = if given_name.is_empty() && family_name.is_empty() {
-        String::new()
-    } else if family_name.is_empty() {
-        given_name.clone()
-    } else if given_name.is_empty() {
-        family_name.clone()
-    } else {
-        format!("{} {}", given_name, family_name)
-    };
+    // Native formatter respects locale, contact type, middle names and suffixes.
+    // Required descriptor is fetched below so accessing formatter keys is safe.
+    let formatted: *mut AnyObject =
+        msg_send![class!(CNContactFormatter), stringFromContact: cn_contact, style: 0isize];
+    let mut display_name = nsstring_to_string(formatted);
+    if display_name.is_empty() {
+        let organization: *mut AnyObject = msg_send![cn_contact, organizationName];
+        display_name = nsstring_to_string(organization);
+    }
+    if display_name.is_empty() {
+        let nickname: *mut AnyObject = msg_send![cn_contact, nickname];
+        display_name = nsstring_to_string(nickname);
+    }
 
     // Phone numbers: NSArray<CNLabeledValue<CNPhoneNumber *> *>
     let phone_numbers: *mut AnyObject = msg_send![cn_contact, phoneNumbers];
@@ -318,6 +331,10 @@ unsafe fn create_fetch_keys() -> *mut AnyObject {
     let key_family_name = new_nsstring("familyName");
     let key_phone_numbers = new_nsstring("phoneNumbers");
     let key_email_addresses = new_nsstring("emailAddresses");
+    let key_organization = new_nsstring("organizationName");
+    let key_nickname = new_nsstring("nickname");
+    let formatter_keys: *mut AnyObject =
+        msg_send![class!(CNContactFormatter), descriptorForRequiredKeysForStyle: 0isize];
 
     let objects = [
         key_identifier,
@@ -325,6 +342,9 @@ unsafe fn create_fetch_keys() -> *mut AnyObject {
         key_family_name,
         key_phone_numbers,
         key_email_addresses,
+        key_organization,
+        key_nickname,
+        formatter_keys,
     ];
 
     let array: *mut AnyObject = msg_send![class!(NSArray),
@@ -343,7 +363,7 @@ unsafe fn new_nsstring(s: &str) -> *mut AnyObject {
         length: s.len(),
         encoding: 4u64  // NSUTF8StringEncoding
     ];
-    ns
+    msg_send![ns, autorelease]
 }
 
 /// Convert an NSString to a Rust String.
@@ -359,5 +379,37 @@ unsafe fn nsstring_to_string(ns: *mut AnyObject) -> String {
     match c_str.to_str() {
         Ok(s) => s.to_owned(),
         Err(_) => c_str.to_string_lossy().into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_formatter_preserves_organization_and_localized_full_name() {
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let contact: *mut AnyObject = msg_send![class!(CNMutableContact), new];
+            let organization = new_nsstring("회사 | Example, Inc.");
+            let _: () = msg_send![contact, setOrganizationName: organization];
+            let _: () = msg_send![contact, setContactType: 1isize];
+            assert_eq!(
+                parse_cn_contact(contact).unwrap().display_name,
+                "회사 | Example, Inc."
+            );
+            let _: () = msg_send![contact, setContactType: 0isize];
+            let given = new_nsstring("Ada");
+            let middle = new_nsstring("Augusta");
+            let family = new_nsstring("Lovelace");
+            let _: () = msg_send![contact, setGivenName: given];
+            let _: () = msg_send![contact, setMiddleName: middle];
+            let _: () = msg_send![contact, setFamilyName: family];
+            let formatted: *mut AnyObject =
+                msg_send![class!(CNContactFormatter), stringFromContact: contact, style: 0isize];
+            assert_eq!(
+                parse_cn_contact(contact).unwrap().display_name,
+                nsstring_to_string(formatted)
+            );
+            let _: () = msg_send![contact, release];
+        });
     }
 }

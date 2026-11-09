@@ -4,120 +4,109 @@ use jni::objects::JValue;
 
 pub fn get_package_info() -> Result<PackageInfo, String> {
     jni_helpers::with_env(|env| {
-        let activity = jni_helpers::activity(env)?;
-
-        // activity.getPackageName() → String
-        let pkg_name_obj = env
-            .call_method(
-                &activity,
-                jni::jni_str!("getPackageName"),
-                jni::jni_sig!("()Ljava/lang/String;"),
-                &[],
-            )
-            .and_then(|v| v.l())
-            .e()?;
-        let package_name = get_string(env, &pkg_name_obj);
-
-        // activity.getPackageManager() → PackageManager
-        let pm = env
-            .call_method(
-                &activity,
-                jni::jni_str!("getPackageManager"),
-                jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
-                &[],
-            )
-            .and_then(|v| v.l())
-            .e()?;
-        if pm.is_null() {
-            return Err("getPackageManager returned null".into());
-        }
-
-        // pm.getPackageInfo(packageName, 0) → android.content.pm.PackageInfo
-        let jpkg = env.new_string(&package_name).e()?;
-        let pkg_info = env
-            .call_method(
-                &pm,
-                jni::jni_str!("getPackageInfo"),
-                jni::jni_sig!("(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;"),
-                &[JValue::Object(&jpkg), JValue::Int(0)],
-            )
-            .and_then(|v| v.l())
-            .e()?;
-        if pkg_info.is_null() {
-            return Err("getPackageInfo returned null".into());
-        }
-
-        // versionName: String
-        let version = match env
-            .get_field(
-                &pkg_info,
-                jni::jni_str!("versionName"),
-                jni::jni_sig!("Ljava/lang/String;"),
-            )
-            .and_then(|v| v.l())
-        {
-            Ok(vn) => get_string(env, &vn),
-            Err(_) => {
-                env.exception_clear();
-                String::new()
-            }
-        };
-
-        // versionCode: int
-        let build_number = match env
-            .get_field(&pkg_info, jni::jni_str!("versionCode"), jni::jni_sig!("I"))
-            .and_then(|v| v.i())
-        {
-            Ok(vc) => vc.to_string(),
-            Err(_) => {
-                env.exception_clear();
-                String::new()
-            }
-        };
-
-        // applicationInfo → getApplicationLabel
-        let app_name = (|| -> Option<String> {
-            let app_info = env
-                .get_field(
-                    &pkg_info,
-                    jni::jni_str!("applicationInfo"),
-                    jni::jni_sig!("Landroid/content/pm/ApplicationInfo;"),
-                )
-                .and_then(|v| v.l())
-                .ok()?;
-            if app_info.is_null() {
-                return None;
-            }
-            let cs = env
+        let result = (|| {
+            let activity = jni_helpers::activity(env)?;
+            let package = env
                 .call_method(
-                    &pm,
-                    jni::jni_str!("getApplicationLabel"),
-                    jni::jni_sig!("(Landroid/content/pm/ApplicationInfo;)Ljava/lang/CharSequence;"),
-                    &[JValue::Object(&app_info)],
+                    &activity,
+                    jni::jni_str!("getPackageName"),
+                    jni::jni_sig!("()Ljava/lang/String;"),
+                    &[],
                 )
                 .and_then(|v| v.l())
-                .ok()?;
-            if cs.is_null() {
-                return None;
+                .e()?;
+            let package_name = get_string(env, &package);
+            if package_name.is_empty() {
+                return Err("Package name unavailable".into());
             }
+            let manager = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getPackageManager"),
+                    jni::jni_sig!("()Landroid/content/pm/PackageManager;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .e()?;
+            let info = env
+                .call_method(
+                    &manager,
+                    jni::jni_str!("getPackageInfo"),
+                    jni::jni_sig!("(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;"),
+                    &[JValue::Object(&package), JValue::Int(0)],
+                )
+                .and_then(|v| v.l())
+                .e()?;
+            let version = env
+                .get_field(
+                    &info,
+                    jni::jni_str!("versionName"),
+                    jni::jni_sig!("Ljava/lang/String;"),
+                )
+                .and_then(|v| v.l())
+                .e()?;
+            let version = get_string(env, &version);
+            let sdk = env
+                .get_static_field(
+                    jni::jni_str!("android/os/Build$VERSION"),
+                    jni::jni_str!("SDK_INT"),
+                    jni::jni_sig!("I"),
+                )
+                .and_then(|v| v.i())
+                .e()?;
+            let build_number = if sdk >= 28 {
+                env.call_method(
+                    &info,
+                    jni::jni_str!("getLongVersionCode"),
+                    jni::jni_sig!("()J"),
+                    &[],
+                )
+                .and_then(|v| v.j())
+                .e()?
+                .to_string()
+            } else {
+                env.get_field(&info, jni::jni_str!("versionCode"), jni::jni_sig!("I"))
+                    .and_then(|v| v.i())
+                    .e()?
+                    .to_string()
+            };
+            let application = env
+                .call_method(
+                    &activity,
+                    jni::jni_str!("getApplicationInfo"),
+                    jni::jni_sig!("()Landroid/content/pm/ApplicationInfo;"),
+                    &[],
+                )
+                .and_then(|v| v.l())
+                .e()?;
             let label = env
                 .call_method(
-                    &cs,
+                    &manager,
+                    jni::jni_str!("getApplicationLabel"),
+                    jni::jni_sig!("(Landroid/content/pm/ApplicationInfo;)Ljava/lang/CharSequence;"),
+                    &[JValue::Object(&application)],
+                )
+                .and_then(|v| v.l())
+                .e()?;
+            let label = env
+                .call_method(
+                    &label,
                     jni::jni_str!("toString"),
                     jni::jni_sig!("()Ljava/lang/String;"),
                     &[],
                 )
                 .and_then(|v| v.l())
-                .ok()?;
-            Some(get_string(env, &label))
-        })()
-        .unwrap_or_default();
-
-        Ok(PackageInfo {
-            app_name,
-            package_name,
-            version,
-            build_number,
-        })
+                .e()?;
+            Ok(PackageInfo {
+                package_name,
+                version,
+                build_number,
+                app_name: get_string(env, &label),
+            })
+        })();
+        if result.is_err() {
+            env.exception_clear();
+        }
+        result
     })
 }

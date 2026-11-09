@@ -15,6 +15,10 @@ pub(crate) struct PackagesState {
     pub last_picked_file: Option<String>,
     pub last_picked_image: Option<String>,
     pub camera_handle: Option<usize>,
+    pub camera_preview_handle: Option<std::sync::Arc<gpui_mobile::platform_view::PlatformViewHandle>>,
+    pub camera_direction: Option<gpui_mobile::packages::camera::CameraLensDirection>,
+    pub camera_list: Option<String>,
+    pub camera_busy: bool,
     pub camera_status: Option<String>,
     pub camera_previewing: bool,
     pub camera_recording: bool,
@@ -24,10 +28,104 @@ pub(crate) struct PackagesState {
     pub notif_counter: i32,
     pub audio_status: Option<String>,
     pub video_status: Option<String>,
+    pub url_status: Option<String>,
 }
 
 thread_local! {
     pub(crate) static PACKAGES_STATE: RefCell<PackagesState> = RefCell::new(PackagesState::default());
+}
+
+struct PendingCamera(Option<gpui_mobile::packages::camera::CameraHandle>);
+
+impl Drop for PendingCamera {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            std::thread::spawn(move || {
+                let _ = gpui_mobile::packages::camera::dispose(handle);
+            });
+        }
+    }
+}
+
+// Called from a foreground task, outside any Router/PackagesState borrow.
+// iOS pickers service UIKit's run loop; Android pickers block a worker.
+async fn run_picker<T: Send + 'static>(
+    executor: &gpui::BackgroundExecutor,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    #[cfg(target_os = "ios")]
+    { let _ = executor; operation() }
+    #[cfg(not(target_os = "ios"))]
+    { executor.spawn(async move { operation() }).await }
+}
+
+// Camera session calls can block for tens of seconds. Keep one native operation
+// in flight at a time and apply its result on the UI thread.
+fn spawn_camera_operation<T: Send + 'static>(
+    cx: &mut gpui::Context<Router>,
+    busy_status: &'static str,
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+    apply: impl FnOnce(&mut PackagesState, Result<T, String>) + 'static,
+) {
+    let started = PACKAGES_STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        if state.camera_busy {
+            false
+        } else {
+            state.camera_busy = true;
+            state.camera_status = Some(busy_status.into());
+            true
+        }
+    });
+    if !started {
+        PACKAGES_STATE.with(|s| s.borrow_mut().camera_status = Some("Camera is busy; try again".into()));
+        cx.notify();
+        return;
+    }
+    cx.notify();
+
+    cx.spawn(async move |this, cx| {
+        let result = cx.background_executor().spawn(async move { operation() }).await;
+        let updated = this.update(cx, move |_this, cx| {
+            PACKAGES_STATE.with(|s| {
+                let mut state = s.borrow_mut();
+                state.camera_busy = false;
+                apply(&mut state, result);
+            });
+            cx.notify();
+        });
+        if updated.is_err() {
+            PACKAGES_STATE.with(|s| s.borrow_mut().camera_busy = false);
+        }
+    })
+    .detach();
+}
+
+fn spawn_camera_flash(
+    cx: &mut gpui::Context<Router>,
+    mode: gpui_mobile::packages::camera::FlashMode,
+    success_status: &'static str,
+) {
+    if let Some(id) = PACKAGES_STATE.with(|s| s.borrow().camera_handle) {
+        spawn_camera_operation(
+            cx,
+            "Setting flash...",
+            move || {
+                let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
+                let result = gpui_mobile::packages::camera::set_flash_mode(&handle, mode);
+                std::mem::forget(handle);
+                result
+            },
+            move |state, result| {
+                if state.camera_handle == Some(id) {
+                    state.camera_status = Some(match result {
+                        Ok(()) => success_status.into(),
+                        Err(e) => format!("Error: {e}"),
+                    });
+                }
+            },
+        );
+    }
 }
 
 /// Render the Packages demo screen.
@@ -223,6 +321,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
         .child(section_header("URL Launcher", sub_text))
         .child({
             let can = gpui_mobile::packages::url_launcher::can_launch_url("https://zed.dev");
+            let status = PACKAGES_STATE.with(|s| s.borrow().url_status.clone().unwrap_or_else(|| "Not opened".into()));
             info_card(card_bg)
                 .child(kv_row(
                     "Can open https://zed.dev",
@@ -231,6 +330,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                     text_color,
                     sub_text,
                 ))
+                .child(kv_row("Last launch", &status, BLUE, text_color, sub_text))
                 .child(divider_line(divider_color))
                 .child(
                     div()
@@ -253,10 +353,19 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
                                     cx.listener(|_this, _, _, cx| {
-                                        let _ = gpui_mobile::packages::url_launcher::launch_url(
-                                            "https://zed.dev",
-                                        );
-                                        cx.notify();
+                                        cx.spawn(async |this, cx| {
+                                            let result = cx.background_executor().spawn(async {
+                                                gpui_mobile::packages::url_launcher::launch_url("https://zed.dev")
+                                            }).await;
+                                            let _ = this.update(cx, |_this, cx| {
+                                                PACKAGES_STATE.with(|s| s.borrow_mut().url_status = Some(match result {
+                                                    Ok(true) => "Opened".into(),
+                                                    Ok(false) => "Not opened: no application accepted the URL".into(),
+                                                    Err(error) => format!("Error: {error}"),
+                                                }));
+                                                cx.notify();
+                                            });
+                                        }).detach();
                                     }),
                                 ),
                         ),
@@ -424,7 +533,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Pick File", BLUE, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::file_selector::OpenFileOptions::default();
                                         gpui_mobile::packages::file_selector::open_file(&opts)
                                     }).await;
@@ -445,7 +554,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Pick Files", GREEN, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::file_selector::OpenFileOptions::default();
                                         gpui_mobile::packages::file_selector::open_files(&opts)
                                     }).await;
@@ -465,7 +574,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Pick Dir", TEAL, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::file_selector::get_directory_path(None)
                                     }).await;
                                     let _ = this.update(cx, |_this, cx| {
@@ -504,7 +613,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Gallery", MAUVE, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::image_picker::ImagePickerOptions {
                                             source: gpui_mobile::packages::image_picker::ImageSource::Gallery,
                                             ..Default::default()
@@ -528,7 +637,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Camera", PEACH, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         let opts = gpui_mobile::packages::image_picker::ImagePickerOptions {
                                             source: gpui_mobile::packages::image_picker::ImageSource::Camera,
                                             ..Default::default()
@@ -552,7 +661,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Multi", YELLOW, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::image_picker::pick_multi_image(None, None, None)
                                     }).await;
                                     let _ = this.update(cx, |_this, cx| {
@@ -571,7 +680,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Video", TEAL, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::image_picker::pick_video(
                                             gpui_mobile::packages::image_picker::ImageSource::Gallery,
                                             gpui_mobile::packages::image_picker::CameraDevice::Rear,
@@ -594,7 +703,7 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                         .child(
                             action_button("Record", super::RED, cx.listener(|_this, _, _, cx| {
                                 cx.spawn(async |this, cx| {
-                                    let result = cx.background_executor().spawn(async {
+                                    let result = run_picker(cx.background_executor(), || {
                                         gpui_mobile::packages::image_picker::pick_video(
                                             gpui_mobile::packages::image_picker::ImageSource::Camera,
                                             gpui_mobile::packages::image_picker::CameraDevice::Rear,
@@ -630,21 +739,9 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                 )
             });
 
-            // List cameras
-            let cameras_label = match gpui_mobile::packages::camera::available_cameras() {
-                Ok(cams) => {
-                    let names: Vec<String> = cams
-                        .iter()
-                        .map(|c| format!("{:?} ({})", c.lens_direction, c.name))
-                        .collect();
-                    if names.is_empty() {
-                        "No cameras found".to_string()
-                    } else {
-                        names.join(", ")
-                    }
-                }
-                Err(e) => format!("Error: {e}"),
-            };
+            let cameras_label = PACKAGES_STATE.with(|s| {
+                s.borrow().camera_list.clone().unwrap_or_else(|| "Loaded when opened".into())
+            });
 
             let mut card = info_card(card_bg)
                 .child(kv_row("Cameras", &cameras_label, PEACH, text_color, sub_text))
@@ -664,106 +761,180 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                             if has_handle { "Preview" } else { "Open" },
                             if has_handle { GREEN } else { BLUE },
                             cx.listener(move |_this, _, _, cx| {
-                                PACKAGES_STATE.with(|s| {
-                                    let mut state = s.borrow_mut();
-                                    if state.camera_handle.is_some() {
-                                        // Toggle preview
-                                        let mut handle = gpui_mobile::packages::camera::CameraHandle::from_id(state.camera_handle.unwrap());
-                                        if state.camera_previewing {
-                                            match gpui_mobile::packages::camera::stop_preview(&mut handle) {
-                                                Ok(()) => {
-                                                    state.camera_previewing = false;
-                                                    state.camera_status = Some("Preview stopped".into());
-                                                }
-                                                Err(e) => state.camera_status = Some(format!("Error: {e}")),
-                                            }
-                                        } else {
-                                            match gpui_mobile::packages::camera::start_preview(&mut handle) {
-                                                Ok(()) => {
-                                                    state.camera_previewing = true;
-                                                    state.camera_status = Some("Preview active".into());
-                                                }
-                                                Err(e) => state.camera_status = Some(format!("Error: {e}")),
-                                            }
-                                        }
-                                        std::mem::forget(handle);
-                                    } else {
-                                        // Open back camera
-                                        match gpui_mobile::packages::camera::available_cameras() {
-                                            Ok(cams) => {
-                                                let cam = cams.iter()
-                                                    .find(|c| c.lens_direction == gpui_mobile::packages::camera::CameraLensDirection::Back)
-                                                    .or(cams.first());
-                                                if let Some(cam) = cam {
-                                                    match gpui_mobile::packages::camera::create_camera(
-                                                        cam,
-                                                        gpui_mobile::packages::camera::ResolutionPreset::High,
-                                                        true,
-                                                    ) {
-                                                        Ok(h) => {
-                                                            state.camera_handle = Some(h.id);
-                                                            state.camera_status = Some(format!("Opened: {}", cam.name));
-                                                            std::mem::forget(h);
+                                let preview = PACKAGES_STATE.with(|s| {
+                                    let state = s.borrow();
+                                    state.camera_handle.map(|id| (id, state.camera_previewing))
+                                });
+                                match preview {
+                                    Some((id, previewing)) if previewing => {
+                                        spawn_camera_operation(
+                                            cx,
+                                            "Stopping preview...",
+                                            move || {
+                                                let mut handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
+                                                let result = gpui_mobile::packages::camera::stop_preview(&mut handle);
+                                                std::mem::forget(handle);
+                                                result
+                                            },
+                                            move |state, result| {
+                                                if state.camera_handle == Some(id) {
+                                                    match result {
+                                                        Ok(()) => {
+                                                            if let Some(view) = state.camera_preview_handle.take() {
+                                                                view.dispose();
+                                                            }
+                                                            state.camera_previewing = false;
+                                                            state.camera_status = Some("Preview stopped".into());
                                                         }
                                                         Err(e) => state.camera_status = Some(format!("Error: {e}")),
                                                     }
-                                                } else {
-                                                    state.camera_status = Some("No cameras available".into());
                                                 }
-                                            }
-                                            Err(e) => state.camera_status = Some(format!("Error: {e}")),
-                                        }
+                                            },
+                                        );
                                     }
-                                });
-                                cx.notify();
+                                    Some((id, _)) => {
+                                        spawn_camera_operation(
+                                            cx,
+                                            "Starting preview...",
+                                            move || {
+                                                let mut handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
+                                                gpui_mobile::packages::camera::start_preview(&mut handle)?;
+                                                Ok(gpui_mobile::packages::camera::preview_platform_view_handle(&handle))
+                                            },
+                                            move |state, result| {
+                                                if state.camera_handle == Some(id) {
+                                                    match result {
+                                                        Ok(view) => {
+                                                            state.camera_preview_handle = view;
+                                                            state.camera_previewing = true;
+                                                            state.camera_status = Some("Preview active".into());
+                                                        }
+                                                        Err(e) => state.camera_status = Some(format!("Error: {e}")),
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    }
+                                    None => {
+                                        spawn_camera_operation(
+                                            cx,
+                                            "Opening camera...",
+                                            || {
+                                                let cams = gpui_mobile::packages::camera::available_cameras()?;
+                                                let names = cams.iter().map(|c| format!("{:?} ({})", c.lens_direction, c.name)).collect::<Vec<_>>().join(", ");
+                                                let cam = cams
+                                                    .iter()
+                                                    .find(|c| c.lens_direction == gpui_mobile::packages::camera::CameraLensDirection::Back)
+                                                    .or(cams.first())
+                                                    .ok_or_else(|| "No cameras available".to_string())?;
+                                                let name = cam.name.clone();
+                                                let direction = cam.lens_direction;
+                                                let handle = gpui_mobile::packages::camera::create_camera(
+                                                    cam,
+                                                    gpui_mobile::packages::camera::ResolutionPreset::High,
+                                                    true,
+                                                )?;
+                                                Ok((PendingCamera(Some(handle)), name, direction, names))
+                                            },
+                                            |state, result| {
+                                                match result {
+                                                    Ok((mut pending, name, direction, names)) if state.camera_handle.is_none() => {
+                                                        let handle = pending.0.take().unwrap();
+                                                        let id = handle.id;
+                                                        state.camera_handle = Some(id);
+                                                        state.camera_direction = Some(direction);
+                                                        state.camera_list = Some(names);
+                                                        state.camera_status = Some(format!("Opened: {name}"));
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(e) => state.camera_status = Some(format!("Error: {e}")),
+                                                }
+                                            },
+                                        );
+                                    }
+                                }
                             }),
                         ),
                     )
                     .child(
                         action_button("Switch", YELLOW, cx.listener(|_this, _, _, cx| {
-                            PACKAGES_STATE.with(|s| {
-                                let mut state = s.borrow_mut();
-                                if let Some(id) = state.camera_handle {
-                                    let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
-                                    match gpui_mobile::packages::camera::available_cameras() {
-                                        Ok(cams) => {
-                                            // Toggle between front and back
-                                            let target_dir = if state.camera_status.as_deref()
-                                                .map(|s| s.contains("Front"))
-                                                .unwrap_or(false)
-                                            {
-                                                gpui_mobile::packages::camera::CameraLensDirection::Back
-                                            } else {
-                                                gpui_mobile::packages::camera::CameraLensDirection::Front
-                                            };
-                                            if let Some(cam) = cams.iter().find(|c| c.lens_direction == target_dir) {
-                                                match gpui_mobile::packages::camera::set_camera(&handle, cam) {
-                                                    Ok(()) => state.camera_status = Some(format!("Switched to {:?}", cam.lens_direction)),
-                                                    Err(e) => state.camera_status = Some(format!("Error: {e}")),
+                            let switch = PACKAGES_STATE.with(|s| {
+                                let state = s.borrow();
+                                state.camera_handle.map(|id| {
+                                    let target = if state.camera_direction == Some(gpui_mobile::packages::camera::CameraLensDirection::Front) {
+                                        gpui_mobile::packages::camera::CameraLensDirection::Back
+                                    } else {
+                                        gpui_mobile::packages::camera::CameraLensDirection::Front
+                                    };
+                                    (id, target)
+                                })
+                            });
+                            if let Some((id, target)) = switch {
+                                spawn_camera_operation(
+                                    cx,
+                                    "Switching camera...",
+                                    move || {
+                                        let cams = gpui_mobile::packages::camera::available_cameras()?;
+                                        let cam = cams
+                                            .iter()
+                                            .find(|c| c.lens_direction == target)
+                                            .ok_or_else(|| format!("No {target:?} camera available"))?;
+                                        let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
+                                        let result = gpui_mobile::packages::camera::set_camera(&handle, cam);
+                                        std::mem::forget(handle);
+                                        result.map(|()| format!("Switched to {target:?}"))
+                                    },
+                                    move |state, result| {
+                                        if state.camera_handle == Some(id) {
+                                            match result {
+                                                Ok(status) => {
+                                                    state.camera_direction = Some(target);
+                                                    state.camera_status = Some(status);
                                                 }
+                                                Err(e) => state.camera_status = Some(format!("Error: {e}")),
                                             }
                                         }
-                                        Err(e) => state.camera_status = Some(format!("Error: {e}")),
-                                    }
-                                    std::mem::forget(handle);
-                                }
-                            });
-                            cx.notify();
+                                    },
+                                );
+                            }
                         })),
                     )
                     .child(
                         action_button("Close", super::RED, cx.listener(|_this, _, _, cx| {
-                            PACKAGES_STATE.with(|s| {
-                                let mut state = s.borrow_mut();
-                                if let Some(id) = state.camera_handle.take() {
-                                    let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
-                                    let _ = gpui_mobile::packages::camera::dispose(handle);
-                                    state.camera_previewing = false;
-                                    state.camera_recording = false;
-                                    state.camera_status = Some("Closed".into());
-                                }
-                            });
-                            cx.notify();
+                            if let Some(id) = PACKAGES_STATE.with(|s| s.borrow().camera_handle) {
+                                spawn_camera_operation(
+                                    cx,
+                                    "Closing camera...",
+                                    move || {
+                                        gpui_mobile::packages::camera::dispose(
+                                            gpui_mobile::packages::camera::CameraHandle::from_id(id),
+                                        )
+                                    },
+                                    move |state, result| {
+                                        if state.camera_handle == Some(id) {
+                                            match result {
+                                                Ok(()) => {
+                                                    if let Some(view) = state.camera_preview_handle.take() { view.dispose(); }
+                                                    state.camera_handle = None;
+                                                    state.camera_direction = None;
+                                                    state.camera_previewing = false;
+                                                    state.camera_recording = false;
+                                                    state.camera_status = Some("Closed".into());
+                                                }
+                                                Err(e) if e.contains("cleanup continues in background") || e == "Invalid camera handle" => {
+                                                    if let Some(view) = state.camera_preview_handle.take() { view.dispose(); }
+                                                    state.camera_handle = None;
+                                                    state.camera_direction = None;
+                                                    state.camera_previewing = false;
+                                                    state.camera_recording = false;
+                                                    state.camera_status = Some(format!("Error: {e}"));
+                                                }
+                                                Err(e) => state.camera_status = Some(format!("Error: {e}")),
+                                            }
+                                        }
+                                    },
+                                );
+                            }
                         })),
                     ),
             );
@@ -778,22 +949,26 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                     .pb_3()
                     .child(
                         action_button("Photo", TEAL, cx.listener(|_this, _, _, cx| {
-                            PACKAGES_STATE.with(|s| {
-                                let mut state = s.borrow_mut();
-                                if let Some(id) = state.camera_handle {
-                                    let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
-                                    match gpui_mobile::packages::camera::take_picture(&handle) {
-                                        Ok(img) => {
-                                            state.camera_status = Some(format!(
-                                                "Photo: {}x{}", img.width, img.height
-                                            ));
+                            if let Some(id) = PACKAGES_STATE.with(|s| s.borrow().camera_handle) {
+                                spawn_camera_operation(
+                                    cx,
+                                    "Taking photo...",
+                                    move || {
+                                        let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
+                                        let result = gpui_mobile::packages::camera::take_picture(&handle);
+                                        std::mem::forget(handle);
+                                        result
+                                    },
+                                    move |state, result| {
+                                        if state.camera_handle == Some(id) {
+                                            match result {
+                                                Ok(img) => state.camera_status = Some(format!("Photo: {}x{}", img.width, img.height)),
+                                                Err(e) => state.camera_status = Some(format!("Error: {e}")),
+                                            }
                                         }
-                                        Err(e) => state.camera_status = Some(format!("Error: {e}")),
-                                    }
-                                    std::mem::forget(handle);
-                                }
-                            });
-                            cx.notify();
+                                    },
+                                );
+                            }
                         })),
                     )
                     .child(
@@ -801,31 +976,59 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                             if recording { "Stop Rec" } else { "Record" },
                             if recording { super::RED } else { MAUVE },
                             cx.listener(move |_this, _, _, cx| {
-                                PACKAGES_STATE.with(|s| {
-                                    let mut state = s.borrow_mut();
-                                    if let Some(id) = state.camera_handle {
-                                        let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
-                                        if state.camera_recording {
-                                            match gpui_mobile::packages::camera::stop_video_recording(&handle) {
-                                                Ok(vid) => {
-                                                    state.camera_recording = false;
-                                                    state.camera_status = Some(format!("Video: {}", vid.path));
-                                                }
-                                                Err(e) => state.camera_status = Some(format!("Error: {e}")),
-                                            }
-                                        } else {
-                                            match gpui_mobile::packages::camera::start_video_recording(&handle) {
-                                                Ok(()) => {
-                                                    state.camera_recording = true;
-                                                    state.camera_status = Some("Recording...".into());
-                                                }
-                                                Err(e) => state.camera_status = Some(format!("Error: {e}")),
-                                            }
-                                        }
-                                        std::mem::forget(handle);
-                                    }
+                                let recording = PACKAGES_STATE.with(|s| {
+                                    let state = s.borrow();
+                                    state.camera_handle.map(|id| (id, state.camera_recording))
                                 });
-                                cx.notify();
+                                match recording {
+                                    Some((id, true)) => {
+                                        spawn_camera_operation(
+                                            cx,
+                                            "Stopping recording...",
+                                            move || {
+                                                let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
+                                                let result = gpui_mobile::packages::camera::stop_video_recording(&handle);
+                                                std::mem::forget(handle);
+                                                result
+                                            },
+                                            move |state, result| {
+                                                if state.camera_handle == Some(id) {
+                                                    match result {
+                                                        Ok(video) => {
+                                                            state.camera_recording = false;
+                                                            state.camera_status = Some(format!("Video: {}", video.path));
+                                                        }
+                                                        Err(e) => state.camera_status = Some(format!("Error: {e}")),
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    }
+                                    Some((id, false)) => {
+                                        spawn_camera_operation(
+                                            cx,
+                                            "Starting recording...",
+                                            move || {
+                                                let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
+                                                let result = gpui_mobile::packages::camera::start_video_recording(&handle);
+                                                std::mem::forget(handle);
+                                                result
+                                            },
+                                            move |state, result| {
+                                                if state.camera_handle == Some(id) {
+                                                    match result {
+                                                        Ok(()) => {
+                                                            state.camera_recording = true;
+                                                            state.camera_status = Some("Recording...".into());
+                                                        }
+                                                        Err(e) => state.camera_status = Some(format!("Error: {e}")),
+                                                    }
+                                                }
+                                            },
+                                        );
+                                    }
+                                    None => {}
+                                }
                             }),
                         ),
                     ),
@@ -840,46 +1043,13 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                     .px_3()
                     .pb_3()
                     .child(action_button("Flash Off", SURFACE0, cx.listener(|_this, _, _, cx| {
-                        PACKAGES_STATE.with(|s| {
-                            let mut state = s.borrow_mut();
-                            if let Some(id) = state.camera_handle {
-                                let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
-                                let _ = gpui_mobile::packages::camera::set_flash_mode(
-                                    &handle, gpui_mobile::packages::camera::FlashMode::Off,
-                                );
-                                state.camera_status = Some("Flash: Off".into());
-                                std::mem::forget(handle);
-                            }
-                        });
-                        cx.notify();
+                        spawn_camera_flash(cx, gpui_mobile::packages::camera::FlashMode::Off, "Flash: Off");
                     })))
                     .child(action_button("Auto", BLUE, cx.listener(|_this, _, _, cx| {
-                        PACKAGES_STATE.with(|s| {
-                            let mut state = s.borrow_mut();
-                            if let Some(id) = state.camera_handle {
-                                let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
-                                let _ = gpui_mobile::packages::camera::set_flash_mode(
-                                    &handle, gpui_mobile::packages::camera::FlashMode::Auto,
-                                );
-                                state.camera_status = Some("Flash: Auto".into());
-                                std::mem::forget(handle);
-                            }
-                        });
-                        cx.notify();
+                        spawn_camera_flash(cx, gpui_mobile::packages::camera::FlashMode::Auto, "Flash: Auto");
                     })))
                     .child(action_button("Torch", YELLOW, cx.listener(|_this, _, _, cx| {
-                        PACKAGES_STATE.with(|s| {
-                            let mut state = s.borrow_mut();
-                            if let Some(id) = state.camera_handle {
-                                let handle = gpui_mobile::packages::camera::CameraHandle::from_id(id);
-                                let _ = gpui_mobile::packages::camera::set_flash_mode(
-                                    &handle, gpui_mobile::packages::camera::FlashMode::Torch,
-                                );
-                                state.camera_status = Some("Flash: Torch".into());
-                                std::mem::forget(handle);
-                            }
-                        });
-                        cx.notify();
+                        spawn_camera_flash(cx, gpui_mobile::packages::camera::FlashMode::Torch, "Flash: Torch");
                     }))),
             );
 

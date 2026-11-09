@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui::{PlatformDispatcher, Priority, RunnableVariant, ThreadTaskTimings};
+use gpui::{PlatformDispatcher, Priority, RunnableVariant};
 use parking_lot::Mutex;
 
 // ── NDK / libc symbols we need ────────────────────────────────────────────────
@@ -124,8 +124,86 @@ impl ThreadPool {
 // ── delayed task queue ────────────────────────────────────────────────────────
 
 struct DelayedTask {
-    due: Instant,
+    due: Option<Instant>,
     task: BoxedTask,
+}
+
+struct TimerQueue {
+    sender: Mutex<Option<std::sync::mpsc::Sender<DelayedTask>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl TimerQueue {
+    fn new(background: std::sync::mpsc::Sender<BoxedTask>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel::<DelayedTask>();
+        let worker = std::thread::Builder::new()
+            .name("gpui-timer".into())
+            .spawn(move || {
+                let mut pending: Vec<DelayedTask> = Vec::new();
+                loop {
+                    let received = match pending.first().and_then(|task| task.due) {
+                        Some(due) => {
+                            receiver.recv_timeout(due.saturating_duration_since(Instant::now()))
+                        }
+                        None => receiver
+                            .recv()
+                            .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+                    };
+                    match received {
+                        Ok(task) => {
+                            pending.push(task);
+                            pending.sort_by(|a, b| match (a.due, b.due) {
+                                (Some(a), Some(b)) => a.cmp(&b),
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => std::cmp::Ordering::Equal,
+                            });
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let now = Instant::now();
+                    while pending
+                        .first()
+                        .and_then(|task| task.due)
+                        .is_some_and(|due| due <= now)
+                    {
+                        let _ = background.send(pending.remove(0).task);
+                    }
+                }
+            })
+            .expect("failed to spawn timer thread");
+        Self {
+            sender: Mutex::new(Some(sender)),
+            worker: Mutex::new(Some(worker)),
+        }
+    }
+
+    fn dispatch(&self, delay: Duration, task: BoxedTask) {
+        if let Some(sender) = self.sender.lock().as_ref() {
+            // An unrepresentable deadline must never wrap into an immediate timer.
+            let _ = sender.send(DelayedTask {
+                due: Instant::now().checked_add(delay),
+                task,
+            });
+        }
+    }
+
+    fn stop(&self) {
+        self.sender.lock().take();
+        let worker = self.worker.lock().take();
+        if let Some(worker) = worker {
+            if worker.thread().id() != std::thread::current().id() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
+impl Drop for TimerQueue {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 // ── AndroidDispatcher ─────────────────────────────────────────────────────────
@@ -134,7 +212,7 @@ struct DelayedTask {
 ///
 /// * Foreground tasks run on the Android main/native thread via `ALooper`.
 /// * Background tasks run on a Rust thread-pool.
-/// * Delayed tasks are checked on each `tick()` call (driven by the main loop).
+/// * A timer worker dispatches delayed tasks even when the main loop is idle.
 pub struct AndroidDispatcher {
     /// Shared task queue + wake pipe for the main thread.
     main_queue: Arc<Mutex<MainQueue>>,
@@ -143,10 +221,10 @@ pub struct AndroidDispatcher {
     /// Raw pointer to the main-thread `ALooper` (not `Send` — used only on the
     /// main thread).
     looper: *mut libc_looper_opaque,
+    owner_thread: std::thread::ThreadId,
     /// Background thread-pool.
     pool: ThreadPool,
-    /// Delayed background tasks sorted by due time.
-    delayed: Mutex<Vec<DelayedTask>>,
+    timers: TimerQueue,
     /// Set to `true` once `shutdown()` is called.
     shutdown: AtomicBool,
 }
@@ -188,12 +266,15 @@ impl AndroidDispatcher {
             write_fd,
         }));
 
+        let pool = ThreadPool::new(pool_threads);
+        let timers = TimerQueue::new(pool.sender.clone());
         let dispatcher = Arc::new(Self {
             main_queue: Arc::clone(&main_queue),
             read_fd,
             looper,
-            pool: ThreadPool::new(pool_threads),
-            delayed: Mutex::new(Vec::new()),
+            owner_thread: std::thread::current().id(),
+            pool,
+            timers,
             shutdown: AtomicBool::new(false),
         });
 
@@ -224,12 +305,15 @@ impl AndroidDispatcher {
             write_fd,
         }));
 
+        let pool = ThreadPool::new(pool_threads);
+        let timers = TimerQueue::new(pool.sender.clone());
         Arc::new(Self {
             main_queue,
             read_fd,
             looper: std::ptr::null_mut(), // no real looper in headless mode
-            pool: ThreadPool::new(pool_threads),
-            delayed: Mutex::new(Vec::new()),
+            owner_thread: std::thread::current().id(),
+            pool,
+            timers,
             shutdown: AtomicBool::new(false),
         })
     }
@@ -238,11 +322,8 @@ impl AndroidDispatcher {
 
     /// Returns `true` if the calling thread is the main/UI thread.
     pub fn is_main_thread(&self) -> bool {
-        // On Android the main thread is the one that owns the looper we
-        // registered with.  `ALooper_forThread()` returns the *same* pointer
-        // if we're on that thread, or a *different* (or null) pointer otherwise.
-        let current = unsafe { ALooper_forThread() };
-        !current.is_null() && current == self.looper
+        // Headless dispatchers also have an owner for foreground task affinity.
+        std::thread::current().id() == self.owner_thread
     }
 
     /// Enqueue a task to run on the **main** (foreground) thread.
@@ -277,38 +358,20 @@ impl AndroidDispatcher {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let due = Instant::now() + delay;
-        let mut delayed = self.delayed.lock();
-        delayed.push(DelayedTask {
-            due,
-            task: Box::new(f),
-        });
-        // Keep sorted by ascending due time.
-        delayed.sort_by_key(|d| d.due);
+        self.timers.dispatch(delay, Box::new(f));
     }
 
-    /// Process any delayed background tasks whose due time has passed.
-    ///
-    /// Should be called from the main loop on every iteration (e.g. just
-    /// before calling `ALooper_pollOnce`).
-    pub fn tick(&self) {
-        let now = Instant::now();
-        let mut ready: Vec<BoxedTask> = Vec::new();
-        {
-            let mut delayed = self.delayed.lock();
-            while delayed.first().map(|d| d.due <= now).unwrap_or(false) {
-                ready.push(delayed.remove(0).task);
-            }
-        }
-        for task in ready {
-            self.pool.dispatch(task);
-        }
-    }
+    /// Compatibility hook; deadlines no longer depend on event-loop polling.
+    pub fn tick(&self) {}
 
     /// Drain all pending **main-thread** tasks synchronously.
     ///
     /// Useful in tests or when the looper callback is not set up.
     pub fn flush_main_thread_tasks(&self) {
+        assert!(
+            self.is_main_thread(),
+            "foreground tasks must run on their owner thread"
+        );
         loop {
             let task = {
                 let mut q = self.main_queue.lock();
@@ -321,9 +384,10 @@ impl AndroidDispatcher {
         }
     }
 
-    /// Stop accepting new tasks and signal the thread-pool to wind down.
+    /// Stop accepting work and cancel pending timers. Already-running work may finish.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.timers.stop();
         self.unregister_from_looper();
     }
 
@@ -351,6 +415,9 @@ impl AndroidDispatcher {
         };
 
         if ret != 1 {
+            unsafe {
+                drop(Arc::from_raw(data_ptr as *const Mutex<MainQueue>));
+            }
             log::warn!(
                 "ALooper_addFd returned {} (expected 1); foreground dispatch may not work",
                 ret
@@ -359,8 +426,10 @@ impl AndroidDispatcher {
     }
 
     fn unregister_from_looper(&self) {
-        unsafe {
-            ALooper_removeFd(self.looper, self.read_fd);
+        if !self.looper.is_null() {
+            unsafe {
+                ALooper_removeFd(self.looper, self.read_fd);
+            }
         }
     }
 }
@@ -495,21 +564,6 @@ unsafe fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32 {
 // ── impl PlatformDispatcher ───────────────────────────────────────────────────
 
 impl PlatformDispatcher for AndroidDispatcher {
-    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
-        // Task-level profiling is not yet implemented on Android.
-        // Return an empty vec — GPUI treats this as "no data available".
-        Vec::new()
-    }
-
-    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
-        ThreadTaskTimings {
-            thread_name: std::thread::current().name().map(|n| n.to_string()),
-            thread_id: std::thread::current().id(),
-            timings: Vec::new(),
-            total_pushed: 0,
-        }
-    }
-
     fn is_main_thread(&self) -> bool {
         // Delegate to the existing `is_main_thread` method.
         AndroidDispatcher::is_main_thread(self)
@@ -519,9 +573,9 @@ impl PlatformDispatcher for AndroidDispatcher {
         // All non-realtime background tasks go to the thread-pool.
         // Priority-based scheduling is not yet implemented; all tasks are
         // treated equally by the pool.
-        self.pool.dispatch(Box::new(move || {
+        self.dispatch(move || {
             runnable.run();
-        }));
+        });
     }
 
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, _priority: Priority) {
@@ -539,15 +593,9 @@ impl PlatformDispatcher for AndroidDispatcher {
         if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
-        let due = Instant::now() + duration;
-        let mut delayed = self.delayed.lock();
-        delayed.push(DelayedTask {
-            due,
-            task: Box::new(move || {
-                runnable.run();
-            }),
+        self.dispatch_after(duration, move || {
+            runnable.run();
         });
-        delayed.sort_by_key(|d| d.due);
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
@@ -601,12 +649,15 @@ mod tests {
             write_fd,
         }));
 
+        let pool = ThreadPool::new(1);
+        let timers = TimerQueue::new(pool.sender.clone());
         let dispatcher = AndroidDispatcher {
             main_queue,
             read_fd,
             looper: std::ptr::null_mut(),
-            pool: ThreadPool::new(1),
-            delayed: Mutex::new(Vec::new()),
+            owner_thread: std::thread::current().id(),
+            pool,
+            timers,
             shutdown: AtomicBool::new(false),
         };
 
@@ -620,13 +671,44 @@ mod tests {
         dispatcher.tick();
         assert!(!ran.load(Ordering::Relaxed), "task should not run yet");
 
-        // Cleanup — prevent Drop from calling ALooper_removeFd with a null pointer.
-        dispatcher.shutdown.store(true, Ordering::SeqCst);
-        std::mem::forget(dispatcher); // skip Drop (null looper)
-        unsafe {
-            libc_close(read_fd);
-            libc_close(write_fd);
-        }
+        drop(dispatcher);
+    }
+
+    #[test]
+    fn headless_foreground_has_an_owner_and_shutdown_rejects_work() {
+        let dispatcher = AndroidDispatcher::new_headless();
+        assert!(dispatcher.is_main_thread());
+        let other = dispatcher.clone();
+        assert!(!std::thread::spawn(move || other.is_main_thread())
+            .join()
+            .unwrap());
+        dispatcher.dispatch_on_main_thread(|| {});
+        dispatcher.flush_main_thread_tasks();
+        dispatcher.shutdown();
+        dispatcher.dispatch_on_main_thread(|| panic!("accepted after shutdown"));
+        dispatcher.flush_main_thread_tasks();
+    }
+
+    #[test]
+    fn timers_fire_without_tick_and_long_deadlines_do_not_block_short_ones() {
+        let pool = ThreadPool::new(1);
+        let timers = TimerQueue::new(pool.sender.clone());
+        timers.dispatch(Duration::MAX, Box::new(|| panic!("overflowed timer fired")));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+        timers.dispatch(
+            Duration::from_millis(20),
+            Box::new(move || {
+                tx.send(Instant::now()).unwrap();
+            }),
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .duration_since(start)
+                >= Duration::from_millis(20)
+        );
+        timers.stop();
     }
 
     /// Verify pipe creation succeeds.

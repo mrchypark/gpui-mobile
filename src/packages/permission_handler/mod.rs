@@ -14,6 +14,8 @@
 mod android;
 #[cfg(target_os = "ios")]
 mod ios;
+#[cfg(any(target_os = "ios", test))]
+mod ios_status;
 
 /// A permission that can be requested from the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,6 +39,9 @@ pub enum Permission {
     /// Access media library / music (iOS only).
     MediaLibrary,
     /// Access device sensors (accelerometer, gyroscope).
+    /// Neither mobile backend exposes a runtime permission query/request for this
+    /// raw sensor scope, so both return an explicit unsupported error. This is not
+    /// iOS Motion & Fitness or Android BODY_SENSORS authorization.
     Sensors,
     /// Bluetooth access.
     Bluetooth,

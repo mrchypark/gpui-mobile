@@ -224,9 +224,7 @@ impl fmt::Debug for AndroidDisplay {
 
 impl PlatformDisplay for AndroidDisplay {
     fn id(&self) -> DisplayId {
-        // Truncate the u64 id to u32 — on Android the pointer-derived id
-        // fits in 32 bits for the lower half, and DisplayId only stores u32.
-        DisplayId::new(self.id as u32)
+        DisplayId::new(self.id)
     }
 
     fn uuid(&self) -> Result<uuid::Uuid> {
@@ -245,6 +243,10 @@ impl PlatformDisplay for AndroidDisplay {
             origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
             size: gpui::size(gpui::px(logical.width.0), gpui::px(logical.height.0)),
         }
+    }
+
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        None
     }
 }
 

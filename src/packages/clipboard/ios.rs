@@ -2,7 +2,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 
 pub fn set_text(text: &str) -> Result<(), String> {
-    unsafe {
+    crate::ios::platform_view::on_main(|| unsafe {
         let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
         if pasteboard.is_null() {
             return Err("Failed to get UIPasteboard".into());
@@ -19,12 +19,13 @@ pub fn set_text(text: &str) -> Result<(), String> {
         }
 
         let _: () = msg_send![pasteboard, setString: ns_text];
+        let _: () = msg_send![ns_text, release];
         Ok(())
-    }
+    })
 }
 
 pub fn get_text() -> Result<Option<String>, String> {
-    unsafe {
+    crate::ios::platform_view::on_main(|| unsafe {
         let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
         if pasteboard.is_null() {
             return Err("Failed to get UIPasteboard".into());
@@ -42,19 +43,19 @@ pub fn get_text() -> Result<Option<String>, String> {
 
         let utf8: *const std::ffi::c_char = msg_send![ns_string, UTF8String];
         if utf8.is_null() {
-            return Ok(None);
+            return Err("Clipboard text could not be converted to UTF-8".into());
         }
 
-        let c_str = std::ffi::CStr::from_ptr(utf8);
-        match c_str.to_str() {
-            Ok(s) => Ok(Some(s.to_owned())),
-            Err(_) => Ok(Some(c_str.to_string_lossy().into_owned())),
-        }
-    }
+        let length: usize = msg_send![ns_string, lengthOfBytesUsingEncoding: 4usize];
+        let bytes = std::slice::from_raw_parts(utf8 as *const u8, length);
+        String::from_utf8(bytes.to_vec())
+            .map(Some)
+            .map_err(|e| e.to_string())
+    })
 }
 
 pub fn has_text() -> Result<bool, String> {
-    unsafe {
+    crate::ios::platform_view::on_main(|| unsafe {
         let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
         if pasteboard.is_null() {
             return Err("Failed to get UIPasteboard".into());
@@ -62,5 +63,5 @@ pub fn has_text() -> Result<bool, String> {
 
         let has: bool = msg_send![pasteboard, hasStrings];
         Ok(has)
-    }
+    })
 }

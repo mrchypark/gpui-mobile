@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99
 
       - name: Cache Cargo registry + git deps
         uses: actions/cache@v5
@@ -34,8 +34,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: publish-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: publish-cargo-
+          key: publish-1.99-cargo-${{ hashFiles('Cargo.toml') }}
+          restore-keys: publish-1.99-cargo-
 
       - name: Verify crate version matches release tag
         if: github.event_name == 'release'
@@ -50,8 +50,15 @@ jobs:
             exit 1
           fi
 
+      - name: Guard packaged dependencies against silent registry drift
+        run: |
+          python3 .github/scripts/check_package_registry_drift.py --self-test
+          cargo package --no-verify
+          python3 .github/scripts/check_package_registry_drift.py \
+            Cargo.toml target/package
+
       - name: Run tests before publishing
-        run: cargo test --lib
+        run: cargo test --lib --features ble
 
       - name: Dry-run publish
         if: github.event_name == 'workflow_dispatch' && inputs.dry-run == 'true'

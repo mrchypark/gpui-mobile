@@ -28,7 +28,7 @@ public final class GpuiCalendar {
                 null, null, null
             );
 
-            if (cursor == null) return "";
+            if (cursor == null) throw new IllegalStateException("Calendar provider returned no cursor");
             while (cursor.moveToNext()) {
                 if (result.length() > 0) result.append("\n");
                 String id = cursor.getString(0);
@@ -37,12 +37,12 @@ public final class GpuiCalendar {
                 int color = cursor.getInt(3);
                 boolean readOnly = access < CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR;
                 result.append(id).append("|")
-                      .append(name != null ? name : "").append("|")
+                      .append(nullSafe(name)).append("|")
                       .append(readOnly ? "1" : "0").append("|")
                       .append(color & 0xFFFFFFFFL);
             }
         } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "getCalendars failed", e);
+            throw new IllegalStateException("getCalendars failed", e);
         } finally {
             if (cursor != null) cursor.close();
         }
@@ -53,30 +53,33 @@ public final class GpuiCalendar {
         ContentResolver cr = activity.getContentResolver();
         StringBuilder result = new StringBuilder();
 
-        String selection = CalendarContract.Events.CALENDAR_ID + " = ? AND " +
-            CalendarContract.Events.DTSTART + " >= ? AND " +
-            CalendarContract.Events.DTSTART + " <= ?";
+        String selection = CalendarContract.Instances.CALENDAR_ID + " = ? AND " +
+            CalendarContract.Instances.END + " > ? AND " +
+            CalendarContract.Instances.BEGIN + " < ?";
+        Uri.Builder range = CalendarContract.Instances.CONTENT_URI.buildUpon();
+        android.content.ContentUris.appendId(range, startMs);
+        android.content.ContentUris.appendId(range, endMs);
 
         Cursor cursor = null;
         try {
             cursor = cr.query(
-                CalendarContract.Events.CONTENT_URI,
+                range.build(),
                 new String[]{
-                    CalendarContract.Events._ID,
+                    CalendarContract.Instances.EVENT_ID,
                     CalendarContract.Events.TITLE,
                     CalendarContract.Events.DESCRIPTION,
                     CalendarContract.Events.EVENT_LOCATION,
-                    CalendarContract.Events.DTSTART,
-                    CalendarContract.Events.DTEND,
+                    CalendarContract.Instances.BEGIN,
+                    CalendarContract.Instances.END,
                     CalendarContract.Events.ALL_DAY,
                     CalendarContract.Events.CALENDAR_ID,
                 },
                 selection,
                 new String[]{calendarId, String.valueOf(startMs), String.valueOf(endMs)},
-                CalendarContract.Events.DTSTART + " ASC"
+                CalendarContract.Instances.BEGIN + " ASC"
             );
 
-            if (cursor == null) return "";
+            if (cursor == null) throw new IllegalStateException("Calendar provider returned no cursor");
             while (cursor.moveToNext()) {
                 if (result.length() > 0) result.append("\n");
                 result.append(cursor.getString(0)).append("|")  // id
@@ -89,7 +92,7 @@ public final class GpuiCalendar {
                       .append(cursor.getString(7));  // calendarId
             }
         } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "getEvents failed", e);
+            throw new IllegalStateException("getEvents failed", e);
         } finally {
             if (cursor != null) cursor.close();
         }
@@ -99,6 +102,8 @@ public final class GpuiCalendar {
     public static String createEvent(Activity activity, String calendarId,
             String title, String description, String location,
             long startMs, long endMs, boolean allDay) {
+        if (endMs <= startMs || (allDay && (startMs % 86400000L != 0 || endMs % 86400000L != 0)))
+            throw new IllegalArgumentException("Invalid event range; all-day timestamps must be UTC midnight with exclusive end");
         ContentValues values = new ContentValues();
         values.put(CalendarContract.Events.CALENDAR_ID, Long.parseLong(calendarId));
         values.put(CalendarContract.Events.TITLE, title);
@@ -107,7 +112,7 @@ public final class GpuiCalendar {
         values.put(CalendarContract.Events.DTSTART, startMs);
         values.put(CalendarContract.Events.DTEND, endMs);
         values.put(CalendarContract.Events.ALL_DAY, allDay ? 1 : 0);
-        values.put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().getID());
+        values.put(CalendarContract.Events.EVENT_TIMEZONE, allDay ? "UTC" : TimeZone.getDefault().getID());
 
         try {
             Uri uri = activity.getContentResolver().insert(CalendarContract.Events.CONTENT_URI, values);
@@ -115,24 +120,60 @@ public final class GpuiCalendar {
                 return uri.getLastPathSegment();
             }
         } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "createEvent failed", e);
+            throw new IllegalStateException("createEvent failed", e);
         }
-        return null;
+        throw new IllegalStateException("Calendar provider returned no created event URI");
     }
 
     public static boolean deleteEvent(Activity activity, String eventId) {
+        // Validate before obtaining any resolver: an empty URI segment would
+        // otherwise select the collection and risk deleting unrelated rows.
+        long rowId = eventRowId(eventId);
         try {
-            Uri uri = CalendarContract.Events.CONTENT_URI.buildUpon()
-                .appendPath(eventId).build();
-            int rows = activity.getContentResolver().delete(uri, null, null);
+            Uri uri = android.content.ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, rowId);
+            ContentResolver resolver = activity.getContentResolver();
+            try (Cursor cursor = resolver.query(uri, new String[]{
+                    CalendarContract.Events.RRULE, CalendarContract.Events.RDATE,
+                    CalendarContract.Events.ORIGINAL_ID}, null, null, null)) {
+                if (cursor == null) throw new IllegalStateException("Calendar provider returned no cursor");
+                if (!cursor.moveToFirst()) return false;
+                if (isRecurring(cursor.getString(0), cursor.getString(1), !cursor.isNull(2)))
+                    throw new IllegalArgumentException("Recurring event deletion requires an explicit scope and is unsupported");
+            }
+            // Check again atomically with deletion: a concurrent provider edit
+            // must not turn a checked standalone event into a deleted series.
+            // CalendarProvider rejects selections on events/#. Use collection
+            // routing with an exact bound ID AND the recurrence safety guard.
+            int rows = resolver.delete(CalendarContract.Events.CONTENT_URI,
+                DELETE_STANDALONE_SELECTION, new String[]{Long.toString(rowId)});
             return rows > 0;
         } catch (Exception e) {
-            android.util.Log.e("GpuiCalendar", "deleteEvent failed", e);
-            return false;
+            throw new IllegalStateException("deleteEvent failed", e);
         }
     }
 
-    private static String nullSafe(String s) { return s != null ? s : ""; }
+    static final String DELETE_STANDALONE_SELECTION =
+        "_id = ? AND (rrule IS NULL OR rrule = '') AND (rdate IS NULL OR rdate = '') AND original_id IS NULL";
+
+    static long eventRowId(String value) {
+        if (value == null || value.isEmpty()) throw new IllegalArgumentException("Event ID must be a positive Android row ID");
+        for (int i = 0; i < value.length(); i++) {
+            if (value.charAt(i) < '0' || value.charAt(i) > '9')
+                throw new IllegalArgumentException("Event ID must contain only ASCII digits");
+        }
+        long id = Long.parseLong(value);
+        if (id <= 0) throw new IllegalArgumentException("Event ID must be positive");
+        return id;
+    }
+
+    static boolean isRecurring(String rule, String dates, boolean original) {
+        return original || (rule != null && !rule.isEmpty()) || (dates != null && !dates.isEmpty());
+    }
+
+    private static String nullSafe(String s) {
+        return s == null ? "" : s.replace("%", "%25").replace("|", "%7C")
+            .replace("\n", "%0A").replace("\r", "%0D").replace(",", "%2C").replace(":", "%3A");
+    }
 
     private GpuiCalendar() {}
 }

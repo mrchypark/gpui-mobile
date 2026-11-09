@@ -1,0 +1,9 @@
+/target/
+!/Cargo.lock
+
+/ios-build/
+/android-build/
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
