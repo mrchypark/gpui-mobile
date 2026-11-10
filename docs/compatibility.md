@@ -52,7 +52,6 @@ All 12 build source hashes still match; dependency pins remain unchanged.
 | Example zed-reqwest | `https://github.com/zed-industries/reqwest.git`, `33bc764aa15ff7b200bf7c93bd96e24878d53e14` |
 | Validation toolchain | Rust `1.97.1`; Apple Silicon; iOS simulator 26.3; Android NDK `28.2.13676358`, API 26 |
 
-The GPUI hash is a Zed revision, not a example-application commit. The read-only reference was `git show feature/gpui-canvas-map:docs/ios-feasibility-20261013.md` plus that branch's manifest/lock. No example-application or desktop dependency files were changed.
 
 Core gpui-mobile has no Ely dependency. `examples/ely-integration` composes Ely with the mobile platform using the same GPUI instance. `ios::ffi::run_app_with_assets(impl gpui::AssetSource)` accepts application assets without depending on Ely; the app supplies Ely's assets. Both startup paths retain an `ApplicationHandle` for UIKit's external run loop.
 

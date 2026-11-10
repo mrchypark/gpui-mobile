@@ -1,6 +1,6 @@
 # Draft: Align mobile GPUI types and make native iOS rendering work
 
-Align gpui/gpui_wgpu with Ely/canvas-map's Zed `1a28cff4b409169bac058bca40dfbfeb7621d19b` and crates.io wgpu `29.0.4`. Adapt platform, dispatcher, atlas and display APIs; match the example's reqwest source to avoid duplicate Client types. Core gpui-mobile stays independent of Ely, while the app-layer example supplies Ely assets. Application lockfiles preserve the tested libc resolution and TLS certificate validation remains enabled.
+Align gpui/gpui_wgpu with Ely's Zed `1a28cff4b409169bac058bca40dfbfeb7621d19b` and crates.io wgpu `29.0.4`. Adapt platform, dispatcher, atlas and display APIs; match the example's reqwest source to avoid duplicate Client types. Core gpui-mobile stays independent of Ely, while the app-layer example supplies Ely assets. Application lockfiles preserve the tested libc resolution and TLS certificate validation remains enabled.
 
 Fix two causes of a linked iOS app opening to a black screen: provide wgpu's Metal display handle and retain `run_embedded()`'s application handle while UIKit owns the run loop. Propagate renderer failures and provide a POSIX native simulator build path. The integrated scope also includes raw touch/pinch/lifecycle/inset contracts, asynchronous GPS, and opt-in BLE scan/connect/discover/read/write/notify/disconnect/reconnect with Android Java packaging.
 
