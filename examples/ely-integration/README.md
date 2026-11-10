@@ -124,7 +124,8 @@ fingerprint and internal receiver permissions through manifest merging.
 `evidence/source-identity*.json` records actual Cargo metadata package IDs and
 full sources for both iOS and Android. Exactly one of each package was found;
 the identities match between targets. `evidence/*-ios.txt` and
-`evidence/gpui-android.txt` are active locked dependency trees.
+`evidence/gpui-android.txt` are historical dependency trees, not the current lockfile.
+Local checkout paths in the restored evidence are redacted.
 
 This is an independent workspace/lockfile. The app root repeats the existing
 async-task patch because dependency manifest patches are ignored. The lock

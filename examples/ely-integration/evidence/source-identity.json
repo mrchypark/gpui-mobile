@@ -1,0 +1,26 @@
+[
+  {
+    "name": "ely-gpui-component",
+    "version": "0.1.1",
+    "id": "git+https://github.com/mrchypark/Ely-GPUI-Components?rev=7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd#ely-gpui-component@0.1.1",
+    "source": "git+https://github.com/mrchypark/Ely-GPUI-Components?rev=7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd#7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd"
+  },
+  {
+    "name": "gpui",
+    "version": "0.2.2",
+    "id": "git+https://github.com/zed-industries/zed?rev=1a28cff4b409169bac058bca40dfbfeb7621d19b#gpui@0.2.2",
+    "source": "git+https://github.com/zed-industries/zed?rev=1a28cff4b409169bac058bca40dfbfeb7621d19b#1a28cff4b409169bac058bca40dfbfeb7621d19b"
+  },
+  {
+    "name": "gpui_wgpu",
+    "version": "0.1.0",
+    "id": "git+https://github.com/zed-industries/zed?rev=1a28cff4b409169bac058bca40dfbfeb7621d19b#gpui_wgpu@0.1.0",
+    "source": "git+https://github.com/zed-industries/zed?rev=1a28cff4b409169bac058bca40dfbfeb7621d19b#1a28cff4b409169bac058bca40dfbfeb7621d19b"
+  },
+  {
+    "name": "wgpu",
+    "version": "29.0.4",
+    "id": "registry+https://github.com/rust-lang/crates.io-index#wgpu@29.0.4",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+  }
+]
