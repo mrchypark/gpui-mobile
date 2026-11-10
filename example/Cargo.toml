@@ -19,9 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 gpui-mobile = { path = ".." }
-gpui = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", package = "gpui", default-features = false }
-reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", package = "reqwest_client" }
-reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "33bc764aa15ff7b200bf7c93bd96e24878d53e14", package = "zed-reqwest", default-features = false, features = ["rustls-tls"] }
+gpui = { package = "gpui-fast", version = "=0.1.12", default-features = false }
+reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.10" }
 log = "0.4"
 
 [target.'cfg(target_os = "ios")'.dependencies]
@@ -32,7 +31,8 @@ android_logger = "0.15"
 android-activity = { version = "0.6", features = ["native-activity"] }
 
 [patch.crates-io]
-async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+gpui-fast = { path = "../vendor/gpui-fast" }
+gpui-fast-wgpu = { path = "../vendor/gpui-fast-wgpu" }
 
 [profile.release]
 opt-level = "z"

@@ -30,6 +30,7 @@
     <!-- Foreground location; runtime authorization remains application-owned. -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
@@ -176,6 +177,12 @@
             android:name="dev.gpui.mobile.GpuiPickerActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
+        />
+
+        <!-- Explicit target for media notification play/previous/next actions. -->
+        <receiver
+            android:name="dev.gpui.mobile.GpuiMediaSession$ButtonReceiver"
+            android:exported="false"
         />
 
         <!-- Transparent helper Activity for runtime permission requests. -->

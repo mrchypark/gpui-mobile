@@ -49,6 +49,12 @@ public final class GpuiPackageLogicTest {
         equal("[android.permission.ACCESS_BACKGROUND_LOCATION]", java.util.Arrays.toString(
             GpuiPermissions.runtimePermissions("android.permission.ACCESS_BACKGROUND_LOCATION", 31)));
         invalid(() -> GpuiPermissions.aggregateStatus(bluetooth, 31, new int[]{0}));
-        System.out.println("PASS: picker filename/bounds and permission normalization regressions");
+        java.util.ArrayList<String> pending = new java.util.ArrayList<>();
+        pending.add("content://picker/one");
+        pending.add("file:///cache/two");
+        equal(pending, GpuiPickerActivity.decodePendingResult(
+            GpuiPickerActivity.encodePendingResult(pending)));
+        equal(0, GpuiPickerActivity.decodePendingResult(null).size());
+        System.out.println("PASS: picker filename/bounds/recovery and permission normalization regressions");
     }
 }

@@ -10,13 +10,14 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.media.MediaRecorder;
-import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.util.Size;
 import android.util.SparseArray;
 import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.TextureView;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -83,7 +84,10 @@ public final class GpuiCamera {
         HandlerThread backgroundThread;
         Handler backgroundHandler;
         volatile TextureView textureView;
+        volatile SurfaceView surfaceView;
         volatile Surface previewSurface;
+        boolean ownsPreviewSurface;
+        File cacheDir;
         volatile Size previewSize;
         boolean enableAudio;
         int flashMode = FLASH_OFF;
@@ -131,6 +135,7 @@ public final class GpuiCamera {
         CameraSession session = new CameraSession();
         try {
             session.enableAudio = enableAudio;
+            session.cacheDir = activity.getCacheDir();
             session.resolution = resolution;
             session.manager = (CameraManager) activity.getApplicationContext().getSystemService(Context.CAMERA_SERVICE);
 
@@ -226,7 +231,10 @@ public final class GpuiCamera {
         }
         if (session == null) return;
 
-        releasePreviewSurface(session);
+        synchronized (session) {
+            session.surfaceView = null;
+            releasePreviewSurface(session);
+        }
         TextureView view = session.textureView;
         session.textureView = null;
         if (view != null) new Handler(Looper.getMainLooper()).post(() -> {
@@ -250,7 +258,7 @@ public final class GpuiCamera {
         if (!session.openLock.tryAcquire()) return null;
 
         try {
-            if (session.disposed || session.device == null) return null;
+            if (session.disposed || session.device == null || session.captureSession == null) return null;
             CountDownLatch latch = new CountDownLatch(1);
             AtomicReference<String> resultRef = new AtomicReference<>(null);
 
@@ -262,15 +270,13 @@ public final class GpuiCamera {
                         buffer.get(bytes);
 
                         String fileName = "photo_" + UUID.randomUUID().toString() + ".jpg";
-                        File file = new File(Environment.getExternalStoragePublicDirectory(
-                                Environment.DIRECTORY_PICTURES), fileName);
-                        // Fallback to cache dir
-                        if (!file.getParentFile().exists()) {
-                            file = new File(System.getProperty("java.io.tmpdir"), fileName);
-                        }
+                        File file = new File(session.cacheDir, fileName);
 
                         try (FileOutputStream fos = new FileOutputStream(file)) {
                             fos.write(bytes);
+                        } catch (IOException error) {
+                            if (!file.delete()) android.util.Log.w(TAG, "Failed to remove incomplete photo");
+                            throw error;
                         }
 
                         resultRef.set(file.getAbsolutePath() + "|" +
@@ -608,6 +614,7 @@ public final class GpuiCamera {
             releasePreviewSurface(session);
             TextureView view = session.textureView;
             session.textureView = null;
+            session.surfaceView = null;
             if (view != null) new Handler(Looper.getMainLooper()).post(() -> {
                 view.setSurfaceTextureListener(null);
                 ViewGroup parent = (ViewGroup) view.getParent();
@@ -623,9 +630,10 @@ public final class GpuiCamera {
     private static void attachPreviewSurface(CameraSession session, SurfaceTexture texture) {
         synchronized (session) {
             if (session.disposed || texture == null) return;
-            if (session.previewSurface != null) session.previewSurface.release();
+            if (session.previewSurface != null && session.ownsPreviewSurface) session.previewSurface.release();
             texture.setDefaultBufferSize(session.previewSize.getWidth(), session.previewSize.getHeight());
             session.previewSurface = new Surface(texture);
+            session.ownsPreviewSurface = true;
             createCaptureSession(session);
         }
     }
@@ -636,8 +644,9 @@ public final class GpuiCamera {
             if (session.captureSession != null) session.captureSession.close();
             session.captureSession = null;
             session.previewRequestBuilder = null;
-            if (session.previewSurface != null) session.previewSurface.release();
+            if (session.previewSurface != null && session.ownsPreviewSurface) session.previewSurface.release();
             session.previewSurface = null;
+            session.ownsPreviewSurface = false;
         }
     }
 
@@ -727,10 +736,14 @@ public final class GpuiCamera {
 
     private static void restartPreview(CameraSession session) throws Exception {
         if (session.previewSurface == null) return;
-        TextureView view = session.textureView;
-        SurfaceTexture texture = view == null ? null : view.getSurfaceTexture();
-        if (texture == null) throw new IllegalStateException("Preview surface was destroyed");
-        texture.setDefaultBufferSize(session.previewSize.getWidth(), session.previewSize.getHeight());
+        if (session.surfaceView != null) {
+            if (!session.previewSurface.isValid()) throw new IllegalStateException("Preview surface was destroyed");
+        } else {
+            TextureView view = session.textureView;
+            SurfaceTexture texture = view == null ? null : view.getSurfaceTexture();
+            if (texture == null) throw new IllegalStateException("Preview surface was destroyed");
+            texture.setDefaultBufferSize(session.previewSize.getWidth(), session.previewSize.getHeight());
+        }
         CountDownLatch configured = new CountDownLatch(1);
         AtomicReference<String> error = new AtomicReference<>();
         createCaptureSession(session, configured, error);
@@ -851,15 +864,15 @@ public final class GpuiCamera {
     }
 
     /**
-     * Create a TextureView for camera preview.
+     * Create a SurfaceView for camera preview.
      *
-     * <p>The TextureView is wired to the CameraSession. When the surface
+     * <p>The SurfaceView is wired to the CameraSession. When the surface
      * becomes available, a capture session is created automatically.
      * The view is NOT added to the hierarchy — the caller (GpuiPlatformView) handles that.</p>
      *
      * @param activity  The current Activity.
      * @param handleId  Camera session handle ID.
-     * @return A configured TextureView, or an empty FrameLayout if the session is not found.
+     * @return A configured SurfaceView, or an empty FrameLayout if the session is not found.
      */
     public static android.view.View createPreviewSurface(Activity activity, int handleId) {
         CameraSession session;
@@ -872,38 +885,26 @@ public final class GpuiCamera {
         }
 
         final CameraSession s = session;
-        android.view.TextureView tv = new android.view.TextureView(activity);
-        s.textureView = tv;
-
-        tv.setSurfaceTextureListener(new android.view.TextureView.SurfaceTextureListener() {
-            @Override
-            public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surface, int width, int height) {
-                attachPreviewSurface(s, surface);
+        SurfaceView view = new SurfaceView(activity);
+        view.setZOrderOnTop(true);
+        s.surfaceView = view;
+        view.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                synchronized (s) {
+                    if (s.disposed || s.surfaceView != view) return;
+                    s.previewSurface = holder.getSurface();
+                    s.ownsPreviewSurface = false;
+                    createCaptureSession(s);
+                }
             }
-
-            @Override
-            public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture surface, int w, int h) {}
-
-            @Override
-            public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture surface) {
-                releasePreviewSurface(s);
-                return true;
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {}
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                synchronized (s) {
+                    if (s.surfaceView == view) releasePreviewSurface(s);
+                }
             }
-
-            @Override
-            public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture surface) {}
         });
-
-        // If texture is already available
-        if (tv.isAvailable()) {
-            android.graphics.SurfaceTexture st = tv.getSurfaceTexture();
-            attachPreviewSurface(s, st);
-        }
-
-        // Start the session running
-        // (capture session creation is async via the SurfaceTextureListener)
-
-        return tv;
+        return view;
     }
 
     private GpuiCamera() {}

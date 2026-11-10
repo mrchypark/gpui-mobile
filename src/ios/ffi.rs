@@ -50,6 +50,12 @@ pub(crate) fn windows() -> Vec<std::rc::Rc<super::window::IosWindowInner>> {
     WINDOWS.with(|registry| registry.snapshot())
 }
 
+pub(crate) fn wake_windows() {
+    for window in windows() {
+        window.frame_demand.wake();
+    }
+}
+
 pub(crate) fn active_window_handle() -> Option<gpui::AnyWindowHandle> {
     windows()
         .into_iter()
@@ -296,19 +302,26 @@ pub extern "C" fn gpui_ios_handle_touch(
 /// The window_ptr should be the value returned by gpui_ios_get_window().
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
+    gpui_ios_request_frame_if_needed(window_ptr);
+}
+
+/// Render one tick and return whether another frame is needed.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_request_frame_if_needed(window_ptr: *mut c_void) -> bool {
     if window_ptr.is_null() {
-        return;
+        return false;
     }
 
     // Safety: window_ptr must be a valid pointer to an IosWindow
     let Some(window) = window_for_handle(window_ptr as usize) else {
-        return;
+        return false;
     };
 
     // ── Momentum scrolling ───────────────────────────────────────────────
     if !window.can_render() {
-        return;
+        return false;
     }
+    window.frame_demand.clear();
     // Pump the momentum scroller BEFORE the render callback so that any
     // synthetic ScrollWheel events are processed during this frame's
     // layout/paint cycle.  This produces the smooth, decelerating inertia
@@ -326,11 +339,26 @@ pub extern "C" fn gpui_ios_request_frame(window_ptr: *mut c_void) {
         || !window.closed.get(),
         |cb| {
             cb(RequestFrameOptions {
-                force_render: text_dirty,
+                force_render: text_dirty | crate::render_request::take_force_render(),
                 ..Default::default()
             });
         },
     );
+    window.frame_demand.is_pending()
+        || crate::TEXT_INPUT_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+        || crate::render_request::force_render_pending()
+}
+
+/// Register a main-thread callback that resumes the host's frame source.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_frame_waker(
+    window_ptr: *mut c_void,
+    waker: Option<unsafe extern "C" fn(*mut c_void)>,
+    context: *mut c_void,
+) {
+    if let Some(window) = window_for_handle(window_ptr as usize) {
+        window.frame_demand.set_host_waker(waker.map(|waker| (waker, context)));
+    }
 }
 
 /// Show the software keyboard.
@@ -391,16 +419,22 @@ pub extern "C" fn gpui_ios_handle_text_input(window_ptr: *mut c_void, text_ptr: 
 
 /// Handle a key event from an external keyboard.
 ///
+/// The app delegate forwards presses that the focused responder leaves
+/// unhandled, so text input and IME delivery remain owned by UIKit.
+///
 /// Parameters:
 /// - `window_ptr`: Pointer to the IosWindow
 /// - `key_code`: The key code from UIKeyboardHIDUsage
 /// - `modifiers`: Modifier flags from UIKeyModifierFlags
+/// - `unmodified`, `characters`: nullable UTF-8 strings from UIKey
 /// - `is_key_down`: true for key down, false for key up
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_handle_key_event(
     window_ptr: *mut c_void,
     key_code: u32,
     modifiers: u32,
+    unmodified: *const std::ffi::c_char,
+    characters: *const std::ffi::c_char,
     is_key_down: bool,
 ) {
     if window_ptr.is_null() {
@@ -417,7 +451,15 @@ pub extern "C" fn gpui_ios_handle_key_event(
     let Some(window) = window_for_handle(window_ptr as usize) else {
         return;
     };
-    window.handle_key_event(key_code, modifiers, is_key_down);
+    let string = |ptr: *const std::ffi::c_char| {
+        if ptr.is_null() {
+            String::new()
+        } else {
+            // The host supplies UTF-8 strings valid for this call.
+            unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        }
+    };
+    window.handle_key_event(key_code, modifiers, &string(unmodified), &string(characters), is_key_down);
 }
 
 /// Called from ObjC when the app receives a URL to open.

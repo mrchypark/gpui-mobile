@@ -8,7 +8,13 @@ export IPHONEOS_DEPLOYMENT_TARGET=16.0
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-"$root/example/target"}
-cargo rustc --crate-type staticlib --manifest-path "$here/Cargo.toml" --locked --lib --target aarch64-apple-ios-sim -j 1
+smoke_feature=
+if [ "${GPUI_PLATFORM_EXTENDED:-0}" = 1 ]; then
+    smoke_feature=--features=platform-extended
+elif [ "${GPUI_PLATFORM_SMOKE:-0}" = 1 ]; then
+    smoke_feature=--features=platform-smoke
+fi
+cargo rustc --crate-type staticlib --manifest-path "$here/Cargo.toml" --locked --lib $smoke_feature --target aarch64-apple-ios-sim -j 1
 sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
 host="$root/example/ios"
 app="$here/ios-build/ElyIntegration.app"

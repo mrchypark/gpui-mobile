@@ -235,6 +235,17 @@ pub type CloseCallback = Box<dyn FnOnce() + Send + 'static>;
 /// Called when the window appearance (light/dark) changes.
 pub type AppearanceCallback = Box<dyn FnMut(WindowAppearance) + Send + 'static>;
 
+/// Called after the latest window insets observation changes.
+pub type InsetsChangedCallback = Box<dyn FnMut(gpui::WindowInsets)>;
+
+fn platform_insets(insets: &mobile_events::WindowInsets) -> gpui::WindowInsets {
+    gpui::WindowInsets {
+        safe_area: insets.safe_area,
+        ime: insets.keyboard_insets.unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
 // ── appearance ────────────────────────────────────────────────────────────────
 
 /// Light / dark / high-contrast appearance of the window.
@@ -304,6 +315,8 @@ struct WindowState {
     /// `WindowResized`.  The top inset accounts for the status bar / notch,
     /// and the bottom inset accounts for the navigation bar / gesture area.
     safe_area_insets: SafeAreaInsets,
+    /// Latest complete observation, including floating keyboard geometry.
+    mobile_insets: mobile_events::WindowInsets,
     has_native_insets: bool,
 
     /// Current appearance.
@@ -322,6 +335,7 @@ struct WindowState {
     resize_callback: Option<ResizeCallback>,
     close_callback: Option<CloseCallback>,
     appearance_callback: Option<AppearanceCallback>,
+    insets_changed_callback: Option<InsetsChangedCallback>,
 }
 
 // SAFETY: `WindowState` is only ever accessed while holding the
@@ -346,6 +360,7 @@ pub struct AndroidWindow {
     legacy_multitouch: std::sync::atomic::AtomicBool,
     app_resumed: std::sync::atomic::AtomicBool,
     visibility_callback: Mutex<Option<Box<dyn FnMut(gpui::WindowVisibility) + Send>>>,
+    a11y: std::sync::Mutex<Option<super::accessibility::Handlers>>,
 }
 
 // SAFETY: `WindowState` is protected by a `Mutex`.
@@ -384,6 +399,9 @@ impl AndroidWindow {
         }
         self.emit_mobile_events(events);
         self.notify_visibility(before);
+        if resumed {
+            super::frame_source::resume();
+        }
     }
 
     fn visibility(&self) -> gpui::WindowVisibility {
@@ -481,6 +499,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            mobile_insets: mobile_events::WindowInsets::default(),
             has_native_insets: false,
             appearance: WindowAppearance::Light,
             transparent,
@@ -492,6 +511,7 @@ impl AndroidWindow {
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
+            insets_changed_callback: None,
         }));
 
         Ok(Arc::new(Self {
@@ -506,6 +526,7 @@ impl AndroidWindow {
             legacy_multitouch: std::sync::atomic::AtomicBool::new(false),
             app_resumed: std::sync::atomic::AtomicBool::new(true),
             visibility_callback: Mutex::new(None),
+            a11y: Default::default(),
         }))
     }
 
@@ -523,6 +544,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            mobile_insets: mobile_events::WindowInsets::default(),
             has_native_insets: false,
             appearance: WindowAppearance::Light,
             transparent: false,
@@ -534,6 +556,7 @@ impl AndroidWindow {
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
+            insets_changed_callback: None,
         }));
 
         Arc::new(Self {
@@ -544,6 +567,7 @@ impl AndroidWindow {
             legacy_multitouch: std::sync::atomic::AtomicBool::new(false),
             app_resumed: std::sync::atomic::AtomicBool::new(false),
             visibility_callback: Mutex::new(None),
+            a11y: Default::default(),
         })
     }
 
@@ -608,9 +632,8 @@ impl AndroidWindow {
 
         // Store the new native window (drops previous one if any).
         state.native_window = Some(native_window);
-        state.width = width;
-        state.height = height;
         drop(state);
+        self.update_size(width, height, false);
         self.activity.set_surface(true);
         let events = self
             .mobile_events
@@ -618,6 +641,10 @@ impl AndroidWindow {
             .surface(SurfaceLifecycle::Available, std::time::Duration::ZERO);
         self.emit_mobile_events(events);
         self.notify_visibility(previous_visibility);
+        if let Some(handlers) = self.a11y.lock().expect("poisoned").clone() {
+            super::accessibility::init(&handlers);
+        }
+        super::frame_source::resume();
         Ok(())
     }
 
@@ -662,16 +689,19 @@ impl AndroidWindow {
 
     /// Called when `APP_CMD_WINDOW_RESIZED` fires.
     pub fn handle_resize(&self) {
+        let (width, height) = {
+            let state = self.state.lock();
+            let Some(window) = state.native_window.as_ref() else {
+                return;
+            };
+            (window.width(), window.height())
+        };
+        self.update_size(width, height, true);
+    }
+
+    fn update_size(&self, new_w: i32, new_h: i32, resize_surface: bool) {
         let (new_w, new_h, scale) = {
             let mut state = self.state.lock();
-
-            let nw = match state.native_window.as_ref() {
-                Some(nw) => nw,
-                None => return,
-            };
-
-            let new_w = nw.width();
-            let new_h = nw.height();
 
             if new_w == state.width && new_h == state.height {
                 log::debug!("handle_resize: no change ({}×{})", new_w, new_h);
@@ -692,12 +722,14 @@ impl AndroidWindow {
 
             // update_drawable_size calls device.poll(Wait) which can take
             // time — take the renderer out to avoid holding the state lock.
-            if let Some(mut renderer) = state.renderer.take() {
-                renderer.update_drawable_size(gpui::size(
-                    gpui::DevicePixels(new_w),
-                    gpui::DevicePixels(new_h),
-                ));
-                state.renderer = Some(renderer);
+            if resize_surface {
+                if let Some(mut renderer) = state.renderer.take() {
+                    renderer.update_drawable_size(gpui::size(
+                        gpui::DevicePixels(new_w),
+                        gpui::DevicePixels(new_h),
+                    ));
+                    state.renderer = Some(renderer);
+                }
             }
 
             (new_w, new_h, scale)
@@ -1002,6 +1034,12 @@ impl AndroidWindow {
             self.state.lock().key_meta_state = 0;
         }
         self.activity.set_active(active);
+        if active {
+            if let Some(handlers) = self.a11y.lock().expect("poisoned").clone() {
+                super::accessibility::init(&handlers);
+            }
+            super::frame_source::resume();
+        }
     }
 
     // ── transparency ──────────────────────────────────────────────────────────
@@ -1065,6 +1103,27 @@ impl AndroidWindow {
         state.safe_area_insets.to_logical(state.scale_factor)
     }
 
+    fn update_mobile_insets(&self, insets: mobile_events::WindowInsets) {
+        // Take the callback before dispatch or invocation so both may re-enter.
+        let callback = {
+            let mut state = self.state.lock();
+            if state.mobile_insets == insets {
+                None
+            } else {
+                state.mobile_insets = insets.clone();
+                state.insets_changed_callback.take()
+            }
+        };
+        mobile_events::dispatch(self.id, &MobileEvent::Insets(insets.clone()));
+        if let Some(mut callback) = callback {
+            callback(platform_insets(&insets));
+            let mut state = self.state.lock();
+            if state.insets_changed_callback.is_none() {
+                state.insets_changed_callback = Some(callback);
+            }
+        }
+    }
+
     /// Update the safe area insets from the content rect provided by the system.
     ///
     /// `content_rect` is `(left, top, right, bottom)` in physical pixels — the
@@ -1096,21 +1155,19 @@ impl AndroidWindow {
         );
         state.safe_area_insets = insets;
         let logical = insets.to_logical(state.scale_factor);
+        let mobile_insets = crate::mobile_events::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(logical.top),
+                bottom: gpui::px(logical.bottom),
+                left: gpui::px(logical.left),
+                right: gpui::px(logical.right),
+            },
+            keyboard: None,
+            keyboard_visible: None,
+            keyboard_insets: None,
+        };
         drop(state);
-        mobile_events::dispatch(
-            self.id,
-            &MobileEvent::Insets(crate::mobile_events::WindowInsets {
-                safe_area: gpui::Edges {
-                    top: gpui::px(logical.top),
-                    bottom: gpui::px(logical.bottom),
-                    left: gpui::px(logical.left),
-                    right: gpui::px(logical.right),
-                },
-                keyboard: None,
-                keyboard_visible: None,
-                keyboard_insets: None,
-            }),
-        );
+        self.update_mobile_insets(mobile_insets);
     }
 
     /// Called on the GPUI thread after the Java UI thread reports typed WindowInsets.
@@ -1146,7 +1203,7 @@ impl AndroidWindow {
                 .map(|edges| f32::from(edges.bottom))
                 .unwrap_or(0.0),
         );
-        mobile_events::dispatch(self.id, &MobileEvent::Insets(insets));
+        self.update_mobile_insets(insets);
         if let Some(mut callback) = callback {
             callback(dimensions, density);
             let mut state = self.state.lock();
@@ -1278,6 +1335,39 @@ impl AndroidWindow {
         RawAndroidWindow { nw_ptr }
     }
 
+    /// Initialize the selected backend before creating a presentation surface.
+    pub(crate) fn initialize_gpu_context(
+        native_window: &NativeWindow,
+        gpu_context: &GpuContext,
+        backend: super::AndroidBackend,
+    ) -> Result<()> {
+        if gpu_context.borrow().is_some() {
+            return Ok(());
+        }
+        let raw = Self::raw_window(native_window);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: match backend {
+                super::AndroidBackend::Vulkan => wgpu::Backends::VULKAN,
+                super::AndroidBackend::Gles => wgpu::Backends::GL,
+            },
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: Some(Box::new(raw)),
+        });
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: None,
+                raw_window_handle: raw.window_handle()?.as_raw(),
+            })?
+        };
+        let context = WgpuContext::new(instance, &surface, None)?;
+        log::info!("Android GPU backend selected: {:?}", context.adapter.get_info().backend);
+        drop(surface);
+        *gpu_context.borrow_mut() = Some(context);
+        Ok(())
+    }
+
     /// Create a `WgpuRenderer` for the given `NativeWindow`.
     fn create_renderer(
         native_window: &NativeWindow,
@@ -1295,11 +1385,11 @@ impl AndroidWindow {
                 && qemu[0] == b'1' as libc::c_char
         };
         if is_emulator && gpu_context.borrow().is_none() {
-            // ranchu can crash in vkSetDebugUtilsObjectNameEXT, even with SwiftShader.
-            // Keep Vulkan/debugging/validation; omit only HAL object labels.
+            // SwiftShader's Vulkan renderer stalls while GPUI builds its pipelines.
+            // Android Emulator's ANGLE OpenGL ES adapter avoids that path.
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-                flags: wgpu::InstanceFlags::default() | wgpu::InstanceFlags::DISCARD_HAL_LABELS,
+                backends: wgpu::Backends::GL,
+                flags: wgpu::InstanceFlags::default(),
                 backend_options: wgpu::BackendOptions::default(),
                 memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
                 display: Some(Box::new(raw)),
@@ -1314,7 +1404,9 @@ impl AndroidWindow {
             };
             let context = WgpuContext::new(instance, &surface, None)?;
             *gpu_context.borrow_mut() = Some(context);
-            log::info!("Android emulator Vulkan workaround: HAL object labels disabled");
+            log::info!(
+                "Android emulator workaround: using OpenGL ES instead of SwiftShader Vulkan"
+            );
         }
 
         let config = WgpuSurfaceConfig {
@@ -1329,6 +1421,9 @@ impl AndroidWindow {
 
 impl Drop for AndroidWindow {
     fn drop(&mut self) {
+        if let Some(handlers) = self.a11y.lock().expect("poisoned").take() {
+            super::accessibility::close(&handlers);
+        }
         let mut state = self.state.lock();
 
         // Destroy renderer before releasing the native window.
@@ -1397,9 +1492,9 @@ impl AndroidPlatformWindow {
 impl Drop for AndroidPlatformWindow {
     fn drop(&mut self) {
         let owns_ime = crate::mobile_events::active_text_input_lease().is_none_or(|lease|
-            self.window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.window()));
+            self.window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.owner().window));
         if let Some(lease) = crate::mobile_events::active_text_input_lease() {
-            if self.window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.window()) {
+            if self.window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.owner().window) {
                 crate::mobile_events::release_text_input_owner(lease);
             }
         }
@@ -1443,6 +1538,18 @@ impl HasDisplayHandle for AndroidPlatformWindow {
 }
 
 impl PlatformWindow for AndroidPlatformWindow {
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        let handlers = super::accessibility::Handlers::new(callbacks);
+        *self.window.a11y.lock().expect("poisoned") = Some(handlers.clone());
+        super::accessibility::init(&handlers);
+    }
+
+    fn a11y_tree_update(&self, tree: gpui::accesskit::TreeUpdate) {
+        if let Some(handlers) = self.window.a11y.lock().expect("poisoned").clone() {
+            super::accessibility::update(&handlers, tree);
+        }
+    }
+
     fn bounds(&self) -> gpui::Bounds<gpui::Pixels> {
         let state = self.window.state.lock();
         let w = state.width as f32 / state.scale_factor;
@@ -1451,6 +1558,15 @@ impl PlatformWindow for AndroidPlatformWindow {
             origin: gpui::point(gpui::px(0.0), gpui::px(0.0)),
             size: gpui::size(gpui::px(w), gpui::px(h)),
         }
+    }
+
+    fn insets(&self) -> gpui::WindowInsets {
+        let state = self.window.state.lock();
+        platform_insets(&state.mobile_insets)
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        self.window.state.lock().insets_changed_callback = Some(callback);
     }
 
     fn is_maximized(&self) -> bool {
@@ -1589,6 +1705,14 @@ impl PlatformWindow for AndroidPlatformWindow {
         true
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        Some(Rc::new(super::frame_source::schedule_frame))
+    }
+
+    fn schedule_frame(&self) {
+        super::frame_source::schedule_frame();
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         // PlatformWindow gives us Box<dyn FnMut(...)> (not Send).
         // AndroidWindow::on_request_frame requires Send.  On Android the
@@ -1638,7 +1762,7 @@ impl PlatformWindow for AndroidPlatformWindow {
 
                     let position = gpui::point(gpui::px(pos_x), gpui::px(pos_y));
                     if let Some(mut guard) = input_cb.try_lock() {
-                        let _ = guard(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                        let _ = guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                             position,
                             delta: gpui::ScrollDelta::Pixels(gpui::point(
                                 gpui::px(dx),
@@ -1646,6 +1770,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                             )),
                             modifiers: gpui::Modifiers::default(),
                             touch_phase: phase,
+                            source: gpui::ScrollSource::Touch,
                         }));
                     }
                 } else if ms.scroller.is_active() {
@@ -1661,7 +1786,7 @@ impl PlatformWindow for AndroidPlatformWindow {
 
                         if let Some(mut guard) = input_cb.try_lock() {
                             let _ =
-                                guard(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                                guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                                     position,
                                     delta: gpui::ScrollDelta::Pixels(gpui::point(
                                         gpui::px(delta.dx),
@@ -1669,14 +1794,15 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     )),
                                     modifiers: gpui::Modifiers::default(),
                                     touch_phase: gpui::TouchPhase::Moved,
+                                    source: gpui::ScrollSource::Touch,
                                 }));
 
                             // If this was the last momentum frame (scroller
                             // deactivated during step), send the Ended event
                             // now so GPUI knows the gesture is complete.
                             if fling_ended {
-                                let _ = guard(gpui::PlatformInput::ScrollWheel(
-                                    gpui::ScrollWheelEvent {
+                                let _ = guard(gpui::PlatformInput::Scroll(
+                                    gpui::ScrollEvent {
                                         position,
                                         delta: gpui::ScrollDelta::Pixels(gpui::point(
                                             gpui::px(0.0),
@@ -1684,6 +1810,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                         )),
                                         modifiers: gpui::Modifiers::default(),
                                         touch_phase: gpui::TouchPhase::Ended,
+                                        source: gpui::ScrollSource::Touch,
                                     },
                                 ));
                             }
@@ -1698,7 +1825,7 @@ impl PlatformWindow for AndroidPlatformWindow {
 
                         if let Some(mut guard) = input_cb.try_lock() {
                             let _ =
-                                guard(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                                guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                                     position: pos,
                                     delta: gpui::ScrollDelta::Pixels(gpui::point(
                                         gpui::px(0.0),
@@ -1706,6 +1833,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     )),
                                     modifiers: gpui::Modifiers::default(),
                                     touch_phase: gpui::TouchPhase::Ended,
+                                    source: gpui::ScrollSource::Touch,
                                 }));
                         }
                     }
@@ -1720,8 +1848,13 @@ impl PlatformWindow for AndroidPlatformWindow {
             let mut cb = send_callback.lock();
             cb(RequestFrameOptions {
                 require_presentation: true,
-                force_render: text_dirty,
+                force_render: text_dirty | crate::render_request::take_force_render(),
+                ..Default::default()
             });
+            if crate::render_request::force_render_pending()
+                || (!crate::mobile_events::raw_touch_only() && momentum.lock().scroller.is_active()) {
+                super::frame_source::schedule_frame();
+            }
         });
     }
 
@@ -1753,11 +1886,13 @@ impl PlatformWindow for AndroidPlatformWindow {
         });
         // Like ime_callback, only invoked on the native GPUI owner thread.
         self.window.state.lock().ime_owner_refresh = Some(unsafe { std::mem::transmute(refresh) });
+        let mut compose_state = crate::mobile_events::ImeComposeState::default();
         let callback: Box<dyn FnMut(i64, i64, crate::mobile_events::ImeInput)> =
             Box::new(move |session, editor, input| {
                 if !super::jni::ime_delivery_current(session, editor) {
                     return;
                 }
+                if !compose_state.accepts(session, editor) { return; }
                 if let Some(lease) = crate::mobile_events::active_text_input_lease() {
                     let generation = handler.generation();
                     handler.call(|| super::jni::ime_delivery_current(session, editor), |candidate| {
@@ -1772,9 +1907,85 @@ impl PlatformWindow for AndroidPlatformWindow {
                         if !current() { return; }
                         use crate::mobile_events::ImeInput;
                         match input {
-                            ImeInput::Commit(text) => candidate.replace_text_in_range(None, &text),
-                            ImeInput::Compose { text, selection } => candidate.replace_and_mark_text_in_range(None, &text, Some(selection)),
-                            ImeInput::FinishComposition => candidate.unmark_text(),
+                            ImeInput::Commit(text) => {
+                                let replacement = if let Some(region) = compose_state.take_region() {
+                                    let Some(native_selection) = candidate.selected_text_range(true) else {
+                                        if compose_state.reject_region(session, editor, verify(candidate)) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    };
+                                    let Some(range) = crate::mobile_events::ime_compose_region_range(&region, &native_selection.range) else {
+                                        if compose_state.reject_region(session, editor, verify(candidate)) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    };
+                                    let mut adjusted = None;
+                                    let Some(actual) = candidate.text_for_range(range.clone(), &mut adjusted) else {
+                                        if compose_state.reject_region(session, editor, verify(candidate)) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    };
+                                    let owner_is_current = verify(candidate);
+                                    if adjusted.unwrap_or_else(|| range.clone()) != range || actual != region.text {
+                                        if compose_state.reject_region(session, editor, owner_is_current) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    }
+                                    if !owner_is_current {
+                                        compose_state.block(session, editor);
+                                        return;
+                                    }
+                                    Some(range)
+                                } else { None };
+                                candidate.replace_text_in_range(replacement, &text)
+                            }
+                            ImeInput::Compose { region: Some(region), .. } => {
+                                compose_state.set_region(session, editor, region)
+                            }
+                            ImeInput::Compose { text, selection, region: None } => {
+                                let replacement = if let Some(region) = compose_state.take_region() {
+                                    let Some(native_selection) = candidate.selected_text_range(true) else {
+                                        if compose_state.reject_region(session, editor, verify(candidate)) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    };
+                                    let Some(range) = crate::mobile_events::ime_compose_region_range(&region, &native_selection.range) else {
+                                        if compose_state.reject_region(session, editor, verify(candidate)) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    };
+                                    let mut adjusted = None;
+                                    let Some(actual) = candidate.text_for_range(range.clone(), &mut adjusted) else {
+                                        if compose_state.reject_region(session, editor, verify(candidate)) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    };
+                                    let owner_is_current = verify(candidate);
+                                    if adjusted.unwrap_or_else(|| range.clone()) != range || actual != region.text {
+                                        if compose_state.reject_region(session, editor, owner_is_current) {
+                                            super::jni::restart_ime_connection(session, editor);
+                                        }
+                                        return;
+                                    }
+                                    if !owner_is_current {
+                                        compose_state.block(session, editor);
+                                        return;
+                                    }
+                                    Some(range)
+                                } else { None };
+                                candidate.replace_and_mark_text_in_range(replacement, &text, Some(selection));
+                            }
+                            ImeInput::FinishComposition => {
+                                compose_state.clear_region();
+                                candidate.unmark_text()
+                            }
                             ImeInput::Enter | ImeInput::Backspace => {
                                 let enter = matches!(input, ImeInput::Enter);
                                 let result = ime_cb.lock()(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
@@ -1786,6 +1997,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 }
                             }
                             ImeInput::DeleteBefore { count, codepoints } => {
+                                compose_state.clear_region();
                                 let Some(selection) = candidate.selected_text_range(true) else { return; };
                                 if !verify(candidate) { return; }
                                 if !selection.range.is_empty() {
@@ -2014,8 +2226,12 @@ impl PlatformWindow for AndroidPlatformWindow {
                             }
                         }
 
+                        let needs_scroll_frame = ms.has_pending_scroll;
                         // Drop momentum lock before dispatching MouseMove.
                         drop(ms);
+                        if needs_scroll_frame {
+                            super::frame_source::schedule_frame();
+                        }
 
                         // Always emit MouseMove so interactive screens can
                         // track finger position (drag line in Animations,
@@ -2046,11 +2262,12 @@ impl PlatformWindow for AndroidPlatformWindow {
                         ms.has_pending_scroll = false;
                         drop(ms);
                         if was_scrolling {
-                            cb.lock()(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                            cb.lock()(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                                 position,
                                 delta: gpui::ScrollDelta::Pixels(Default::default()),
                                 modifiers,
                                 touch_phase: gpui::TouchPhase::Cancelled,
+                                source: gpui::ScrollSource::Touch,
                             }));
                         }
                     }
@@ -2108,14 +2325,18 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 let (vx, vy) = ms.velocity_tracker.velocity();
                                 ms.velocity_tracker.reset();
                                 ms.scroller.fling(vx, vy, logical_x, logical_y);
+                                let fling_active = ms.scroller.is_active();
 
                                 // Drop momentum lock before dispatching.
                                 drop(ms);
+                                if fling_active {
+                                    super::frame_source::schedule_frame();
+                                }
 
                                 let mut guard = cb.lock();
                                 // ScrollWheel Ended for scroll containers.
-                                let _ = guard(gpui::PlatformInput::ScrollWheel(
-                                    gpui::ScrollWheelEvent {
+                                let _ = guard(gpui::PlatformInput::Scroll(
+                                    gpui::ScrollEvent {
                                         position,
                                         delta: gpui::ScrollDelta::Pixels(gpui::point(
                                             gpui::px(total_dx),
@@ -2123,6 +2344,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                         )),
                                         modifiers,
                                         touch_phase: gpui::TouchPhase::Ended,
+                                        source: gpui::ScrollSource::Touch,
                                     },
                                 ));
                                 // MouseUp for interactive screens (Animations
@@ -2242,6 +2464,10 @@ impl PlatformWindow for AndroidPlatformWindow {
 
     fn on_moved(&self, _callback: Box<dyn FnMut()>) {
         // Android windows don't move — they're always fullscreen.
+    }
+
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {
+        // NativeActivity exposes no display-change callback for its window.
     }
 
     fn on_should_close(&self, _callback: Box<dyn FnMut() -> bool>) {
@@ -2496,6 +2722,107 @@ mod tests {
     }
 
     #[test]
+    fn platform_insets_follow_latest_mobile_observation() {
+        let w = AndroidWindow::headless(1080, 1920, 3.0);
+        let platform_window = AndroidPlatformWindow::new(w.clone(), None);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let output = observed.clone();
+        let callback_window = Arc::downgrade(&w);
+        platform_window.on_insets_changed(Box::new(move |insets| {
+            let logical = callback_window
+                .upgrade()
+                .expect("window retained by the test")
+                .safe_area_insets_logical();
+            output.lock().push((insets, logical));
+        }));
+        let attached = crate::mobile_events::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(24.0),
+                bottom: gpui::px(16.0),
+                ..Default::default()
+            },
+            keyboard: Some(gpui::Bounds {
+                origin: gpui::point(gpui::px(0.0), gpui::px(400.0)),
+                size: gpui::size(gpui::px(360.0), gpui::px(240.0)),
+            }),
+            keyboard_visible: Some(true),
+            keyboard_insets: Some(gpui::Edges {
+                bottom: gpui::px(240.0),
+                ..Default::default()
+            }),
+        };
+        w.update_window_insets(3.0, attached);
+        assert_eq!(platform_window.insets().ime.bottom, gpui::px(240.0));
+
+        let floating_keyboard = gpui::Bounds {
+            origin: gpui::point(gpui::px(40.0), gpui::px(180.0)),
+            size: gpui::size(gpui::px(180.0), gpui::px(180.0)),
+        };
+        w.update_window_insets(
+            3.0,
+            crate::mobile_events::WindowInsets {
+                safe_area: gpui::Edges {
+                    top: gpui::px(32.0),
+                    bottom: gpui::px(20.0),
+                    ..Default::default()
+                },
+                keyboard: Some(floating_keyboard),
+                keyboard_visible: Some(true),
+                keyboard_insets: Some(gpui::Edges::default()),
+            },
+        );
+        let moved_keyboard = gpui::Bounds {
+            origin: gpui::point(gpui::px(60.0), gpui::px(200.0)),
+            ..floating_keyboard
+        };
+        w.update_window_insets(
+            3.0,
+            crate::mobile_events::WindowInsets {
+                safe_area: gpui::Edges {
+                    top: gpui::px(32.0),
+                    bottom: gpui::px(20.0),
+                    ..Default::default()
+                },
+                keyboard: Some(moved_keyboard),
+                keyboard_visible: Some(true),
+                keyboard_insets: Some(gpui::Edges::default()),
+            },
+        );
+
+        let insets = platform_window.insets();
+        assert_eq!(insets.safe_area.top, gpui::px(32.0));
+        assert_eq!(insets.ime, gpui::Edges::<gpui::Pixels>::default());
+        let observed = observed.lock();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[2].0.safe_area.top, gpui::px(32.0));
+        assert_eq!(observed[2].0.ime, gpui::Edges::<gpui::Pixels>::default());
+        assert!((observed[2].1.top - 96.0).abs() < f32::EPSILON);
+        drop(observed);
+        assert_eq!(
+            w.state.lock().mobile_insets.keyboard,
+            Some(moved_keyboard)
+        );
+        std::mem::forget(platform_window);
+    }
+
+    #[test]
+    fn replacement_surface_notifies_changed_size_once() {
+        let w = AndroidWindow::headless(1080, 1920, 2.0);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = received.clone();
+        let callback_window = Arc::downgrade(&w);
+        w.on_resize(move |size, scale| {
+            assert_eq!(callback_window.upgrade().unwrap().physical_size(), size);
+            output.lock().push((size.width.0, size.height.0, scale));
+        });
+
+        w.update_size(1920, 1080, false);
+        w.update_size(1920, 1080, false);
+        w.update_size(1920, 1080, true);
+        assert_eq!(*received.lock(), vec![(1920, 1080, 2.0)]);
+    }
+
+    #[test]
     fn headless_window_logical_size() {
         let w = AndroidWindow::headless(1080, 1920, 3.0);
         let ls = w.logical_size();
@@ -2664,8 +2991,8 @@ mod tests {
     }
 
     #[test]
-    fn gpu_info_none_for_headless() {
+    fn gpu_specs_none_for_headless() {
         let w = AndroidWindow::headless(1080, 1920, 2.0);
-        assert!(w.gpu_info().is_none());
+        assert!(w.gpu_specs().is_none());
     }
 }

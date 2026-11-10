@@ -61,6 +61,51 @@ unsafe fn inside_native_ime_edit(this: *mut AnyObject) -> bool {
     (*(*this).get_ivar::<Bool>(IME_NATIVE_EDIT_IVAR)).as_bool()
 }
 
+/// Identifies the logical text field currently represented by the one UIKit
+/// proxy. UIKit retains that proxy while GPUI replaces input handlers during
+/// painting, so only a changed focus id starts a new proxy generation.
+struct ProxyInputSession<F> {
+    focus: Option<F>,
+    generation: u64,
+}
+
+impl<F: PartialEq> ProxyInputSession<F> {
+    fn new() -> Self {
+        Self {
+            focus: None,
+            generation: 0,
+        }
+    }
+
+    /// Returns true when a different text field now owns the UIKit proxy.
+    fn set_focus(&mut self, focus: Option<F>) -> bool {
+        if self.focus.as_ref() == focus.as_ref() {
+            return false;
+        }
+        self.focus = focus;
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+}
+
+unsafe fn clear_proxy_context(this: *mut AnyObject, window: &IosWindowInner) {
+    native_ime_edit(this, || {
+        let _: () = msg_send![this, setText: ptr::null_mut::<AnyObject>()];
+    });
+    *window.proxy_context.borrow_mut() = None;
+    window.proxy_base.set(None);
+    window.proxy_mapping_valid.set(false);
+    window.proxy_text.borrow_mut().clear();
+}
+
 unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, before_edit: bool) {
     let native: *mut AnyObject = msg_send![this, text];
     let utf8: *const i8 = msg_send![native, UTF8String];
@@ -87,12 +132,8 @@ unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, befo
     let owner_changed = window.proxy_context.borrow().as_ref().map(|c| c.0)
         != context.as_ref().map(|c| c.0);
     if (before_edit && changed) || owner_changed || !matches {
-        native_ime_edit(this, || {
-            let _: () = msg_send![this, setText: ptr::null_mut::<AnyObject>()];
-        });
+        clear_proxy_context(this, window);
         window.proxy_base.set(context.as_ref().map(|(_, range)| range.start));
-        window.proxy_mapping_valid.set(false);
-        window.proxy_text.borrow_mut().clear();
     } else if !before_edit {
         // A void handler callback is not acceptance. Only authoritative text
         // at the original anchor can certify this native document's mapping.
@@ -112,6 +153,55 @@ fn native_text_edit<'a>(before: &str, after: &'a str) -> (std::ops::Range<usize>
     let start = before[..prefix].encode_utf16().count();
     let end = before[..before.len() - suffix].encode_utf16().count();
     (start..end, &after[prefix..after.len() - suffix])
+}
+
+fn appearance_style_changed(previous: Option<i64>, current: Option<i64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if previous != current)
+}
+
+fn edge_attached_keyboard_insets(
+    window: Bounds<Pixels>,
+    keyboard: Option<Bounds<Pixels>>,
+) -> gpui::Edges<Pixels> {
+    let Some(keyboard) = keyboard else {
+        return Default::default();
+    };
+    let spans_width = keyboard.left() <= window.left() && keyboard.right() >= window.right();
+    let spans_height = keyboard.top() <= window.top() && keyboard.bottom() >= window.bottom();
+
+    if spans_width && keyboard.bottom() >= window.bottom() {
+        gpui::Edges {
+            bottom: window.bottom() - keyboard.top(),
+            ..Default::default()
+        }
+    } else if spans_width && keyboard.top() <= window.top() {
+        gpui::Edges {
+            top: keyboard.bottom() - window.top(),
+            ..Default::default()
+        }
+    } else if spans_height && keyboard.right() >= window.right() {
+        gpui::Edges {
+            right: window.right() - keyboard.left(),
+            ..Default::default()
+        }
+    } else if spans_height && keyboard.left() <= window.left() {
+        gpui::Edges {
+            left: keyboard.right() - window.left(),
+            ..Default::default()
+        }
+    } else {
+        Default::default()
+    }
+}
+
+fn platform_insets(window: Bounds<Pixels>, insets: &WindowInsets) -> gpui::WindowInsets {
+    gpui::WindowInsets {
+        safe_area: insets.safe_area,
+        ime: insets
+            .keyboard_insets
+            .unwrap_or_else(|| edge_attached_keyboard_insets(window, insets.keyboard)),
+        ..Default::default()
+    }
 }
 
 #[repr(C)]
@@ -292,6 +382,42 @@ fn register_metal_view_class() -> &'static AnyClass {
             handle_touches(this, touches, event);
         }
 
+        // UIKit reports system appearance changes on the view that owns the
+        // dynamic colors. Delegate to the window that created this view.
+        unsafe extern "C" fn trait_collection_did_change(
+            this: *mut AnyObject,
+            _sel: Sel,
+            previous: *mut AnyObject,
+        ) {
+            let _: () = msg_send![super(this, class!(UIView)),
+                traitCollectionDidChange: previous];
+
+            let current: *mut AnyObject = msg_send![this, traitCollection];
+            let previous_style =
+                (!previous.is_null()).then(|| msg_send![previous, userInterfaceStyle]);
+            let current_style =
+                (!current.is_null()).then(|| msg_send![current, userInterfaceStyle]);
+            if !appearance_style_changed(previous_style, current_style) {
+                return;
+            }
+
+            #[allow(deprecated)]
+            let window_ptr: *mut c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
+            let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
+                return;
+            };
+            let delivered = window
+                .appearance_changed_callback
+                .call(|| !window.closed.get(), |callback| callback())
+                .is_some();
+            log::info!(
+                "GPUI iOS: Appearance changed - previous: {:?}, current: {:?}, delivered: {}",
+                previous_style,
+                current_style,
+                delivered
+            );
+        }
+
         unsafe {
             // Add class method for layerClass
             decl.add_class_method(
@@ -316,6 +442,11 @@ fn register_metal_view_class() -> &'static AnyClass {
                 sel!(touchesCancelled:withEvent:),
                 touches_cancelled
                     as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject),
+            );
+            decl.add_method(
+                sel!(traitCollectionDidChange:),
+                trait_collection_did_change
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
             );
             unsafe extern "C" fn pinch(
                 this: *mut AnyObject,
@@ -419,6 +550,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
                 return;
             };
+            let generation = window.proxy_generation();
             let text: *mut AnyObject = msg_send![text, retain];
             sync_proxy_context(this, &window, true);
             let acknowledged = window.proxy_text.borrow().clone();
@@ -454,8 +586,12 @@ fn register_text_input_view_class() -> &'static AnyClass {
                     }).is_some()
                 }
             } else { false };
-            if !delivered { window.handle_text_input(text); }
-            sync_proxy_context(this, &window, false);
+            if window.proxy_generation_is_current(generation) && !delivered {
+                window.handle_text_input(text);
+            }
+            if window.proxy_generation_is_current(generation) {
+                sync_proxy_context(this, &window, false);
+            }
             let _: () = msg_send![text, release];
         }
 
@@ -467,6 +603,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
             #[allow(deprecated)]
             let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
             let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            let generation = window.proxy_generation();
             sync_proxy_context(this, &window, true);
             native_ime_edit(this, || {
                 let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
@@ -480,7 +617,9 @@ fn register_text_input_view_class() -> &'static AnyClass {
             if !crate::mobile_dispatch::has_text_handler() { window.input_handler.call(|| !window.closed.get(), |handler| {
                 handler.replace_and_mark_text_in_range(None, &text, Some(selection));
             }); }
-            sync_proxy_context(this, &window, false);
+            if window.proxy_generation_is_current(generation) {
+                sync_proxy_context(this, &window, false);
+            }
         }
 
         unsafe extern "C" fn replace_range(this: *mut AnyObject, _sel: Sel, range: *mut AnyObject, text: *mut AnyObject) {
@@ -492,10 +631,16 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
             let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
             if range.is_null() || text.is_null() { return; }
+            let generation = window.proxy_generation();
             // Do not apply a range obtained from a previous owner's document.
             let previous = window.proxy_context.borrow().clone();
             sync_proxy_context(this, &window, true);
-            if previous != *window.proxy_context.borrow() || !window.proxy_mapping_valid.get() { return; }
+            if !window.proxy_generation_is_current(generation)
+                || previous != *window.proxy_context.borrow()
+                || !window.proxy_mapping_valid.get()
+            {
+                return;
+            }
             let beginning: *mut AnyObject = msg_send![this, beginningOfDocument];
             let start: *mut AnyObject = msg_send![range, start];
             let end: *mut AnyObject = msg_send![range, end];
@@ -515,7 +660,9 @@ fn register_text_input_view_class() -> &'static AnyClass {
                 });
                 handler.replace_text_in_range(Some(owner_start..owner_end), &replacement);
             });
-            sync_proxy_context(this, &window, false);
+            if window.proxy_generation_is_current(generation) {
+                sync_proxy_context(this, &window, false);
+            }
         }
 
         unsafe extern "C" fn unmark_text(this: *mut AnyObject, _sel: Sel) {
@@ -526,6 +673,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
             #[allow(deprecated)]
             let handle = *(*this).get_ivar::<*mut c_void>(GPUI_WINDOW_IVAR);
             let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
+            let generation = window.proxy_generation();
             sync_proxy_context(this, &window, true);
             let marked: *mut AnyObject = msg_send![this, markedTextRange];
             if marked.is_null() { return; }
@@ -534,11 +682,18 @@ fn register_text_input_view_class() -> &'static AnyClass {
             native_ime_edit(this, || {
                 let _: () = msg_send![super(this, class!(UITextView)), unmarkText];
             });
-            if crate::mobile_dispatch::has_text_handler() || window.input_handler.call(|| !window.closed.get(), |handler| handler.unmark_text()).is_none() {
+            let should_fallback = crate::mobile_dispatch::has_text_handler()
+                || window
+                    .input_handler
+                    .call(|| !window.closed.get(), |handler| handler.unmark_text())
+                    .is_none();
+            if window.proxy_generation_is_current(generation) && should_fallback {
                 window.handle_text_input(text);
             }
             let _: () = msg_send![text, release];
-            sync_proxy_context(this, &window, false);
+            if window.proxy_generation_is_current(generation) {
+                sync_proxy_context(this, &window, false);
+            }
         }
 
         // void deleteBackward
@@ -555,6 +710,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let Some(window) = super::ffi::window_for_handle(window_ptr as usize) else {
                 return;
             };
+            let generation = window.proxy_generation();
             sync_proxy_context(this, &window, true);
             let marked: *mut AnyObject = msg_send![this, markedTextRange];
             if !marked.is_null() {
@@ -588,7 +744,9 @@ fn register_text_input_view_class() -> &'static AnyClass {
                 let _: () = msg_send![super(this, class!(UITextView)), deleteBackward];
             });
             window.handle_delete_backward();
-            sync_proxy_context(this, &window, false);
+            if window.proxy_generation_is_current(generation) {
+                sync_proxy_context(this, &window, false);
+            }
         }
 
         // canBecomeFirstResponder must return Bool::YES
@@ -716,6 +874,7 @@ pub(crate) struct IosWindowInner {
     scale_factor: Cell<f32>,
     /// Input handler for text input
     input_handler: Callback<PlatformInputHandler>,
+    proxy_input_session: RefCell<ProxyInputSession<gpui::FocusId>>,
     proxy_context: RefCell<Option<(Option<mobile_events::TextInputOwner>, std::ops::Range<usize>)>>,
     proxy_base: Cell<Option<usize>>,
     proxy_mapping_valid: Cell<bool>,
@@ -724,6 +883,7 @@ pub(crate) struct IosWindowInner {
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: Callback<Box<dyn FnMut(RequestFrameOptions)>>,
+    pub(super) frame_demand: Rc<crate::frame_demand::FrameDemand>,
     /// Callback for input events
     input_callback: Callback<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     /// Callback for active status changes
@@ -758,6 +918,9 @@ pub(crate) struct IosWindowInner {
     mobile_events: RefCell<MobileEventState>,
     legacy_multitouch: Cell<bool>,
     keyboard_bounds: Cell<Option<Bounds<Pixels>>>,
+    /// Latest complete observation, including floating keyboard geometry.
+    mobile_insets: RefCell<WindowInsets>,
+    insets_changed_callback: Callback<Box<dyn FnMut(gpui::WindowInsets)>>,
     /// Velocity tracker — records recent touch samples during drag gestures
     /// so we can compute the release velocity when the finger lifts.
     velocity_tracker: RefCell<VelocityTracker>,
@@ -777,6 +940,14 @@ unsafe impl Send for IosWindow {}
 unsafe impl Sync for IosWindow {}
 
 impl IosWindowInner {
+    fn proxy_generation(&self) -> u64 {
+        self.proxy_input_session.borrow().generation()
+    }
+
+    fn proxy_generation_is_current(&self, generation: u64) -> bool {
+        self.proxy_input_session.borrow().is_current(generation)
+    }
+
     fn apply_input_configuration(&self) {
         let configuration = self.input_configuration.borrow().clone();
         let (correct, capitalize, spellcheck, action) =
@@ -882,6 +1053,10 @@ impl IosWindowInner {
                 self.legacy_multitouch.set(false);
             }
             self.surface_available.set(available);
+            if available {
+                self.frame_demand.clear();
+                self.frame_demand.wake();
+            }
             let phase = if available {
                 SurfaceLifecycle::Available
             } else {
@@ -911,11 +1086,12 @@ impl IosWindowInner {
         self.velocity_tracker.borrow_mut().reset();
         self.momentum_scroller.borrow_mut().cancel();
         if was_scrolling {
-            self.dispatch_input(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+            self.dispatch_input(PlatformInput::Scroll(gpui::ScrollEvent {
                 position: self.mouse_position.get(),
                 delta: gpui::ScrollDelta::Pixels(Point::default()),
                 modifiers: self.modifiers.get(),
                 touch_phase: gpui::TouchPhase::Cancelled,
+                source: gpui::ScrollSource::Touch,
             }));
         }
     }
@@ -925,7 +1101,7 @@ impl IosWindowInner {
             return;
         }
         let (top, bottom, left, right) = self.safe_area_insets();
-        self.emit_mobile_events(vec![MobileEvent::Insets(WindowInsets {
+        let insets = WindowInsets {
             safe_area: gpui::Edges {
                 top: px(top),
                 bottom: px(bottom),
@@ -935,7 +1111,16 @@ impl IosWindowInner {
             keyboard: self.keyboard_bounds.get(),
             keyboard_visible: Some(self.keyboard_bounds.get().is_some()),
             keyboard_insets: None,
-        })]);
+        };
+        let previous = self.mobile_insets.replace(insets.clone());
+        let changed = previous != insets;
+        let platform_insets = platform_insets(self.bounds.get(), &insets);
+        self.emit_mobile_events(vec![MobileEvent::Insets(insets)]);
+        if changed {
+            self.insets_changed_callback
+                .call(|| !self.closed.get(), |callback| callback(platform_insets));
+            crate::render_request::request_force_render();
+        }
     }
 
     pub fn new(handle: AnyWindowHandle, _params: WindowParams) -> anyhow::Result<Self> {
@@ -1026,12 +1211,14 @@ impl IosWindowInner {
                 bounds: Cell::new(screen_bounds),
                 scale_factor: Cell::new(scale_factor),
                 input_handler: Callback::default(),
+                proxy_input_session: RefCell::new(ProxyInputSession::new()),
                 proxy_context: RefCell::new(None),
                 proxy_base: Cell::new(None),
                 proxy_mapping_valid: Cell::new(false),
                 proxy_text: RefCell::new(String::new()),
                 input_configuration: RefCell::new(gpui::TextInputConfiguration::default()),
                 request_frame_callback: Callback::default(),
+                frame_demand: Rc::new(crate::frame_demand::FrameDemand::default()),
                 input_callback: Callback::default(),
                 active_status_callback: Callback::default(),
                 visibility_callback: Callback::default(),
@@ -1053,6 +1240,8 @@ impl IosWindowInner {
                 mobile_events: RefCell::new(MobileEventState::default()),
                 legacy_multitouch: Cell::new(false),
                 keyboard_bounds: Cell::new(None),
+                mobile_insets: RefCell::new(WindowInsets::default()),
+                insets_changed_callback: Callback::default(),
                 velocity_tracker: RefCell::new(VelocityTracker::new()),
                 momentum_scroller: RefCell::new(MomentumScroller::new()),
                 renderer: Mutex::new(None),
@@ -1373,7 +1562,7 @@ impl IosWindowInner {
                                 prev_x: logical_x,
                                 prev_y: logical_y,
                             };
-                            emit(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                            emit(PlatformInput::Scroll(gpui::ScrollEvent {
                                 position,
                                 delta: gpui::ScrollDelta::Pixels(gpui::point(
                                     gpui::px(dx),
@@ -1381,6 +1570,7 @@ impl IosWindowInner {
                                 )),
                                 modifiers,
                                 touch_phase: gpui::TouchPhase::Started,
+                                source: gpui::ScrollSource::Touch,
                             }));
                         }
                         // Always emit MouseMove so interactive screens can
@@ -1400,7 +1590,7 @@ impl IosWindowInner {
                             prev_y: logical_y,
                         };
                         // Scroll event for scrollable containers.
-                        emit(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                        emit(PlatformInput::Scroll(gpui::ScrollEvent {
                             position,
                             delta: gpui::ScrollDelta::Pixels(gpui::point(
                                 gpui::px(dx),
@@ -1408,6 +1598,7 @@ impl IosWindowInner {
                             )),
                             modifiers,
                             touch_phase: gpui::TouchPhase::Moved,
+                            source: gpui::ScrollSource::Touch,
                         }));
                         // MouseMove for interactive screens.
                         emit(PlatformInput::MouseMove(gpui::MouseMoveEvent {
@@ -1450,7 +1641,7 @@ impl IosWindowInner {
                         // End the active touch-scroll gesture.
                         let dx = logical_x - prev_x;
                         let dy = logical_y - prev_y;
-                        emit(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                        emit(PlatformInput::Scroll(gpui::ScrollEvent {
                             position,
                             delta: gpui::ScrollDelta::Pixels(gpui::point(
                                 gpui::px(dx),
@@ -1458,6 +1649,7 @@ impl IosWindowInner {
                             )),
                             modifiers,
                             touch_phase: gpui::TouchPhase::Ended,
+                            source: gpui::ScrollSource::Touch,
                         }));
                         // Also emit MouseUp so interactive screens can
                         // detect the end of a drag (e.g. fling a ball).
@@ -1479,6 +1671,9 @@ impl IosWindowInner {
                         self.momentum_scroller
                             .borrow_mut()
                             .fling(vx, vy, logical_x, logical_y);
+                        if self.momentum_scroller.borrow().is_active() {
+                            self.frame_demand.wake();
+                        }
                     }
                     TouchState::Idle => {}
                 }
@@ -1564,7 +1759,7 @@ impl IosWindowInner {
         drop(scroller);
         let modifiers = self.modifiers.get();
         if let Some(delta) = delta {
-            self.dispatch_input(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+            self.dispatch_input(PlatformInput::Scroll(gpui::ScrollEvent {
                 position,
                 delta: gpui::ScrollDelta::Pixels(gpui::point(
                     gpui::px(delta.dx),
@@ -1572,15 +1767,19 @@ impl IosWindowInner {
                 )),
                 modifiers,
                 touch_phase: gpui::TouchPhase::Moved,
+                source: gpui::ScrollSource::Touch,
             }));
         }
         if ended {
-            self.dispatch_input(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+            self.dispatch_input(PlatformInput::Scroll(gpui::ScrollEvent {
                 position,
                 delta: gpui::ScrollDelta::Pixels(Point::default()),
                 modifiers,
                 touch_phase: gpui::TouchPhase::Ended,
+                source: gpui::ScrollSource::Touch,
             }));
+        } else {
+            self.frame_demand.wake();
         }
     }
 
@@ -1731,7 +1930,7 @@ impl IosWindowInner {
     }
 
     /// Handle a key event from an external keyboard
-    pub fn handle_key_event(&self, key_code: u32, modifier_flags: u32, is_key_down: bool) {
+    pub fn handle_key_event(&self, key_code: u32, modifier_flags: u32, unmodified: &str, characters: &str, is_key_down: bool) {
         use super::text_input::{
             key_code_to_key_down, key_code_to_key_up, key_code_to_string,
             modifier_flags_to_modifiers,
@@ -1770,9 +1969,9 @@ impl IosWindowInner {
         }
 
         let event = if is_key_down {
-            key_code_to_key_down(key_code, modifier_flags)
+            key_code_to_key_down(key_code, modifier_flags, unmodified, characters)
         } else {
-            key_code_to_key_up(key_code, modifier_flags)
+            key_code_to_key_up(key_code, modifier_flags, unmodified, characters)
         };
 
         self.dispatch_input(event);
@@ -1813,6 +2012,10 @@ impl IosWindowInner {
 
         self.active_status_callback
             .call(|| !self.closed.get(), |callback| callback(is_active));
+        if is_active {
+            self.frame_demand.clear();
+            self.frame_demand.wake();
+        }
     }
 
     /// Handle a layout change (e.g. rotation, split-screen resize).
@@ -1907,6 +2110,7 @@ impl Drop for IosWindow {
             let _: () = msg_send![class!(NSObject), cancelPreviousPerformRequestsWithTarget: self.text_input_view];
         }
         self.request_frame_callback.set(None);
+        self.frame_demand.set_host_waker(None);
         self.input_callback.set(None);
         self.active_status_callback.set(None);
         self.visibility_callback.set(None);
@@ -1917,6 +2121,7 @@ impl Drop for IosWindow {
         self.hit_test_callback.set(None);
         self.close_callback.set(None);
         self.appearance_changed_callback.set(None);
+        self.insets_changed_callback.set(None);
     }
 }
 
@@ -1965,6 +2170,15 @@ impl HasDisplayHandle for IosWindow {
 impl PlatformWindow for IosWindow {
     fn bounds(&self) -> Bounds<Pixels> {
         self.bounds.get()
+    }
+
+    fn insets(&self) -> gpui::WindowInsets {
+        let mobile_insets = self.mobile_insets.borrow();
+        platform_insets(self.bounds.get(), &mobile_insets)
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        self.insets_changed_callback.set(Some(callback));
     }
 
     fn is_maximized(&self) -> bool {
@@ -2017,6 +2231,15 @@ impl PlatformWindow for IosWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
+        let focus_changed = self
+            .proxy_input_session
+            .borrow_mut()
+            .set_focus(input_handler.focus_id());
+        if focus_changed {
+            // A single hidden UITextView serves all fields. Never let its
+            // marked text or mapping from the previous field reach this one.
+            unsafe { clear_proxy_context(self.text_input_view, self) };
+        }
         self.input_handler.set(Some(input_handler));
     }
 
@@ -2172,6 +2395,19 @@ impl PlatformWindow for IosWindow {
         true
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let demand = Rc::downgrade(&self.frame_demand);
+        Some(Rc::new(move || {
+            if let Some(demand) = demand.upgrade() {
+                demand.wake();
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.frame_demand.wake();
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.request_frame_callback.set(Some(callback));
     }
@@ -2194,6 +2430,10 @@ impl PlatformWindow for IosWindow {
 
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
         self.moved_callback.set(Some(callback));
+    }
+
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {
+        // A UIKit window remains on its UIScreen for this backend's lifetime.
     }
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
@@ -2281,7 +2521,12 @@ impl PlatformWindow for IosWindow {
             gpui::TextInputStateChange::FocusGained => {
                 self.show_keyboard_with_type(crate::KeyboardType::Default);
             }
-            gpui::TextInputStateChange::FocusLost => self.hide_keyboard(),
+            gpui::TextInputStateChange::FocusLost => {
+                if self.proxy_input_session.borrow_mut().set_focus(None) {
+                    unsafe { clear_proxy_context(self.text_input_view, self) };
+                }
+                self.hide_keyboard();
+            }
             gpui::TextInputStateChange::SelectionChanged
             | gpui::TextInputStateChange::ContentChanged => {}
         }
@@ -2354,5 +2599,66 @@ impl PlatformAtlas for FallbackAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         self.state.lock().tiles.remove(key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{appearance_style_changed, edge_attached_keyboard_insets, ProxyInputSession};
+
+    #[test]
+    fn appearance_callback_requires_a_real_style_transition() {
+        assert!(!appearance_style_changed(None, Some(1)));
+        assert!(!appearance_style_changed(Some(1), Some(1)));
+        assert!(appearance_style_changed(Some(1), Some(2)));
+    }
+
+    #[test]
+    fn composition_from_a_is_rejected_after_a_to_b_to_a_focus_switch() {
+        let mut proxy = ProxyInputSession::new();
+
+        assert!(proxy.set_focus(Some("A")));
+        let a_composition = proxy.generation();
+        // Repainting field A must not discard its active Korean composition.
+        assert!(!proxy.set_focus(Some("A")));
+        assert!(proxy.is_current(a_composition));
+
+        assert!(proxy.set_focus(Some("B")));
+        let b_composition = proxy.generation();
+        assert!(!proxy.is_current(a_composition));
+
+        assert!(proxy.set_focus(Some("A")));
+        let returned_to_a = proxy.generation();
+        assert!(!proxy.is_current(a_composition));
+        assert!(!proxy.is_current(b_composition));
+        assert!(proxy.is_current(returned_to_a));
+
+        assert!(proxy.set_focus(None));
+        assert!(!proxy.is_current(returned_to_a));
+    }
+
+    #[test]
+    fn platform_insets_ignore_floating_keyboard_geometry() {
+        let window = gpui::Bounds {
+            origin: gpui::Point::default(),
+            size: gpui::size(gpui::px(400.0), gpui::px(800.0)),
+        };
+        let floating = gpui::Bounds {
+            origin: gpui::point(gpui::px(100.0), gpui::px(300.0)),
+            size: gpui::size(gpui::px(200.0), gpui::px(200.0)),
+        };
+        assert_eq!(
+            edge_attached_keyboard_insets(window, Some(floating)),
+            gpui::Edges::default()
+        );
+
+        let docked = gpui::Bounds {
+            origin: gpui::point(gpui::px(0.0), gpui::px(500.0)),
+            size: gpui::size(gpui::px(400.0), gpui::px(300.0)),
+        };
+        assert_eq!(
+            edge_attached_keyboard_insets(window, Some(docked)).bottom,
+            gpui::px(300.0)
+        );
     }
 }

@@ -36,6 +36,8 @@ public class GpuiActivity extends NativeActivity {
 
     /** Whether the native .so has been loaded via System.loadLibrary. */
     private static volatile boolean sNativeLibLoaded = false;
+    private volatile boolean gpuiWindowFocused;
+    private boolean gpuiResumed;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -97,6 +99,35 @@ public class GpuiActivity extends NativeActivity {
         }
     }
 
+    @Override public void onWindowFocusChanged(boolean focused) {
+        gpuiWindowFocused = focused;
+        super.onWindowFocusChanged(focused);
+        if (sNativeLibLoaded) {
+            try {
+                nativeWindowFocusChanged(focused);
+            } catch (UnsatisfiedLinkError ignored) {
+                // A host may still load a previously pinned native library.
+            }
+        }
+    }
+
+    public boolean gpuiHasWindowFocus() { return gpuiWindowFocused; }
+
+    private void reconcileWindowFocus(int attempts) {
+        if (!gpuiResumed || isFinishing() || isDestroyed()) return;
+        if (hasWindowFocus()) {
+            gpuiWindowFocused = true;
+            if (sNativeLibLoaded) {
+                try { nativeWindowFocusChanged(true); } catch (UnsatisfiedLinkError ignored) {}
+            }
+        } else if (attempts > 0) {
+            getWindow().getDecorView().postDelayed(() -> reconcileWindowFocus(attempts - 1), 50);
+        }
+    }
+
+    private native void nativeWindowFocusChanged(boolean focused);
+    private static native boolean nativeHasWindowFocus();
+
     /**
      * Intercept key events to handle volume and media buttons.
      *
@@ -145,6 +176,8 @@ public class GpuiActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        gpuiResumed = true;
+        getWindow().getDecorView().post(() -> reconcileWindowFocus(100));
         GpuiLocation.setHostResumed(this, true);
         GpuiSensors.setHostResumed(this, true);
         GpuiServiceProbe.resumed(this);
@@ -152,6 +185,11 @@ public class GpuiActivity extends NativeActivity {
 
     @Override
     protected void onPause() {
+        gpuiResumed = false;
+        gpuiWindowFocused = false;
+        if (sNativeLibLoaded) {
+            try { nativeWindowFocusChanged(false); } catch (UnsatisfiedLinkError ignored) {}
+        }
         GpuiServiceProbe.paused();
         GpuiLocation.setHostResumed(this, false);
         GpuiSensors.setHostResumed(this, false);

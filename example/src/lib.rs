@@ -220,12 +220,7 @@ fn open_main_window(cx: &mut App) {
     // Set up HTTP client so gpui::img() can fetch remote images (e.g. picsum.photos).
     // The rustls-tls feature supplies WebPKI roots, including on iOS.
     log::info!("Setting up HTTP client for image loading...");
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("Failed to create reqwest client");
-    let http_client: reqwest_client::ReqwestClient = client.into();
-    cx.set_http_client(std::sync::Arc::new(http_client));
+    cx.set_http_client(std::sync::Arc::new(reqwest_client::ReqwestClient::new()));
     log::info!("HTTP client configured successfully");
 
     // Check if the app was launched via a deeplink and determine the initial screen.

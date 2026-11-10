@@ -95,4 +95,11 @@ impl PlatformDisplay for IosDisplay {
             size: size(px(bounds.width as f32), px(bounds.height as f32)),
         }
     }
+
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        unsafe {
+            let hertz: i64 = msg_send![self.screen, maximumFramesPerSecond];
+            gpui::refresh_interval_from_hz(hertz as f64)
+        }
+    }
 }

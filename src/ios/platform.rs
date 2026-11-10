@@ -116,6 +116,13 @@ impl PlatformKeyboardLayout for IosKeyboardLayout {
 }
 
 impl Platform for IosPlatform {
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        gpui::PlatformInfo {
+            os: gpui::OperatingSystem::Ios,
+            target: gpui::PlatformTarget::Native,
+        }
+    }
+
     fn on_system_sleep(&self, callback: Box<dyn FnMut()>) {
         log::debug!("UIKit has no system-power sleep notification; app pause is separate");
         SLEEP_CALLBACK.with(|slot| *slot.borrow_mut() = Some(callback));
@@ -252,6 +259,10 @@ impl Platform for IosPlatform {
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         Some(Rc::new(IosDisplay::main()))
+    }
+
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {
+        // UIKit does not expose an external-display observer through this backend.
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {

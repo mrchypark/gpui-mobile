@@ -107,11 +107,21 @@ impl MobileViewport {
         self.snapshot();
     }
 
+    fn cancel_contact(&mut self, id: u64) {
+        if self.contacts.remove(&id).is_some() {
+            let action = self.touch.cancel();
+            self.action(action);
+            self.snapshot();
+        }
+    }
+
     pub fn event(&mut self, event: &MobileEvent) {
         match event {
             MobileEvent::Insets(insets) => {
-                self.cancel();
-                self.insets = insets.clone();
+                if &self.insets != insets {
+                    self.cancel();
+                    self.insets = insets.clone();
+                }
             }
             MobileEvent::Lifecycle(AppLifecycle::Paused)
             | MobileEvent::Surface(SurfaceLifecycle::Lost) => self.cancel(),
@@ -141,7 +151,7 @@ impl MobileViewport {
                         self.snapshot();
                     }
                     TouchPhase::Cancelled => {
-                        self.cancel();
+                        self.cancel_contact(id);
                     }
                     _ => {}
                 }
@@ -184,7 +194,9 @@ pub fn self_check() {
         timestamp: Duration::ZERO,
     });
     assert_eq!(m.view, before); // no double zoom
+    let paused_view = m.view;
     m.event(&MobileEvent::Lifecycle(AppLifecycle::Paused));
+    assert_eq!(m.view, paused_view); // pause cancels input without resetting the viewport
     m.event(&event(1, TouchPhase::Ended, 42., 134.));
     assert_eq!(m.commits, 0);
     m.event(&event(3, TouchPhase::Started, 22., 134.));
@@ -232,12 +244,55 @@ pub fn self_check() {
     assert!(route.route(7, &event(13, TouchPhase::Started, 22., 134.)));
     assert!(route.route(7, &event(13, TouchPhase::Cancelled, 22., 134.)));
     assert!(!route.route(7, &event(14, TouchPhase::Started, 20., 20.))); // next gesture chooses again
+    let mut partial_route = GestureRoute::new(7);
+    partial_route.painted = m.canvas;
+    assert!(partial_route.route(7, &event(15, TouchPhase::Started, 22., 134.)));
+    assert!(partial_route.route(7, &event(16, TouchPhase::Started, 20., 20.)));
+    assert!(partial_route.route(7, &event(15, TouchPhase::Cancelled, 22., 134.)));
+    assert!(partial_route.route(7, &event(17, TouchPhase::Started, 20., 20.)));
+    assert!(partial_route.route(7, &event(16, TouchPhase::Ended, 20., 20.)));
+    assert!(partial_route.route(7, &event(18, TouchPhase::Started, 20., 20.))); // 17 remains active
+    assert!(partial_route.route(7, &event(17, TouchPhase::Ended, 20., 20.)));
+    assert!(partial_route.route(7, &event(18, TouchPhase::Ended, 20., 20.)));
+    assert!(!partial_route.route(7, &event(19, TouchPhase::Started, 20., 20.))); // all contacts released
     m.event(&event(20, TouchPhase::Started, 22., 134.));
     m.event(&event(21, TouchPhase::Started, 62., 134.));
+    let partial_start = (m.view, m.commits);
     m.event(&event(20, TouchPhase::Cancelled, 22., 134.));
+    assert_eq!(m.contacts.keys().copied().collect::<Vec<_>>(), vec![21]);
+    m.event(&event(21, TouchPhase::Moved, 82., 134.));
+    assert_eq!(m.view, partial_start.0); // partial cancellation blocks the remaining contact
+    m.event(&event(21, TouchPhase::Ended, 82., 134.));
     assert!(m.contacts.is_empty());
+    assert_eq!((m.view, m.commits), partial_start);
     m.event(&MobileEvent::Surface(SurfaceLifecycle::Lost));
     assert!(m.drag.is_none());
+    let mut unchanged_insets = MobileViewport::default();
+    unchanged_insets.canvas = m.canvas;
+    unchanged_insets.insets = WindowInsets {
+        safe_area: Edges {
+            top: px(24.),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    unchanged_insets.event(&event(50, TouchPhase::Started, 22., 134.));
+    unchanged_insets.event(&event(50, TouchPhase::Moved, 42., 134.));
+    let same = unchanged_insets.insets.clone();
+    unchanged_insets.event(&MobileEvent::Insets(same));
+    assert_eq!(unchanged_insets.contacts.len(), 1);
+    assert!(unchanged_insets.drag.is_some());
+    unchanged_insets.event(&event(50, TouchPhase::Moved, 52., 134.));
+    assert_eq!(unchanged_insets.view.x, -30.);
+    let mut changed = unchanged_insets.insets.clone();
+    changed.safe_area.top = px(25.);
+    unchanged_insets.event(&MobileEvent::Insets(changed));
+    assert!(unchanged_insets.contacts.is_empty());
+    assert!(unchanged_insets.drag.is_none());
+    assert_eq!(unchanged_insets.view.x, 0.);
+    unchanged_insets.event(&event(51, TouchPhase::Started, 22., 134.));
+    unchanged_insets.event(&event(51, TouchPhase::Moved, 32., 134.));
+    assert_eq!(unchanged_insets.view.x, -10.);
     let mut outside = MobileViewport::default();
     outside.canvas = m.canvas;
     outside.event(&event(30, TouchPhase::Started, 42., 144.));
@@ -297,7 +352,7 @@ impl GestureRoute {
                     self.active.remove(&event.id.0);
                 }
                 TouchPhase::Cancelled => {
-                    self.active.clear();
+                    self.active.remove(&event.id.0);
                 }
                 _ => {}
             },

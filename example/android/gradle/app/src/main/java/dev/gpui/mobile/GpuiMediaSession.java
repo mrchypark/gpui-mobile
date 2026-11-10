@@ -5,6 +5,8 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
@@ -42,6 +44,18 @@ public class GpuiMediaSession {
     private static NotificationManager sNotificationManager;
     private static Activity sActivity;
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    /** Receives notification and media-button intents for the active session. */
+    public static final class ButtonReceiver extends BroadcastReceiver {
+        @Override public void onReceive(Context context, Intent intent) {
+            MediaSessionCompat session = sSession;
+            if (session == null) {
+                Log.w(TAG, "Ignoring media button without an active session");
+                return;
+            }
+            MediaButtonReceiver.handleIntent(session, intent);
+        }
+    }
 
     private static final class MainOperation<T> implements Runnable {
         final Callable<T> operation;
@@ -284,28 +298,30 @@ public class GpuiMediaSession {
                     .addAction(new NotificationCompat.Action(
                             android.R.drawable.ic_media_previous,
                             "Previous",
-                            MediaButtonReceiver.buildMediaButtonPendingIntent(
-                                    sActivity, PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS)
+                            mediaButtonPendingIntent(PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS)
                     ))
                     // Play / Pause
                     .addAction(new NotificationCompat.Action(
                             isPlaying ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
                             isPlaying ? "Pause" : "Play",
-                            MediaButtonReceiver.buildMediaButtonPendingIntent(
-                                    sActivity, PlaybackStateCompat.ACTION_PLAY_PAUSE)
+                            mediaButtonPendingIntent(PlaybackStateCompat.ACTION_PLAY_PAUSE)
                     ))
                     // Next
                     .addAction(new NotificationCompat.Action(
                             android.R.drawable.ic_media_next,
                             "Next",
-                            MediaButtonReceiver.buildMediaButtonPendingIntent(
-                                    sActivity, PlaybackStateCompat.ACTION_SKIP_TO_NEXT)
+                            mediaButtonPendingIntent(PlaybackStateCompat.ACTION_SKIP_TO_NEXT)
                     ));
 
             sNotificationManager.notify(NOTIFICATION_ID, builder.build());
         } catch (Exception e) {
             Log.e(TAG, "Failed to update notification", e);
         }
+    }
+
+    private static PendingIntent mediaButtonPendingIntent(long action) {
+        ComponentName receiver = new ComponentName(sActivity, ButtonReceiver.class);
+        return MediaButtonReceiver.buildMediaButtonPendingIntent(sActivity, receiver, action);
     }
 
     /**

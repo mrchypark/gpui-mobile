@@ -44,33 +44,38 @@ fn visible_region(
 
 #[derive(Default)]
 pub struct RevealState {
-    previous: Option<(bool, Bounds<Pixels>, Option<Bounds<Pixels>>)>,
+    previous: Option<(Option<u8>, Bounds<Pixels>, Option<Bounds<Pixels>>)>,
 }
 
 impl RevealState {
+    /// Force the next focus acquisition to reveal, including the same field again.
+    pub fn focus_lost(&mut self) {
+        self.previous = None;
+    }
+
     fn changed(
         &mut self,
-        focused: bool,
+        focused: Option<u8>,
         frame: Bounds<Pixels>,
         keyboard: Option<Bounds<Pixels>>,
     ) -> bool {
         let current = (focused, frame, keyboard);
         let changed = self.previous != Some(current);
         self.previous = Some(current);
-        changed && focused && keyboard.is_some()
+        changed && focused.is_some() && keyboard.is_some()
     }
 
     /// Field position and scroll offset are deliberately not triggers: preserve manual scrolling.
     pub fn reveal(
         &mut self,
         scroll: &ScrollHandle,
-        focused: bool,
+        focused: Option<u8>,
         field: Bounds<Pixels>,
         keyboard: Option<Bounds<Pixels>>,
     ) -> bool {
         let frame = scroll.bounds();
         self.changed(focused, frame, keyboard)
-            && visible_region(focused, field, frame, keyboard)
+            && visible_region(focused.is_some(), field, frame, keyboard)
                 .is_some_and(|visible| reveal_in_bounds(scroll, field, visible))
     }
 }
@@ -103,28 +108,41 @@ pub fn self_check() {
             .bottom(),
         px(65.)
     );
+    let second_field = rect(12., 120., 276., 30.);
+    let second_keyboard = rect(50., 130., 180., 50.);
+    assert_eq!(
+        reveal_offset(
+            second_field,
+            visible_region(true, second_field, frame, Some(second_keyboard)).unwrap()
+        )
+        .y,
+        px(-20.)
+    );
     assert!(visible_region(true, field, frame, None).is_none());
     let revealed = rect(12., 40., 276., 30.);
     assert!(visible_region(true, revealed, frame, Some(keyboard)).is_none());
     assert!(visible_region(true, field, frame, Some(rect(0., 0., 300., 180.))).is_none());
     let mut state = RevealState::default();
-    assert!(state.changed(true, frame, Some(keyboard)));
-    assert!(!state.changed(true, frame, Some(keyboard)));
-    assert!(!state.changed(false, frame, Some(keyboard)));
-    assert!(state.changed(true, frame, Some(keyboard))); // focus acquired again
-    assert!(state.changed(true, frame, Some(moved)));
-    assert!(state.changed(true, frame, Some(resized)));
-    assert!(state.changed(true, rect(0., 0., 300., 160.), Some(resized)));
-    assert!(!state.changed(true, frame, None)); // hidden only resets state
-    assert!(state.changed(true, frame, Some(keyboard)));
+    assert!(state.changed(Some(0), frame, Some(keyboard)));
+    assert!(!state.changed(Some(0), frame, Some(keyboard)));
+    assert!(!state.changed(None, frame, Some(keyboard)));
+    assert!(state.changed(Some(0), frame, Some(keyboard))); // focus acquired again
+    assert!(state.changed(Some(1), frame, Some(keyboard))); // direct field switch
+    state.focus_lost();
+    assert!(state.changed(Some(1), frame, Some(keyboard))); // focus lost then reacquired
+    assert!(state.changed(Some(1), frame, Some(moved)));
+    assert!(state.changed(Some(1), frame, Some(resized)));
+    assert!(state.changed(Some(1), rect(0., 0., 300., 160.), Some(resized)));
+    assert!(!state.changed(Some(1), frame, None)); // hidden only resets state
+    assert!(state.changed(Some(1), frame, Some(keyboard)));
     let scroll = ScrollHandle::new();
     let mut state = RevealState::default();
-    state.reveal(&scroll, true, field, Some(keyboard));
+    state.reveal(&scroll, Some(0), field, Some(keyboard));
     let manual = point(px(0.), px(-55.));
     scroll.set_offset(manual);
-    assert!(!state.reveal(&scroll, true, rect(12., -80., 276., 30.), Some(keyboard)));
+    assert!(!state.reveal(&scroll, Some(0), rect(12., -80., 276., 30.), Some(keyboard)));
     assert_eq!(scroll.offset(), manual);
-    assert!(!state.reveal(&scroll, true, field, None));
+    assert!(!state.reveal(&scroll, Some(0), field, None));
     assert_eq!(scroll.offset(), manual);
 }
 

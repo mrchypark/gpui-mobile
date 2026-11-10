@@ -33,6 +33,11 @@ Android wiring is implemented in the example:
 - Required Android declarations and JNI keep rules are included. The app must
   request SCAN/CONNECT at runtime on API 31+, or fine location on API <=30.
   Location permission setup is described in [Location service integration](location-service-integration.md).
+- On the tested Samsung device, two scans without location permission returned
+  no discoveries, while a scan with fine and coarse location permission received
+  advertisements. An empty scan alone does not establish whether devices are
+  absent or filtered. Request location only when the application's use requires
+  it, and verify discovery with representative peripherals on each target device.
 - `src/packages/ble/java` is compiled in both modes; the upstream Java sources
   are included only in BLE mode. The pinned patched backend is checked in under
   `src/packages/ble/vendor`; preparation must preserve its matching Java ABI.
@@ -142,9 +147,87 @@ read/write/notify echo peripheral and `BLE_ECHO_SERVICE`,
 `BLE_ECHO_CHARACTERISTIC`, `BLE_ECHO_TEXT`. It exercises real scan, GATT exchange,
 reconnect after cache removal, and a stale disconnect event against a live new
 connection. Never run against an arbitrary device: it writes the requested text.
-No physical BLE transaction, permission dialog/Settings recovery, radio loss,
-pause/resume on a device, or notification delivery has been verified here.
+At that point, physical BLE transactions, permission dialog/Settings recovery,
+radio loss, pause/resume, and notification delivery had not been verified.
 The iOS simulator type check does not prove physical BLE availability.
+
+### Android GATT echo fixture
+
+`src/packages/ble/tests/echo_fixture.swift` is a temporary macOS CoreBluetooth
+peripheral. It exposes only the test service and a mutable echo characteristic.
+Restart it before each run to reset the initial value. From the repository root:
+
+```sh
+fixture=$(mktemp -d)/GPUIEcho.app
+mkdir -p "$fixture/Contents/MacOS"
+cp src/packages/ble/tests/echo_fixture_info.plist "$fixture/Contents/Info.plist"
+xcrun swiftc src/packages/ble/tests/echo_fixture.swift -o "$fixture/Contents/MacOS/GPUIEcho"
+codesign --force --sign - "$fixture"
+open -n "$fixture" --stdout /tmp/gpui-gatt-fixture.log --stderr /tmp/gpui-gatt-fixture.err
+```
+
+Wait for `ADVERTISING` in the log and allow Bluetooth access if prompted. Build
+the debug host with `-Pble=true -PprobeApplicationId=dev.gpui.mobile.bleprobe`
+and install it on the test device. Grant that test app Bluetooth scan/connect
+permission and, where needed for discovery, location permission. Launch:
+
+```sh
+adb shell am start -n dev.gpui.mobile.bleprobe/dev.gpui.mobile.GpuiActivity \
+  --es gpui.service_probe gatt-echo
+adb logcat -s gpui-mobile-example:I '*:S'
+```
+
+The debug probe connects only when exactly one device advertises its fixed test
+service. It checks read, write-with-response, notification, unsubscribe,
+disconnect, reconnect, and a second read. `GATT_ECHO` and `SERVICE_PROBE` log
+lines report the stages; a zero cleanup-error count is required. Stop the Mac
+fixture and uninstall the dedicated test app after the run. This does not test
+arbitrary peripherals.
+
+For the extended Android device check, restart the fixture, create its trigger
+directory, and launch the same app with `--es gpui.service_probe gatt-background`.
+After `GATT_ECHO background_ready=true`, send the app to the background. Once
+`background_paused=true service_running=true` appears, verify that another app is
+foreground and create `/tmp/gpui-gatt-fixture/background-trigger` on the Mac.
+The server sends a test notification and removes the trigger. After
+`background_notification=true foreground=false service_running=true`, bring the
+app forward so the probe can unsubscribe, reconnect, read, and close. A successful
+run also verifies the without-response write by reading the server's updated value.
+On 2026-11-09 this sequence passed on a Samsung Android device with the connected
+device foreground service running. It does not establish delivery after process
+death, prolonged suspension, or an OS/user stop.
+
+On 2026-11-09, the `gatt-survival` debug probe was also exercised on that device:
+it uses the same fixture and setup as `gatt-background`, waits up to 20 minutes
+in the background, and logs numbered notifications. Write an ASCII sequence
+number to the fixture's trigger file for each test notification. Bring the app
+forward for explicit cleanup. Device-wide forced Doze affects other apps and
+must be restored after testing.
+
+- Killing the test app process with SIGKILL removed the service and GATT
+  subscription. The fixture had no subscriber for a subsequent notification;
+  no automatic process or service restart was observed during the check.
+- Stopping only the service through the test app's UID destroyed the service.
+  The still-running process observed the lost service, but its existing GATT
+  subscription received one subsequent notification before explicit cleanup.
+  This is an observation, not a guarantee after service loss.
+- Android's `am stop-app` stopped the test process and service, and the fixture
+  observed subscription removal and no subscriber for a subsequent notification.
+- Forced deep Doze was sampled as `IDLE` with the connected-device foreground
+  service running for approximately 15 minutes 47 seconds. Six fixture
+  notifications, including the final one, were received in the background. The
+  device screen remained on and USB charging was active, so this is a forced
+  Doze test, not a natural screen-off sleep or a battery-life test. The force
+  flag and device state were restored afterward.
+- A second run kept the screen off and forced deep Doze for approximately
+  15 minutes 14 seconds while USB charging remained active. Six numbered
+  fixture notifications were received with the connected-device service active;
+  the force flag was cleared and the screen was woken afterward. This is still
+  forced Doze under charging, not natural unplugged sleep or battery-life evidence.
+
+These results do not establish recovery after Android independently kills a
+process under memory pressure, delivery during natural extended sleep, or
+automatic GATT reconnection. The service deliberately uses `START_NOT_STICKY`.
 
 ## Host executor usage
 

@@ -79,6 +79,15 @@ pub fn set_mobile_event_handler(handler: Option<EventHandler>) {
     });
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn clear_activity_handlers() {
+    EVENTS.with(|queue| queue.set_handler(None));
+    APP_LIFECYCLE.with(|queue| queue.set_handler(None));
+    MEMORY_WARNING.with(|queue| queue.set_handler(None));
+    OPEN_URLS.with(|queue| queue.set_handler(None));
+    THERMAL_CHANGE.with(|queue| queue.set_handler(None));
+}
+
 pub(crate) fn dispatch(window: u64, event: &MobileEvent) {
     dispatch_batch(window, [event.clone()]);
 }
@@ -343,28 +352,10 @@ fn finite(position: Point<Pixels>) -> bool {
     f32::from(position.x).is_finite() && f32::from(position.y).is_finite()
 }
 
-/// Actual window/entity identities for an opt-in editor (native GPUI thread only).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextInputOwner {
-    pub window: u64,
-    pub editor: u64,
-    pub activation: u64,
-}
+pub use mobile_ime_core::{Lease as TextInputLease, Owner as TextInputOwner};
 
-/// One focus activation. Release this exact lease on blur/disposal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextInputLease {
-    owner: TextInputOwner,
-    generation: u64,
-}
-
-#[derive(Default)]
-struct InputOwners {
-    generation: u64,
-    active: Option<TextInputLease>,
-}
 thread_local! {
-    static INPUT_OWNERS: std::cell::RefCell<InputOwners> = Default::default();
+    static INPUT_OWNERS: std::cell::RefCell<mobile_ime_core::Focus> = Default::default();
     static OWNER_QUERIES: std::cell::RefCell<Vec<(Option<TextInputOwner>, bool)>> = Default::default();
 }
 
@@ -372,13 +363,9 @@ thread_local! {
 pub fn activate_text_input_owner(owner: TextInputOwner) -> TextInputLease {
     let (lease, changed) = INPUT_OWNERS.with(|state| {
         let mut state = state.borrow_mut();
-        if let Some(lease) = state.active.filter(|lease| lease.owner == owner) {
-            return (lease, false);
-        }
-        state.generation = state.generation.checked_add(1).expect("IME activation exhausted");
-        let lease = TextInputLease { owner, generation: state.generation };
-        state.active = Some(lease);
-        (lease, true)
+        let old = state.current();
+        let lease = state.activate(owner);
+        (lease, old != Some(lease))
     });
     if changed {
         #[cfg(target_os = "android")]
@@ -389,12 +376,7 @@ pub fn activate_text_input_owner(owner: TextInputOwner) -> TextInputLease {
 
 /// Compare-and-clear: an old blur/disposal must not invalidate a newer activation.
 pub fn release_text_input_owner(lease: TextInputLease) {
-    let changed = INPUT_OWNERS.with(|state| {
-        let mut state = state.borrow_mut();
-        if state.active != Some(lease) { return false; }
-        state.active = None;
-        true
-    });
+    let changed = INPUT_OWNERS.with(|state| state.borrow_mut().release(lease));
     if changed {
         #[cfg(target_os = "android")]
         crate::android::jni::logical_input_owner_changed(false);
@@ -414,16 +396,13 @@ pub fn report_text_input_owner(owner: TextInputOwner, focused: bool, disabled: b
 }
 
 pub(crate) fn active_text_input_lease() -> Option<TextInputLease> {
-    INPUT_OWNERS.with(|state| state.borrow().active)
-}
-impl TextInputLease {
-    pub(crate) fn window(self) -> u64 { self.owner.window }
+    INPUT_OWNERS.with(|state| state.borrow().current())
 }
 
 pub(crate) fn bind_queried_text_input_owner(window: u64, accepts: bool, owner: Option<TextInputOwner>) {
     if let Some(owner) = owner.filter(|owner| accepts && owner.window == window) {
         activate_text_input_owner(owner);
-    } else if let Some(lease) = active_text_input_lease().filter(|lease| lease.window() == window) {
+    } else if let Some(lease) = active_text_input_lease().filter(|lease| lease.owner().window == window) {
         release_text_input_owner(lease);
         // Transition to an uninstrumented accepting handler preserves legacy behavior.
         // Old explicit traffic is already invalidated by the release/session change.
@@ -447,7 +426,7 @@ pub(crate) fn query_text_input_owner(query: impl FnOnce() -> bool) -> (bool, Opt
 }
 
 pub(crate) fn queried_owner_matches(lease: TextInputLease, owner: Option<TextInputOwner>) -> bool {
-    active_text_input_lease() == Some(lease) && owner == Some(lease.owner)
+    active_text_input_lease() == Some(lease) && owner == Some(lease.owner())
 }
 
 /// Gate the complete native event, not just text, against the retained handler.
@@ -542,8 +521,8 @@ mod owner_tests {
         let a = owner(1);
         let lease = activate_text_input_owner(a);
         let events = [
-            ImeInput::Compose { text: "ㅎ".into(), selection: 1..1 },
-            ImeInput::Compose { text: "한".into(), selection: 1..1 },
+            ImeInput::Compose { text: "ㅎ".into(), selection: 1..1, region: None },
+            ImeInput::Compose { text: "한".into(), selection: 1..1, region: None },
             ImeInput::Commit("한".into()), ImeInput::FinishComposition,
         ];
         for event in events.iter().cloned() {
@@ -570,7 +549,7 @@ mod owner_tests {
         let a = owner(1);
         let lease = activate_text_input_owner(a);
         let compose = verify_owned_ime(lease,
-            ImeInput::Compose { text: "한".into(), selection: 1..1 }, || {
+            ImeInput::Compose { text: "한".into(), selection: 1..1, region: None }, || {
                 report_text_input_owner(a, true, false); true
             });
         assert!(matches!(compose, Some(ImeInput::Compose { .. })));
@@ -592,12 +571,20 @@ mod owner_tests {
 #[derive(Clone, Debug)]
 pub(crate) enum ImeInput {
     Commit(String),
-    Compose { text: String, selection: std::ops::Range<usize> },
+    Compose {
+        text: String,
+        selection: std::ops::Range<usize>,
+        region: Option<ImeComposeRegion>,
+    },
     FinishComposition,
     Enter,
     Backspace,
     DeleteBefore { count: usize, codepoints: bool },
 }
+
+pub(crate) use mobile_ime_core::{
+    ime_compose_region_range, ime_delete_units, ImeComposeRegion, ImeComposeState,
+};
 
 /// JNI action conversion. Empty commits replace (and can delete) marked text.
 pub(crate) fn ime_action(action: i32, text: String) -> Option<ImeInput> {
@@ -626,22 +613,9 @@ pub(crate) fn ime_delete_request(
     }
 }
 
-/// Return a UTF-16 suffix length, refusing a split surrogate or insufficient context.
-pub(crate) fn ime_delete_units(text: &str, count: usize, codepoints: bool) -> Option<usize> {
-    if count == 0 {
-        return Some(0);
-    }
-    let mut units = 0;
-    for (index, character) in text.chars().rev().enumerate() {
-        units += character.len_utf16();
-        if codepoints && index + 1 == count || !codepoints && units == count {
-            return Some(units);
-        }
-        if !codepoints && units > count {
-            return None;
-        }
-    }
-    None
+/// Android password editors must not suggest or learn their contents.
+pub(crate) fn android_password_traits(flags: i32, options: i32, secure: bool) -> (i32, i32) {
+    if secure { (0x80000, options | 0x1000000) } else { (flags, options) }
 }
 
 pub(crate) fn android_input_traits(configuration: &gpui::TextInputConfiguration) -> (i32, i32) {
@@ -700,6 +674,48 @@ pub(crate) fn ios_input_traits(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn password_mode_disables_suggestions_and_personalized_learning() {
+        let (flags, options) = super::android_password_traits(0x8000, 6, true);
+        assert_eq!(flags, 0x80000);
+        assert_eq!(options, 6 | 0x1000000);
+        assert_eq!(super::android_password_traits(0x8000, 6, false), (0x8000, 6));
+    }
+    #[test]
+    fn compose_region_is_relative_to_a_collapsed_native_caret() {
+        let region = super::ImeComposeRegion {
+            text: "gpu".into(),
+            start_offset: -3,
+            end_offset: 0,
+        };
+        assert_eq!(super::ime_compose_region_range(&region, &(3..3)), Some(0..3));
+        assert_eq!(super::ime_compose_region_range(&region, &(4..4)), Some(1..4));
+        assert_eq!(super::ime_compose_region_range(&region, &(3..4)), None);
+        assert_eq!(super::ime_compose_region_range(&region, &(2..2)), None);
+    }
+
+    #[test]
+    fn compose_region_failure_blocks_only_the_stale_connection() {
+        let mut state = super::ImeComposeState::default();
+        state.set_region(7, 11, super::ImeComposeRegion {
+            text: "gpu".into(), start_offset: -3, end_offset: 0,
+        });
+        state.block(7, 11);
+        assert!(!state.accepts(7, 11));
+        assert!(state.accepts(7, 12));
+        assert!(state.take_region().is_none());
+    }
+
+    #[test]
+    fn compose_region_recovery_requires_current_owner() {
+        let mut state = super::ImeComposeState::default();
+        assert!(!state.reject_region(7, 11, false));
+        assert!(!state.accepts(7, 11));
+        assert!(state.reject_region(7, 12, true));
+        assert!(!state.accepts(7, 12));
+        assert!(state.accepts(7, 13));
+    }
+
     #[test]
     fn ime_deletion_preserves_utf16_and_codepoint_boundaries() {
         // Same request count, different native units: an emoji occupies two

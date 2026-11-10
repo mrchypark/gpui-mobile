@@ -7,20 +7,36 @@ publish = false
 # Independent lockfile and patches: the parent repository is not a workspace.
 [workspace]
 
+[features]
+ble = ["gpui-mobile/ble"]
+platform-smoke = []
+platform-extended = ["platform-smoke"]
+platform-device = ["platform-smoke"]
+lifecycle-stress = []
+ely-owner-reporter = []
+
 [lib]
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 gpui-mobile = { path = "../.." }
-gpui = { git = "https://github.com/zed-industries/zed", rev = "1a28cff4b409169bac058bca40dfbfeb7621d19b", default-features = false }
-# Verified published mobile fixes, retaining the common Zed GPUI revision.
-ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd", default-features = false }
+gpui = { package = "gpui-fast", version = "=0.1.12", default-features = false }
+gpui-kit = { version = "=0.8.1", default-features = false, features = ["component", "gpui-fast"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "3ad7ee44e15c8ca1d8de24017a9cb2362bbc8e47", default-features = false }
 # Devices cannot read Ely assets from the build machine's filesystem in debug builds.
 rust-embed = { version = "8.12", features = ["debug-embed"] }
 
+[dev-dependencies]
+gpui = { package = "gpui-fast", version = "=0.1.12", features = ["test-support"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "3ad7ee44e15c8ca1d8de24017a9cb2362bbc8e47", features = ["test-support"] }
+naga = { version = "=30.0.1", features = ["wgsl-in"] }
+
 # Cargo only honors patches at the invoking workspace root.
 [patch.crates-io]
-async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+gpui-fast = { path = "../../vendor/gpui-fast" }
+gpui-fast-wgpu = { path = "../../vendor/gpui-fast-wgpu" }
+gpui-pre = { path = "../../vendor/gpui-pre" }
+gpui-pre-wgpu = { path = "../../vendor/gpui-pre-wgpu" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }

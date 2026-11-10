@@ -76,6 +76,8 @@ void gpui_ios_handle_touch(void* window_ptr, void* touch_ptr, void* event_ptr);
 /// This should be called from CADisplayLink callback.
 /// The window_ptr should be the value returned by gpui_ios_get_window().
 void gpui_ios_request_frame(void* window_ptr);
+bool gpui_ios_request_frame_if_needed(void* window_ptr);
+void gpui_ios_set_frame_waker(void* window_ptr, void (*waker)(void*), void* context);
 
 /// Get the most recently created GPUI window pointer.
 ///
@@ -124,12 +126,17 @@ void gpui_ios_handle_text_input(void* window_ptr, void* text_ptr);
 
 /// Handle a key event from an external keyboard.
 ///
+/// Call this from the app delegate after UIKit has offered the press to the
+/// focused responder. This keeps text input and IME behavior intact.
+///
 /// Parameters:
 /// - window_ptr: Pointer to the IosWindow
 /// - key_code: The key code from UIKeyboardHIDUsage
 /// - modifiers: Modifier flags from UIKeyModifierFlags
+/// - unmodified: UTF-8 charactersIgnoringModifiers (nullable)
+/// - characters: UTF-8 characters produced by the key (nullable)
 /// - is_key_down: true for key down, false for key up
-void gpui_ios_handle_key_event(void* window_ptr, uint32_t key_code, uint32_t modifiers, _Bool is_key_down);
+void gpui_ios_handle_key_event(void* window_ptr, uint32_t key_code, uint32_t modifiers, const char* unmodified, const char* characters, _Bool is_key_down);
 
 /// Called when the app receives a URL to open (deep link).
 /// Parameters:

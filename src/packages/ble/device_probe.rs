@@ -21,7 +21,7 @@ pub extern "system" fn Java_dev_gpui_mobile_GpuiServiceProbe_nativeForeground(
 pub extern "system" fn Java_dev_gpui_mobile_GpuiServiceProbe_nativeRun(
     _: *mut std::ffi::c_void, _: *mut std::ffi::c_void, mode: i32,
 ) {
-    if !matches!(mode, 1 | 2 | 3 | 4) || BUSY.swap(true, Ordering::SeqCst) { return; }
+    if !matches!(mode, 1 | 2 | 3 | 4 | 5 | 6 | 7) || BUSY.swap(true, Ordering::SeqCst) { return; }
     if std::thread::Builder::new().name("gpui-service-probe".into()).spawn(move || {
         let _running = Running;
         log::info!("SERVICE_PROBE begin mode={mode}");
@@ -32,7 +32,7 @@ pub extern "system" fn Java_dev_gpui_mobile_GpuiServiceProbe_nativeRun(
 }
 
 fn run(mode: i32) -> Result<(), &'static str> {
-    let permission = if mode == 1 || mode == 4 { permissions::Permission::Bluetooth }
+    let permission = if mode == 1 || mode == 4 || mode == 5 || mode == 6 || mode == 7 { permissions::Permission::Bluetooth }
         else { permissions::Permission::LocationWhenInUse };
     let status = permissions::request_permission(permission).map_err(|_| "permission_request")?;
     log::info!("SERVICE_PROBE permission mode={mode} status={status:?}");
@@ -60,7 +60,121 @@ fn run(mode: i32) -> Result<(), &'static str> {
     }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()
         .map_err(|_| "runtime")?;
-    if mode == 4 { runtime.block_on(beacons()) } else { runtime.block_on(scan()) }
+    if mode == 5 || mode == 6 || mode == 7 { runtime.block_on(gatt_echo(mode)) }
+    else if mode == 4 { runtime.block_on(beacons()) } else { runtime.block_on(scan()) }
+}
+
+async fn gatt_echo(mode: i32) -> Result<(), &'static str> {
+    let background = mode == 6 || mode == 7;
+    const SERVICE: &str = "928d3811-55b1-4af2-a9e7-1b0c6ac20488";
+    const CHARACTERISTIC: &str = "928d3812-55b1-4af2-a9e7-1b0c6ac20488";
+    let service = SERVICE.parse().map_err(|_| "service_uuid")?;
+    let mut ble = Ble::new(Permission::Granted, Duration::from_secs(15)).await.map_err(|_| "ble_open")?;
+    let outcome = async {
+        let rows = ble.scan_for(ScanOptions { filter: ScanFilter { services: vec![service] },
+            duration: Duration::from_secs(8), ..Default::default() }).await.map_err(|_| "scan")?;
+        if rows.len() != 1 { return Err("fixture_not_unique"); }
+        let id = rows[0].id.clone();
+        log::info!("GATT_ECHO fixture_unique=true");
+        ble.connect(&id).await.map_err(|_| "connect")?;
+        let services = ble.discover().await.map_err(|_| "discover")?;
+        let characteristic = services.iter().flat_map(|s| &s.characteristics)
+            .find(|c| c.service_uuid == service && c.uuid.to_string() == CHARACTERISTIC)
+            .cloned().ok_or("characteristic")?;
+        log::info!("GATT_ECHO connected=true discovered=true");
+        let initial = ble.read(&characteristic).await.map_err(|_| "initial_read")?;
+        if initial != b"initial" { return Err("initial_value"); }
+        let mut values = ble.notifications().await.map_err(|_| "notification_stream")?;
+        ble.subscribe(&characteristic).await.map_err(|_| "subscribe")?;
+        let payload = b"gpui-echo-fixture";
+        ble.write(&characteristic, payload, super::WriteType::WithResponse).await.map_err(|_| "write")?;
+        let notification = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(value) = values.next().await {
+                if value.service_uuid == service && value.uuid == characteristic.uuid { return Some(value.value); }
+            }
+            None
+        }).await.map_err(|_| "notification_timeout")?.ok_or("notification_closed")?;
+        if notification != payload { return Err("notification_value"); }
+        if ble.read(&characteristic).await.map_err(|_| "read")? != payload { return Err("read_value"); }
+        log::info!("GATT_ECHO read=true write=true notification=true");
+        if background {
+            let no_response = b"gpui-no-response";
+            ble.write(&characteristic, no_response, super::WriteType::WithoutResponse).await.map_err(|_| "write_without_response")?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if ble.read(&characteristic).await.map_err(|_| "read_without_response")? == no_response { break; }
+                if Instant::now() >= deadline { return Err("write_without_response_value"); }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            log::info!("GATT_ECHO without_response_readback=true");
+            ble.enable_background_connected().await.map_err(|_| "background_enable")?;
+            log::info!("GATT_ECHO background_ready=true");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while FOREGROUND.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline { return Err("background_transition_timeout"); }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !ble.pause().await.is_empty() { return Err("background_pause"); }
+            ble.check_background().map_err(|_| "background_service")?;
+            log::info!("GATT_ECHO background_paused=true service_running=true");
+            if mode == 7 {
+                let deadline = Instant::now() + Duration::from_secs(1200);
+                let mut context_lost = false;
+                log::info!("GATT_SURVIVAL ready=true");
+                while !FOREGROUND.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    if ble.check_background().is_err() && !context_lost {
+                        context_lost = true;
+                        log::info!("GATT_SURVIVAL service_lost=true");
+                    }
+                    let next = tokio::time::timeout(Duration::from_secs(1), values.next()).await;
+                    if matches!(next, Ok(None)) { return Err("notification_closed"); }
+                    if let Ok(Some(value)) = next {
+                        if value.service_uuid == service && value.uuid == characteristic.uuid {
+                            if let Ok(text) = std::str::from_utf8(&value.value) {
+                                if let Some(sequence) = text.strip_prefix("gpui-survival:") {
+                                    if sequence.bytes().all(|b| b.is_ascii_digit()) && sequence.len() <= 6 {
+                                        log::info!("GATT_SURVIVAL notification={} foreground=false service_running={}", sequence, !context_lost);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if context_lost { return Err("background_service_lost"); }
+                if !FOREGROUND.load(Ordering::SeqCst) { return Err("survival_timeout"); }
+                ble.resume(Permission::Granted).map_err(|_| "resume")?;
+            } else {
+            let received = tokio::time::timeout(Duration::from_secs(30), async {
+                while let Some(value) = values.next().await {
+                    if value.service_uuid == service && value.uuid == characteristic.uuid && value.value == b"gpui-background-push" { return true; }
+                }
+                false
+            }).await.map_err(|_| "background_notification_timeout")?;
+            if !received || FOREGROUND.load(Ordering::SeqCst) { return Err("background_notification_state"); }
+            ble.check_background().map_err(|_| "background_service_after_notification")?;
+            log::info!("GATT_ECHO background_notification=true foreground=false service_running=true");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !FOREGROUND.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline { return Err("foreground_resume_timeout"); }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            ble.resume(Permission::Granted).map_err(|_| "resume")?;
+            }
+        }
+        ble.unsubscribe(&characteristic).await.map_err(|_| "unsubscribe")?;
+        ble.disconnect().await.map_err(|_| "disconnect")?;
+        let fresh = ble.reconnect(&id).await.map_err(|_| "reconnect")?;
+        let characteristic = fresh.iter().flat_map(|s| &s.characteristics)
+            .find(|c| c.service_uuid == service && c.uuid.to_string() == CHARACTERISTIC).ok_or("rediscover")?;
+        let expected: &[u8] = if background { b"gpui-no-response" } else { payload };
+        if ble.read(characteristic).await.map_err(|_| "reconnect_read")? != expected { return Err("reconnect_value"); }
+        ble.disconnect().await.map_err(|_| "final_disconnect")?;
+        log::info!("GATT_ECHO unsubscribe=true reconnect=true final_read=true disconnect=true");
+        Ok(())
+    }.await;
+    let cleanup = ble.close().await;
+    log::info!("GATT_ECHO close_errors={}", cleanup.len());
+    if cleanup.is_empty() { outcome } else { Err("close") }
 }
 
 // BEGIN standalone beacon checks
@@ -206,6 +320,7 @@ async fn scan() -> Result<(), &'static str> {
             }
         }
         log::info!("SERVICE_PROBE ble discovered_events={discoveries} foreground={}", FOREGROUND.load(Ordering::SeqCst));
+        if !FOREGROUND.load(Ordering::SeqCst) { return Err("scan_host_paused"); }
         Ok(())
     }.await;
     // Always attempt both stop_scan and disconnect, including error/foreground exit.

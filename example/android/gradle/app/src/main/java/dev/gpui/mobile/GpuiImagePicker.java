@@ -73,7 +73,7 @@ public final class GpuiImagePicker {
             } else {
                 throw new IllegalArgumentException("Unknown image source");
             }
-            return GpuiPickerActivity.launch(activity, intent, true, capture);
+            return GpuiPickerActivity.launch(activity, intent, true, capture, GpuiPickerActivity.KIND_IMAGE);
         } catch (IOException error) {
             throw new IllegalStateException("Cannot prepare camera output", error);
         } finally {

@@ -67,16 +67,24 @@
 
 // ── Re-export the gpui crate so consumers can access types through us ────────
 
+pub use futures;
 pub use gpui;
 
 // ── shared modules ───────────────────────────────────────────────────────────
 
 pub mod components;
+#[allow(dead_code)]
+pub(crate) mod fling_guard;
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) mod frame_demand;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) mod frame_pacer;
 mod mobile_dispatch;
 pub mod mobile_events;
 pub mod momentum;
 pub mod packages;
 pub mod platform_view;
+pub mod render_request;
 pub mod target_platform;
 
 // ── System chrome (status bar / navigation bar) styling ──────────────────────
@@ -153,6 +161,17 @@ type TextInputCallbackFn = Box<dyn FnMut(&str)>;
 /// which in turn calls `drain_pending_text()` and updates the UI.
 pub static TEXT_INPUT_DIRTY: AtomicBool = AtomicBool::new(false);
 
+/// Marks text input as waiting and asks the platform for the frame that will
+/// process it — a host that paused its frame source on an idle screen has
+/// to be woken, since typing does not go through GPUI's invalidator.
+pub(crate) fn mark_text_input_dirty() {
+    TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+    #[cfg(target_os = "ios")]
+    ios::ffi::wake_windows();
+    #[cfg(target_os = "android")]
+    android::frame_source::wake();
+}
+
 /// Register a callback that receives text from the software keyboard.
 ///
 /// Only one callback can be active at a time. Call with `None` to clear it.
@@ -169,7 +188,7 @@ pub fn set_text_input_callback(callback: Option<TextInputCallbackFn>) {
 pub fn dispatch_text_input(text: &str) -> bool {
     let handled = mobile_dispatch::dispatch_text(text);
     if handled {
-        TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+        mark_text_input_dirty();
     }
     handled
 }
@@ -270,7 +289,7 @@ pub fn set_keyboard_height(height: f32) {
     let prev = f32::from_bits(KEYBOARD_HEIGHT_BITS.load(Ordering::Relaxed));
     if (prev - height).abs() > 0.5 {
         KEYBOARD_HEIGHT_BITS.store(height.to_bits(), Ordering::Release);
-        TEXT_INPUT_DIRTY.store(true, Ordering::Release);
+        mark_text_input_dirty();
     }
 }
 

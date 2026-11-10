@@ -110,6 +110,8 @@ public final class GpuiInsets implements View.OnAttachStateChangeListener,
 
     private static View findSurface(View view) {
         if (view instanceof SurfaceView) return view;
+        // NativeActivity draws into the window, while its content view shrinks for the IME.
+        if (view.getClass().getName().equals("android.app.NativeActivity$NativeContentView")) return view.getRootView();
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
             for (int i = 0; i < group.getChildCount(); i++) {

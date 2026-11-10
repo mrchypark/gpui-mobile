@@ -7,10 +7,21 @@
     <!-- Foreground location; runtime authorization remains application-owned. -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.WRITE_CONTACTS" />
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <application android:label="Ely Integration" android:hasCode="true"
@@ -18,6 +29,10 @@
         <meta-data android:name="com.google.android.geo.API_KEY" android:value="${mapsApiKey}" />
         <service android:name="dev.gpui.mobile.GpuiLocationService"
             android:exported="false" android:foregroundServiceType="location" />
+        <service android:name="org.gpui.mobile.ble.BleConnectionService"
+            android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <receiver android:name="dev.gpui.mobile.GpuiMediaSession$ButtonReceiver"
+            android:exported="false" />
         <provider android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.gpui.picker.files"
             android:exported="false" android:grantUriPermissions="true">
@@ -37,6 +52,9 @@
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <activity android:name="dev.gpui.mobile.GpuiPermissionActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity android:name="dev.gpui.mobile.GpuiAuthActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <activity android:name="dev.gpui.mobile.GpuiActivity"

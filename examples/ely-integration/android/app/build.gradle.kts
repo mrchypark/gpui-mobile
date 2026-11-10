@@ -1,6 +1,15 @@
 plugins { id("com.android.application") }
 val repo = rootProject.file("../../..")
 val host = repo.resolve("example/android/gradle/app/src/main")
+val bleEnabled = providers.gradleProperty("ble").map(String::toBoolean).getOrElse(false)
+val bleJava = layout.buildDirectory.dir("ble")
+val prepareBleJava = tasks.register<Exec>("prepareBleJava") {
+    onlyIf { bleEnabled }
+    commandLine("sh", repo.resolve("src/packages/ble/prepare-android.sh"), bleJava.get().asFile)
+    inputs.files(fileTree(repo.resolve("src/packages/ble")))
+    outputs.dir(bleJava)
+}
+tasks.named("preBuild") { if (bleEnabled) dependsOn(prepareBleJava) }
 android {
     // Existing host Java imports this BuildConfig; the installed app ID is distinct.
     namespace = "dev.gpui.mobile.example"
@@ -8,6 +17,7 @@ android {
     buildFeatures { buildConfig = true }
     defaultConfig {
         applicationId = "dev.gpui.mobile.ely"
+        testInstrumentationRunner = "dev.gpui.mobile.example.ActivityLifecycleTest"
         minSdk = 26
         targetSdk = 34
         versionCode = 1
@@ -15,7 +25,7 @@ android {
         manifestPlaceholders["mapsApiKey"] = providers.gradleProperty("mapsApiKey")
             .orElse(providers.environmentVariable("MAPS_API_KEY"))
             .getOrElse("")
-        buildConfigField("boolean", "BLE_ENABLED", "false")
+        buildConfigField("boolean", "BLE_ENABLED", bleEnabled.toString())
         ndk { abiFilters += "arm64-v8a" }
     }
     buildTypes { debug { isDebuggable = true; isJniDebuggable = true } }
@@ -25,6 +35,7 @@ android {
     }
     sourceSets.getByName("main") {
         java.srcDirs(host.resolve("java"), repo.resolve("src/packages/ble/java"))
+        if (bleEnabled) java.srcDir(bleJava.get().dir("btleplug-0.13.5/src/droidplug/java/src/main/java").asFile)
         res.srcDir(host.resolve("res"))
         assets.srcDir(host.resolve("assets"))
         jniLibs.srcDir(rootProject.file("../android-build/jniLibs"))

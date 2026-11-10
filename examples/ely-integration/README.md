@@ -1,5 +1,61 @@
 # Native Ely mobile viewport
 
+The integration uses GPUI Kit 0.8.1, GPUI Fast 0.1.12, and a pinned public
+Ely fork revision. Cargo applies the local Fast overrides in the application
+workspace; dependencies do not inherit patches from other manifests.
+
+Earlier validation records below describe previous dependency snapshots and do
+not validate the current one.
+
+## Android Activity recreation regression
+
+Build with `GPUI_LIFECYCLE_STRESS=1` to add a delayed timer and an external
+thread wake to each Activity. Install the debug app and its Android test APK,
+then run the `recreate_stress` instrumentation scenario. The test recreates
+the Activity three times in the same process, waits for the old tasks' wakeups,
+and verifies that the last native window is ready. The separate `background`
+scenario checks foreground restoration without recreation.
+
+```sh
+GPUI_LIFECYCLE_STRESS=1 ./examples/ely-integration/android-apk.sh
+./example/android/gradle/gradlew -p examples/ely-integration/android :app:assembleDebugAndroidTest
+adb install -r examples/ely-integration/android-build/ely-integration-arm64-debug.apk
+adb install -r examples/ely-integration/android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb shell am instrument -w -e scenario recreate_stress dev.gpui.mobile.ely.test/dev.gpui.mobile.example.ActivityLifecycleTest
+```
+
+The app's `android_main` must retain its `init_platform` return value until
+`Application::run` returns. The session cancels Activity-local foreground tasks
+before releasing the native thread. Do not bypass the GPUI foreground executor
+with its hidden raw scheduler for tasks that can outlive an Activity.
+
+## Opt-in platform smoke checks
+
+Set `GPUI_PLATFORM_SMOKE=1` when running `android-apk.sh` or
+`ios-simulator.sh` to check package and device information, battery availability,
+the camera permission status, cache directory, and an isolated preferences
+write/read/remove. The app writes `gpui-platform-smoke.txt` in its cache directory.
+The connectivity API is invoked but its result is not independently validated.
+The checks do not request permissions or read user content; a battery value of
+`-1` is reported as skipped. These checks do not cover camera capture, sensors,
+media, sharing, notifications, or network reachability.
+
+Set `GPUI_PLATFORM_EXTENDED=1` for additional sensor samples, location-service
+and camera discovery, and silent audio and video playback using generated or
+bundled test media. Camera session creation and a current location fix run only
+when the test app already has the corresponding permissions; coordinates are
+not written to the results. Results are in `gpui-platform-extended.txt` in the
+app cache. Unavailable hardware is reported as skipped. This does not test
+camera capture, notification delivery, Bluetooth, or permission prompts.
+
+On Android, `GPUI_PLATFORM_DEVICE=1` instead requests camera and notification
+permissions, attempts a low-resolution photo, removes the resulting test image,
+and posts a temporary notification for 20 seconds before canceling it. Inspect
+`gpui-platform-device.txt` in the app cache and independently check the OS
+notification list. Permission results report the final status; only a fresh
+permission prompt tests the request UI. The camera and notification checks can
+fail if the activity is not in the foreground.
+
 A small native app using actual Ely Button/Input/InfiniteCanvas components,
 mobile OS events, and one GPUI dependency graph. No network client or TLS bypass.
 
@@ -42,18 +98,23 @@ assemble a signed debug APK. It reuses the repository's NativeActivity Java,
 resources and assets without copying or changing that host. Generated staging
 and Gradle outputs are ignored.
 
+BLE is enabled by default in this Android build, including its matching Java
+backend and foreground-service declaration. Set `GPUI_MOBILE_BLE=0` to omit it.
+Android permissions are requested by the application when needed, not granted
+by the manifest declarations.
+
 The distinct output is `android-build/ely-integration-arm64-debug.apk` beneath
 this example, with application ID `dev.gpui.mobile.ely`, label `Ely Integration`,
 and native library `gpui_mobile_ely_integration`. This is the Ely UI, not the
-BLE demo. The manifest requests no network or BLE permissions. The reused host's
-BLE initialization is disabled.
+BLE demo. The manifest declares network and BLE permissions; runtime permissions
+still require the user's grant.
 
 The final arm64 cdylib and debug APK built successfully on 2026-10-15. Manifest,
 NativeActivity/JNI exports and APK v2 debug signature verification passed; see
 `evidence/native-android.txt` for hashes and commands. AndroidX adds biometric,
 fingerprint and internal receiver permissions through manifest merging.
 
-## Source identity
+## Historical source identity (2026-10-15)
 
 - Ely: published `https://github.com/mrchypark/Ely-GPUI-Components`,
   `7f6a3f91ceb6e6f6c2dbf4e43d49e01201e384cd`.
@@ -63,11 +124,12 @@ fingerprint and internal receiver permissions through manifest merging.
 `evidence/source-identity*.json` records actual Cargo metadata package IDs and
 full sources for both iOS and Android. Exactly one of each package was found;
 the identities match between targets. `evidence/*-ios.txt` and
-`evidence/gpui-android.txt` are active locked dependency trees.
+`evidence/gpui-android.txt` are historical dependency trees, not the current lockfile.
+Local checkout paths in the restored evidence are redacted.
 
 This is an independent workspace/lockfile. The app root repeats the existing
 async-task patch because dependency manifest patches are ignored. The lock
-uses libc 0.2.189 to avoid the libc 0.2.190/backtrace iOS `_dyld_*` regression.
+uses libc 0.2.191 for the Android arm64 ABI fix and iOS `_dyld_*` declarations.
 No root/desktop lock change is required.
 
 ## Actual event wiring
@@ -162,3 +224,8 @@ the Application for its lifetime. No second platform is constructed.
 Android runtime validation is unavailable: elevated `adb devices` found no
 connected device, and the SDK emulator executable is absent. The keyboard
 assertions executed on iOS as described above; Android runtime remains unverified.
+
+The optional `ely-owner-reporter` feature registers Ely's app-wide input-owner
+reporter for every text input. The pinned Ely revision includes
+`forms::set_input_owner_reporter`. Enable this feature for compound controls as
+well as individually configured inputs.

@@ -36,6 +36,9 @@ This example uses the [`android-activity`](https://crates.io/crates/android-acti
 crate (with the `native-activity` feature) instead of hand-rolled JNI/NDK glue.
 The crate exports `ANativeActivity_onCreate` automatically and calls the
 user-defined `android_main(app: AndroidApp)` function on a dedicated native thread.
+Keep the value returned by `jni::init_platform(&app)` until the event loop and
+GPUI application have returned. Dropping it releases that Activity's platform;
+the next Activity creates a new session on its own native thread.
 
 ```
 Android OS loads libgpui_mobile_example.so via NativeActivity
@@ -43,7 +46,7 @@ Android OS loads libgpui_mobile_example.so via NativeActivity
   └─ ANativeActivity_onCreate()           (android-activity crate)
        └─ android_main(app)               (main.rs — YOUR CODE)
             ├─ init logger + panic hook
-            ├─ jni::init_platform(&app)
+            ├─ let _platform_session = jni::init_platform(&app)
             │    └─ Creates AndroidPlatform + stores global state
             ├─ platform.set_on_init_window(callback)
             │    └─ Deferred — runs when native surface is ready

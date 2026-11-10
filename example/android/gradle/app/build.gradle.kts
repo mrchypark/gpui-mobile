@@ -45,7 +45,7 @@ android {
     buildFeatures { buildConfig = true }
 
     defaultConfig {
-        applicationId = "dev.gpui.mobile.example"
+        applicationId = providers.gradleProperty("probeApplicationId").getOrElse("dev.gpui.mobile.example")
         minSdk = 26          // Vulkan 1.0 is mandatory from API 26+
         targetSdk = 34
         versionCode = 1

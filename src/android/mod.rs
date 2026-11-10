@@ -149,6 +149,12 @@ pub fn size<T>(width: T, height: T) -> Size<T> {
 
 // ── sub-modules ──────────────────────────────────────────────────────────────
 
+// Android NDK arm64 places uc_mcontext at byte 176; older libc releases omit padding.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(std::mem::offset_of!(libc::ucontext_t, uc_mcontext) == 176);
+
+mod accessibility;
+mod accesskit_adapter;
 pub mod dispatcher;
 pub mod display;
 pub mod jni;
@@ -249,3 +255,4 @@ pub fn init_logger() {
         log::info!("gpui-android logger initialised");
     });
 }
+pub(crate) mod frame_source;

@@ -149,6 +149,10 @@
 #endif
 @end
 
+#ifdef USE_GPUI_RUST
+static void GPUIResumeFrames(void *context);
+#endif
+
 @implementation GPUIAppDelegate
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
@@ -185,6 +189,7 @@
         // Setup CADisplayLink to drive rendering
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(renderFrame)];
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        gpui_ios_set_frame_waker(self.gpuiWindow, GPUIResumeFrames, (__bridge void *)self);
         NSLog(@"CADisplayLink started for GPUI rendering");
     } else {
         NSLog(@"Warning: No GPUI window was created");
@@ -204,9 +209,49 @@
 
 #ifdef USE_GPUI_RUST
 - (void)renderFrame {
-    if (self.gpuiWindow) {
-        gpui_ios_request_frame(self.gpuiWindow);
+    if (self.gpuiWindow && !gpui_ios_request_frame_if_needed(self.gpuiWindow)) {
+        self.displayLink.paused = YES;
     }
+}
+
+static void GPUIResumeFrames(void *context) {
+    GPUIAppDelegate *delegate = (__bridge GPUIAppDelegate *)context;
+    delegate.displayLink.paused = NO;
+}
+
+// The focused text view handles IME and text first. Presses that reach the end
+// of the responder chain are app-level physical-key events.
+- (void)forwardHardwareKeyPresses:(NSSet<UIPress *> *)presses keyDown:(BOOL)isKeyDown {
+    if (!self.gpuiWindow) {
+        return;
+    }
+    for (UIPress *press in presses) {
+        UIKey *key = press.key;
+        if (!key) {
+            continue;
+        }
+        gpui_ios_handle_key_event(self.gpuiWindow,
+                                  (uint32_t)key.keyCode,
+                                  (uint32_t)key.modifierFlags,
+                                  key.charactersIgnoringModifiers.UTF8String,
+                                  key.characters.UTF8String,
+                                  isKeyDown);
+    }
+}
+
+- (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self forwardHardwareKeyPresses:presses keyDown:YES];
+    [super pressesBegan:presses withEvent:event];
+}
+
+- (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self forwardHardwareKeyPresses:presses keyDown:NO];
+    [super pressesEnded:presses withEvent:event];
+}
+
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self forwardHardwareKeyPresses:presses keyDown:NO];
+    [super pressesCancelled:presses withEvent:event];
 }
 #endif
 
@@ -219,6 +264,7 @@
     if (!self.displayLink && self.gpuiWindow) {
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(renderFrame)];
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        gpui_ios_set_frame_waker(self.gpuiWindow, GPUIResumeFrames, (__bridge void *)self);
     }
 #endif
 }
@@ -255,6 +301,7 @@
 
     // Pause display link when going to background to save power
     if (self.displayLink) {
+        gpui_ios_set_frame_waker(self.gpuiWindow, NULL, NULL);
         [self.displayLink invalidate];
         self.displayLink = nil;
     }

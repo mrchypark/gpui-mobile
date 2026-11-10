@@ -12,6 +12,9 @@ import android.content.Context;
  */
 public final class GpuiClipboard {
 
+    static final long MAX_IMPORT_BYTES = 64L * 1024L * 1024L;
+    static final long MAX_IMAGE_BYTES = 8L * 1024L * 1024L;
+
     /**
      * Copy text to the clipboard.
      *
@@ -118,9 +121,26 @@ public final class GpuiClipboard {
         if (parent != null && parent.exists() && !parent.delete()) android.util.Log.w("GpuiClipboard", "Cannot remove owned clipboard staging directory");
     }
     private static void copy(java.io.InputStream in, java.io.OutputStream out) throws java.io.IOException {
+        copy(in, out, Long.MAX_VALUE);
+    }
+    static long copy(java.io.InputStream in, java.io.OutputStream out, long limit) throws java.io.IOException {
         if (in == null) throw new java.io.IOException("Clipboard provider returned no stream");
+        if (limit < 0) throw new java.io.IOException("Invalid clipboard import limit");
         byte[] buffer = new byte[32768]; int size;
-        while ((size = in.read(buffer)) != -1) out.write(buffer, 0, size);
+        long total = 0;
+        while ((size = in.read(buffer)) != -1) {
+            if (size == 0) throw new java.io.IOException("Clipboard provider made no progress");
+            if (size > limit - total) throw new java.io.IOException("Clipboard import exceeds size limit");
+            out.write(buffer, 0, size); total += size;
+        }
+        return total;
+    }
+    static long copyToFile(java.io.InputStream in, java.io.File output, long limit) throws java.io.IOException {
+        try (java.io.OutputStream out = new java.io.FileOutputStream(output)) {
+            return copy(in, out, limit);
+        } catch (java.io.IOException | RuntimeException error) {
+            discard(output); throw error;
+        }
     }
     private static android.net.Uri uri(Activity activity, java.io.File file) {
         return androidx.core.content.FileProvider.getUriForFile(activity,
@@ -188,6 +208,8 @@ public final class GpuiClipboard {
         try {
             java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
             java.io.DataOutputStream out = new java.io.DataOutputStream(bytes);
+            long remaining = MAX_IMPORT_BYTES;
+            long imageRemaining = MAX_IMAGE_BYTES;
             out.writeInt(clip.getItemCount());
             for (int index = 0; index < clip.getItemCount(); index++) {
                 ClipData.Item item = clip.getItemAt(index);
@@ -208,7 +230,10 @@ public final class GpuiClipboard {
                         mime = canonicalImageMime(mime);
                         extension(mime); // Reject unsupported formats, never mislabel bytes.
                         java.io.ByteArrayOutputStream imageBytes = new java.io.ByteArrayOutputStream();
-                        try (java.io.InputStream input = activity.getContentResolver().openInputStream(uri)) { copy(input, imageBytes); }
+                        try (java.io.InputStream input = activity.getContentResolver().openInputStream(uri)) {
+                            long size = copy(input, imageBytes, Math.min(remaining, imageRemaining));
+                            remaining -= size; imageRemaining -= size;
+                        }
                         out.writeByte(1); string(out, mime); field(out, imageBytes.toByteArray());
                     } else {
                         String name = "clipboard-file";
@@ -221,8 +246,9 @@ public final class GpuiClipboard {
                         name = name.replaceAll("[/\\\\\\p{Cntrl}]", "_");
                         if (name.isEmpty() || name.equals(".") || name.equals("..")) name = "clipboard-file";
                         java.io.File output = new java.io.File(directory(activity, false), name); imports.add(output);
-                        try (java.io.InputStream input = activity.getContentResolver().openInputStream(uri);
-                             java.io.OutputStream target = new java.io.FileOutputStream(output)) { copy(input, target); }
+                        try (java.io.InputStream input = activity.getContentResolver().openInputStream(uri)) {
+                            remaining -= copyToFile(input, output, remaining);
+                        }
                         out.writeByte(2); string(out, output.getAbsolutePath());
                     }
                 } else throw new java.io.IOException("Clipboard item has no supported text or URI");

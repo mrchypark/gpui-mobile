@@ -11,6 +11,10 @@ use gpui::{
     App, Bounds, Context, Entity, Focusable, IntoElement, Render, Window, WindowOptions, canvas,
     div, point, prelude::*, px, size,
 };
+use gpui_kit::component::button::Button as KitButton;
+#[cfg(all(feature = "platform-smoke", any(target_os = "ios", target_os = "android")))]
+mod platform_smoke;
+
 use gpui_mobile::mobile_events::{
     MobileEvent, TouchDeliveryPolicy, set_mobile_event_handler, set_touch_delivery_policy,
 };
@@ -25,6 +29,7 @@ struct ElyRoot {
     mobile: MobileViewport,
     route: Rc<RefCell<GestureRoute>>,
     input: Entity<TextInput>,
+    second_input: Entity<TextInput>,
     controls_scroll: gpui::ScrollHandle,
     keyboard_reveal: Rc<RefCell<floating_keyboard::RevealState>>,
     _focus_subscriptions: Vec<gpui::Subscription>,
@@ -47,12 +52,16 @@ impl Render for ElyRoot {
         let measure = self.route.clone();
         let scroll = self.controls_scroll.clone();
         let keyboard_reveal = self.keyboard_reveal.clone();
+        let second_keyboard_reveal = keyboard_reveal.clone();
         let focus = self.input.read(cx).focus_handle(cx);
+        let second_focus = self.second_input.read(cx).focus_handle(cx);
+        let second_scroll = scroll.clone();
         let keyboard = if self.mobile.insets.keyboard_visible == Some(false) {
             None
         } else {
             self.mobile.insets.keyboard
         };
+        let second_keyboard = keyboard.clone();
         div()
             .size_full()
             .relative()
@@ -77,6 +86,11 @@ impl Render for ElyRoot {
                     .flex()
                     .flex_col()
                     .gap_2()
+                    .child(KitButton::new("kit-reset").label("Kit: reset viewport").on_click(cx.listener(|view, _, _, cx| {
+                        view.mobile.view = ely_gpui_component::canvas::Viewport::new(0., 0., 1.);
+                        view.resets += 1;
+                        cx.notify();
+                    })))
                     .child(
                         Button::new("reset", format!("Reset viewport · clicks {}", self.resets))
                             .on_click(cx.listener(|view, _, _, cx| {
@@ -87,16 +101,41 @@ impl Render for ElyRoot {
                                 cx.notify();
                             })),
                     )
-                    .child(div().relative().flex_shrink_0()
-                        .child(Input::new(&self.input))
-                        .child(canvas(
+                    .child(div().relative().flex().flex_col().gap_2().flex_shrink_0()
+                        .child(div().relative()
+                            .child(Input::new(&self.input))
+                            .child(canvas(
                             |bounds, _, _| bounds,
                             move |_, field, window, _| {
-                                if keyboard_reveal.borrow_mut().reveal(&scroll, focus.is_focused(window), field, keyboard) {
+                                if focus.is_focused(window)
+                                    && keyboard_reveal.borrow_mut().reveal(
+                                        &scroll,
+                                        Some(0),
+                                        field,
+                                        keyboard,
+                                    )
+                                {
                                     window.request_animation_frame();
                                 }
                             },
                         ).absolute().top_0().left_0().size_full()))
+                        .child(div().relative()
+                            .child(Input::new(&self.second_input))
+                            .child(canvas(
+                            |bounds, _, _| bounds,
+                            move |_, field, window, _| {
+                                if second_focus.is_focused(window)
+                                    && second_keyboard_reveal.borrow_mut().reveal(
+                                        &second_scroll,
+                                        Some(1),
+                                        field,
+                                        second_keyboard,
+                                    )
+                                {
+                                    window.request_animation_frame();
+                                }
+                            },
+                        ).absolute().top_0().left_0().size_full())))
                     .child(format!(
                         "OS {} · zoom {:.2} · pan {:.0},{:.0} · commits {}",
                         self.events,
@@ -163,6 +202,31 @@ pub extern "C" fn gpui_ios_run_ely() {
 }
 
 fn open_window(cx: &mut App) {
+    #[cfg(all(target_os = "android", feature = "lifecycle-stress"))]
+    {
+        let timer = cx.background_executor().timer(std::time::Duration::from_secs(4));
+        cx.foreground_executor().spawn(async move { timer.await }).detach();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<std::task::Waker>));
+        let wake = slot.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            if let Some(waker) = wake.lock().unwrap().take() {
+                waker.wake();
+            }
+        });
+        cx.foreground_executor()
+            .spawn(std::future::poll_fn(move |cx| {
+                *slot.lock().unwrap() = Some(cx.waker().clone());
+                std::task::Poll::<()>::Pending
+            }))
+            .detach();
+    }
+    #[cfg(all(feature = "platform-smoke", any(target_os = "ios", target_os = "android")))]
+    platform_smoke::run();
+    #[cfg(all(feature = "platform-extended", any(target_os = "ios", target_os = "android")))]
+    platform_smoke::run_extended();
+    #[cfg(all(feature = "platform-device", target_os = "android"))]
+    platform_smoke::run_device();
     #[cfg(debug_assertions)]
     {
         mobile::self_check();
@@ -170,7 +234,23 @@ fn open_window(cx: &mut App) {
         eprintln!("ELY_FLOATING_KEYBOARD_SELFCHECK PASS");
         eprintln!("ELY_ADAPTER_SELFCHECK PASS");
     }
+    gpui_kit::init(cx);
     ely_gpui_component::init(cx).expect("initialize Ely assets/fonts/theme");
+    #[cfg(feature = "ely-owner-reporter")]
+    ely_gpui_component::forms::set_input_owner_reporter(
+        |owner| {
+            gpui_mobile::mobile_events::report_text_input_owner(
+                gpui_mobile::mobile_events::TextInputOwner {
+                    window: owner.window.as_u64(),
+                    editor: owner.editor.as_u64(),
+                    activation: owner.activation,
+                },
+                owner.focused,
+                owner.disabled,
+            );
+        },
+        cx,
+    );
     set_touch_delivery_policy(TouchDeliveryPolicy::LegacyCompatible);
     cx.open_window(WindowOptions::default(), |window, cx| {
         #[cfg(target_os = "ios")]
@@ -185,12 +265,53 @@ fn open_window(cx: &mut App) {
         let owner = 0;
         let route = Rc::new(RefCell::new(GestureRoute::new(owner)));
         let root = cx.new(|cx| {
-            let input =
-                cx.new(|cx| TextInput::new(window, cx).placeholder("Tap to edit a map label"));
+            let input = cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .placeholder("Tap to edit a map label")
+                    .input_owner_observer(|owner| {
+                        gpui_mobile::mobile_events::report_text_input_owner(
+                            gpui_mobile::mobile_events::TextInputOwner {
+                                window: owner.window.as_u64(),
+                                editor: owner.editor.as_u64(),
+                                activation: owner.activation,
+                            },
+                            owner.focused,
+                            owner.disabled,
+                        );
+                    })
+            });
+            let second_input = cx.new(|cx| {
+                TextInput::new(window, cx)
+                    .placeholder("Tap to edit a second map label")
+                    .input_owner_observer(|owner| {
+                        gpui_mobile::mobile_events::report_text_input_owner(
+                            gpui_mobile::mobile_events::TextInputOwner {
+                                window: owner.window.as_u64(),
+                                editor: owner.editor.as_u64(),
+                                activation: owner.activation,
+                            },
+                            owner.focused,
+                            owner.disabled,
+                        );
+                    })
+            });
             let focus = input.read(cx).focus_handle(cx);
+            let second_focus = second_input.read(cx).focus_handle(cx);
+            let keyboard_reveal =
+                Rc::new(RefCell::new(floating_keyboard::RevealState::default()));
+            let first_blur_reveal = keyboard_reveal.clone();
+            let second_blur_reveal = keyboard_reveal.clone();
             let subscriptions = vec![
                 cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
-                cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&focus, window, move |_, _, cx| {
+                    first_blur_reveal.borrow_mut().focus_lost();
+                    cx.notify();
+                }),
+                cx.on_focus(&second_focus, window, |_, _, cx| cx.notify()),
+                cx.on_blur(&second_focus, window, move |_, _, cx| {
+                    second_blur_reveal.borrow_mut().focus_lost();
+                    cx.notify();
+                }),
             ];
             let controls_scroll = gpui::ScrollHandle::new();
             controls_scroll.set_offset(point(px(0.), px(-180.)));
@@ -198,8 +319,9 @@ fn open_window(cx: &mut App) {
                 mobile: MobileViewport::default(),
                 route: route.clone(),
                 input,
+                second_input,
                 controls_scroll,
-                keyboard_reveal: Default::default(),
+                keyboard_reveal,
                 _focus_subscriptions: subscriptions,
                 events: 0,
                 resets: 0,
@@ -258,7 +380,7 @@ fn open_window(cx: &mut App) {
                 })
                 .detach();
         })));
-        root
+        cx.new(|cx| gpui_kit::component::Root::new(root, window, cx))
     })
     .expect("open Ely viewport window");
 }
@@ -268,6 +390,6 @@ fn open_window(cx: &mut App) {
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
     gpui_mobile::android::jni::install_panic_hook();
-    gpui_mobile::android::jni::init_platform(&app);
+    let _platform_session = gpui_mobile::android::jni::init_platform(&app);
     run();
 }

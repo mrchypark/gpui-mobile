@@ -96,7 +96,8 @@ public final class GpuiFilePicker {
     // ── Internal ─────────────────────────────────────────────────────────
 
     private static ArrayList<String> launchPicker(Activity activity, Intent intent) {
-        return GpuiPickerActivity.launch(activity, intent, Intent.ACTION_OPEN_DOCUMENT.equals(intent.getAction()), null);
+        return GpuiPickerActivity.launch(activity, intent,
+                Intent.ACTION_OPEN_DOCUMENT.equals(intent.getAction()), null, GpuiPickerActivity.KIND_FILE);
     }
 
     private static void applyMimeTypes(Intent intent, String mimeTypes) {

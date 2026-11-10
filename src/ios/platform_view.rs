@@ -11,7 +11,7 @@ use crate::platform_view::{
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "ios")]
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{class, msg_send};
 
 #[cfg(target_os = "ios")]
@@ -288,6 +288,14 @@ impl IosPlatformView {
     }
 
     unsafe fn resize_video_layers(view: *mut AnyObject) {
+        Self::resize_sublayers_of_class(view, class!(AVPlayerLayer));
+    }
+
+    unsafe fn resize_camera_preview_layers(view: *mut AnyObject) {
+        Self::resize_sublayers_of_class(view, class!(AVCaptureVideoPreviewLayer));
+    }
+
+    unsafe fn resize_sublayers_of_class(view: *mut AnyObject, class: &AnyClass) {
         let bounds: ObjcCGRect = msg_send![view, bounds];
         let local = ObjcCGRect::new(0.0, 0.0, bounds.width, bounds.height);
         let backing: *mut AnyObject = msg_send![view, layer];
@@ -297,8 +305,8 @@ impl IosPlatformView {
         let _: () = msg_send![class!(CATransaction), setDisableActions: true];
         for index in 0..count {
             let layer: *mut AnyObject = msg_send![layers, objectAtIndex: index];
-            let video: bool = msg_send![layer, isKindOfClass: class!(AVPlayerLayer)];
-            if video {
+            let matching: bool = msg_send![layer, isKindOfClass: class];
+            if matching {
                 let _: () = msg_send![layer, setFrame: local];
             }
         }
@@ -406,24 +414,49 @@ impl IosPlatformView {
         let black_color: *mut AnyObject = msg_send![class!(UIColor), blackColor];
         let _: () = msg_send![view, setBackgroundColor: black_color];
 
-        // If a session_id is provided, try to get the AVCaptureSession and create preview layer
-        if let Some(session_id_str) = params.creation_params.get("session_id") {
-            if let Ok(session_id) = session_id_str.parse::<usize>() {
-                if let Some(session_ptr) = crate::packages::camera::ios_get_session(session_id) {
-                    let layer: *mut AnyObject =
-                        msg_send![class!(AVCaptureVideoPreviewLayer), alloc];
-                    let layer: *mut AnyObject = msg_send![layer, initWithSession: session_ptr];
-                    if !layer.is_null() {
-                        let _: () = msg_send![layer, setFrame: frame];
-                        let gravity = Self::make_nsstring("AVLayerVideoGravityResizeAspectFill");
-                        let _: () = msg_send![layer, setVideoGravity: gravity];
-                        let _: () = msg_send![gravity, release];
-                        let view_layer: *mut AnyObject = msg_send![view, layer];
-                        let _: () = msg_send![view_layer, addSublayer: layer];
-                    }
-                }
+        let session_id = match params.creation_params.get("session_id") {
+            Some(session_id) => session_id,
+            None => {
+                let _: () = msg_send![view, release];
+                return Err("camera_preview requires session_id".into());
             }
+        };
+        let session_id = match session_id.parse::<usize>() {
+            Ok(session_id) => session_id,
+            Err(_) => {
+                let _: () = msg_send![view, release];
+                return Err("camera_preview session_id must be an unsigned integer".into());
+            }
+        };
+        let session = match crate::packages::camera::ios_retain_session(session_id) {
+            Some(session) => session,
+            None => {
+                let _: () = msg_send![view, release];
+                return Err("Camera session is disposed or missing".into());
+            }
+        };
+        let layer: *mut AnyObject = msg_send![class!(AVCaptureVideoPreviewLayer), alloc];
+        let layer: *mut AnyObject = msg_send![layer, initWithSession: session];
+        let _: () = msg_send![session, release];
+        if layer.is_null() {
+            let _: () = msg_send![view, release];
+            return Err("Failed to create camera preview layer".into());
         }
+
+        let bounds: ObjcCGRect = msg_send![view, bounds];
+        let _: () = msg_send![layer, setFrame: bounds];
+        let gravity = Self::make_nsstring("AVLayerVideoGravityResizeAspectFill");
+        let _: () = msg_send![layer, setVideoGravity: gravity];
+        let _: () = msg_send![gravity, release];
+        let view_layer: *mut AnyObject = msg_send![view, layer];
+        if view_layer.is_null() {
+            let _: () = msg_send![layer, release];
+            let _: () = msg_send![view, release];
+            return Err("Camera preview container has no backing layer".into());
+        }
+        let _: () = msg_send![view_layer, addSublayer: layer];
+        // The container layer owns the preview layer after insertion.
+        let _: () = msg_send![layer, release];
 
         Ok(view)
     }
@@ -473,6 +506,8 @@ impl IosPlatformView {
                 let _: () = msg_send![view, setFrame: frame];
                 if self.view_type == "video_player" {
                     Self::resize_video_layers(view);
+                } else if self.view_type == "camera_preview" {
+                    Self::resize_camera_preview_layers(view);
                 }
             }
         });
@@ -711,6 +746,64 @@ mod attachment_tests {
             assert_eq!(parent, b);
             let _: () = msg_send![metal_b, removeFromSuperview];
             assert!(attach_above_metal(embedded, metal_b).is_err());
+        });
+    }
+
+    #[test]
+    fn camera_preview_layer_is_owned_by_container_and_tracks_local_bounds() {
+        on_main(|| {
+            objc2::rc::autoreleasepool(|_| unsafe {
+                let session: *mut AnyObject = msg_send![class!(AVCaptureSession), new];
+                let layer: *mut AnyObject = msg_send![class!(AVCaptureVideoPreviewLayer), alloc];
+                let layer: *mut AnyObject = msg_send![layer, initWithSession: session];
+                assert!(!layer.is_null());
+
+                let view: *mut AnyObject = msg_send![class!(UIView), new];
+                let backing: *mut AnyObject = msg_send![view, layer];
+                let _: () = msg_send![backing, addSublayer: layer];
+                // The container now owns the layer; release the creation reference.
+                let _: () = msg_send![layer, release];
+
+                let _: () = msg_send![view, setFrame: ObjcCGRect::new(0.0, 0.0, 300.0, 200.0)];
+                IosPlatformView::resize_camera_preview_layers(view);
+                let frame: ObjcCGRect = msg_send![layer, frame];
+                assert_eq!(
+                    (frame.x, frame.y, frame.width, frame.height),
+                    (0.0, 0.0, 300.0, 200.0)
+                );
+
+                let _: () = msg_send![view, release];
+                let _: () = msg_send![session, release];
+            })
+        });
+    }
+
+    #[test]
+    fn camera_preview_rejects_missing_invalid_and_disposed_sessions() {
+        on_main(|| unsafe {
+            let frame = ObjcCGRect::new(0.0, 0.0, 120.0, 90.0);
+            let mut params = PlatformViewParams::default();
+            assert!(
+                IosPlatformView::create_camera_preview_view(frame, &params)
+                    .unwrap_err()
+                    .contains("requires session_id")
+            );
+            params
+                .creation_params
+                .insert("session_id".into(), "invalid".into());
+            assert!(
+                IosPlatformView::create_camera_preview_view(frame, &params)
+                    .unwrap_err()
+                    .contains("unsigned integer")
+            );
+            params
+                .creation_params
+                .insert("session_id".into(), usize::MAX.to_string());
+            assert!(
+                IosPlatformView::create_camera_preview_view(frame, &params)
+                    .unwrap_err()
+                    .contains("disposed or missing")
+            );
         });
     }
 }

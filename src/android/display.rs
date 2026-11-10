@@ -244,6 +244,10 @@ impl PlatformDisplay for AndroidDisplay {
             size: gpui::size(gpui::px(logical.width.0), gpui::px(logical.height.0)),
         }
     }
+
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 impl fmt::Display for AndroidDisplay {

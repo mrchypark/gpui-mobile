@@ -11,6 +11,9 @@ final class GpuiServiceProbe {
         if ("gps".equals(value)) return 2;
         if ("gps-network".equals(value)) return 3;
         if ("gps-watch".equals(value)) return 4;
+        if ("gatt-echo".equals(value)) return 5;
+        if ("gatt-background".equals(value)) return 6;
+        if ("gatt-survival".equals(value)) return 7;
         return 0;
     }
     static void resumed(Activity activity) {
@@ -18,7 +21,7 @@ final class GpuiServiceProbe {
         nativeForeground(true);
         String value = activity.getIntent().getStringExtra("gpui.service_probe");
         activity.getIntent().removeExtra("gpui.service_probe");
-        if ("ble-beacons".equals(value)) { nativeRun(4); return; }
+        if ("ble-beacons".equals(value)) { scheduleRun(activity, 4); return; }
         int mode = mode(value);
         if (mode == 4) {
             if (!watchActive) {
@@ -26,7 +29,13 @@ final class GpuiServiceProbe {
                 if (!nativeLocationWatch()) watchActive = false;
             }
         }
-        else if (mode != 0) nativeRun(mode);
+        else if (mode != 0) scheduleRun(activity, mode);
+    }
+    private static void scheduleRun(Activity activity, int mode) {
+        // GPUI activation can briefly pause the host during initial launch.
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+            if (!activity.isFinishing() && !activity.isDestroyed()) nativeRun(mode);
+        }, 1000);
     }
     static void paused() {
         if (BuildConfig.DEBUG && BuildConfig.BLE_ENABLED) nativeForeground(false);

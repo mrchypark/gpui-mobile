@@ -55,6 +55,38 @@ public final class GpuiClipboardFormatsTest {
             try { GpuiClipboard.requireContentScheme(scheme); throw new AssertionError("Unsafe scheme accepted: " + scheme); }
             catch (IOException expected) { }
         }
+        if (GpuiClipboard.MAX_IMPORT_BYTES != 64L * 1024L * 1024L)
+            throw new AssertionError("Unexpected clipboard import limit");
+        if (GpuiClipboard.MAX_IMAGE_BYTES != 8L * 1024L * 1024L)
+            throw new AssertionError("Unexpected clipboard image limit");
+        OutputStream sink = new OutputStream() { public void write(int value) {} };
+        byte[] image = new byte[(int) GpuiClipboard.MAX_IMAGE_BYTES + 1];
+        if (GpuiClipboard.copy(new ByteArrayInputStream(image, 0, image.length - 1), sink,
+                GpuiClipboard.MAX_IMAGE_BYTES) != GpuiClipboard.MAX_IMAGE_BYTES)
+            throw new AssertionError("Exact image limit rejected");
+        try { GpuiClipboard.copy(new ByteArrayInputStream(image), sink, GpuiClipboard.MAX_IMAGE_BYTES); throw new AssertionError("Oversized image accepted"); }
+        catch (IOException expected) { }
+        byte[] seven = new byte[7];
+        ByteArrayOutputStream bounded = new ByteArrayOutputStream();
+        if (GpuiClipboard.copy(new ByteArrayInputStream(seven), bounded, 7) != 7 || bounded.size() != 7)
+            throw new AssertionError("Exact clipboard import limit rejected");
+        try { GpuiClipboard.copy(new ByteArrayInputStream(seven), new ByteArrayOutputStream(), 6); throw new AssertionError("Oversized import accepted"); }
+        catch (IOException expected) { }
+        File root = new File(System.getProperty("java.io.tmpdir"), "gpui-clipboard-test-" + java.util.UUID.randomUUID());
+        if (!root.mkdir()) throw new IOException("Cannot create clipboard test directory");
+        File partial = new File(root, "partial");
+        try {
+            InputStream chunks = new ByteArrayInputStream(seven) {
+                @Override public synchronized int read(byte[] buffer, int offset, int length) {
+                    return super.read(buffer, offset, Math.min(length, 3));
+                }
+            };
+            try { GpuiClipboard.copyToFile(chunks, partial, 5); throw new AssertionError("Oversized partial file accepted"); }
+            catch (IOException expected) { }
+            if (partial.exists() || root.exists()) throw new AssertionError("Partial clipboard file or directory remains");
+        } finally {
+            partial.delete(); root.delete();
+        }
         Method extension = GpuiClipboard.class.getDeclaredMethod("extension", String.class);
         extension.setAccessible(true);
         String[][] formats = {{"image/png","png"},{"image/jpeg","jpg"},{"image/webp","webp"},
@@ -81,6 +113,6 @@ public final class GpuiClipboardFormatsTest {
                 catch (InvocationTargetException expected) { if (!(expected.getCause() instanceof IOException)) throw expected; }
             }
         }
-        System.out.println("Clipboard MIME/UTF-8/truncation logic PASS (not native clipboard verification)");
+        System.out.println("Clipboard limit/MIME/UTF-8/truncation/cleanup logic PASS (not native clipboard verification)");
     }
 }
