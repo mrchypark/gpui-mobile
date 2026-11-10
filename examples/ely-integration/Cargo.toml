@@ -13,6 +13,7 @@ platform-smoke = []
 platform-extended = ["platform-smoke"]
 platform-device = ["platform-smoke"]
 lifecycle-stress = []
+ely-owner-reporter = []
 
 [lib]
 crate-type = ["rlib", "staticlib"]
@@ -21,13 +22,13 @@ crate-type = ["rlib", "staticlib"]
 gpui-mobile = { path = "../.." }
 gpui = { package = "gpui-fast", version = "=0.1.12", default-features = false }
 gpui-kit = { version = "=0.8.1", default-features = false, features = ["component", "gpui-fast"] }
-ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "3a6f4365fa88e89cb945f7d30c5706bf65757c8a", default-features = false }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "d589c9ea7ad13011431d941374896626a286dd60", default-features = false }
 # Devices cannot read Ely assets from the build machine's filesystem in debug builds.
 rust-embed = { version = "8.12", features = ["debug-embed"] }
 
 [dev-dependencies]
 gpui = { package = "gpui-fast", version = "=0.1.12", features = ["test-support"] }
-ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "3a6f4365fa88e89cb945f7d30c5706bf65757c8a", features = ["test-support"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "d589c9ea7ad13011431d941374896626a286dd60", features = ["test-support"] }
 naga = { version = "=30.0.1", features = ["wgsl-in"] }
 
 # Cargo only honors patches at the invoking workspace root.

@@ -235,6 +235,17 @@ pub type CloseCallback = Box<dyn FnOnce() + Send + 'static>;
 /// Called when the window appearance (light/dark) changes.
 pub type AppearanceCallback = Box<dyn FnMut(WindowAppearance) + Send + 'static>;
 
+/// Called after the latest window insets observation changes.
+pub type InsetsChangedCallback = Box<dyn FnMut(gpui::WindowInsets)>;
+
+fn platform_insets(insets: &mobile_events::WindowInsets) -> gpui::WindowInsets {
+    gpui::WindowInsets {
+        safe_area: insets.safe_area,
+        ime: insets.keyboard_insets.unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
 // ── appearance ────────────────────────────────────────────────────────────────
 
 /// Light / dark / high-contrast appearance of the window.
@@ -304,6 +315,8 @@ struct WindowState {
     /// `WindowResized`.  The top inset accounts for the status bar / notch,
     /// and the bottom inset accounts for the navigation bar / gesture area.
     safe_area_insets: SafeAreaInsets,
+    /// Latest complete observation, including floating keyboard geometry.
+    mobile_insets: mobile_events::WindowInsets,
     has_native_insets: bool,
 
     /// Current appearance.
@@ -322,6 +335,7 @@ struct WindowState {
     resize_callback: Option<ResizeCallback>,
     close_callback: Option<CloseCallback>,
     appearance_callback: Option<AppearanceCallback>,
+    insets_changed_callback: Option<InsetsChangedCallback>,
 }
 
 // SAFETY: `WindowState` is only ever accessed while holding the
@@ -485,6 +499,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            mobile_insets: mobile_events::WindowInsets::default(),
             has_native_insets: false,
             appearance: WindowAppearance::Light,
             transparent,
@@ -496,6 +511,7 @@ impl AndroidWindow {
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
+            insets_changed_callback: None,
         }));
 
         Ok(Arc::new(Self {
@@ -528,6 +544,7 @@ impl AndroidWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            mobile_insets: mobile_events::WindowInsets::default(),
             has_native_insets: false,
             appearance: WindowAppearance::Light,
             transparent: false,
@@ -539,6 +556,7 @@ impl AndroidWindow {
             resize_callback: None,
             close_callback: None,
             appearance_callback: None,
+            insets_changed_callback: None,
         }));
 
         Arc::new(Self {
@@ -1085,6 +1103,27 @@ impl AndroidWindow {
         state.safe_area_insets.to_logical(state.scale_factor)
     }
 
+    fn update_mobile_insets(&self, insets: mobile_events::WindowInsets) {
+        // Take the callback before dispatch or invocation so both may re-enter.
+        let callback = {
+            let mut state = self.state.lock();
+            if state.mobile_insets == insets {
+                None
+            } else {
+                state.mobile_insets = insets.clone();
+                state.insets_changed_callback.take()
+            }
+        };
+        mobile_events::dispatch(self.id, &MobileEvent::Insets(insets.clone()));
+        if let Some(mut callback) = callback {
+            callback(platform_insets(&insets));
+            let mut state = self.state.lock();
+            if state.insets_changed_callback.is_none() {
+                state.insets_changed_callback = Some(callback);
+            }
+        }
+    }
+
     /// Update the safe area insets from the content rect provided by the system.
     ///
     /// `content_rect` is `(left, top, right, bottom)` in physical pixels — the
@@ -1116,21 +1155,19 @@ impl AndroidWindow {
         );
         state.safe_area_insets = insets;
         let logical = insets.to_logical(state.scale_factor);
+        let mobile_insets = crate::mobile_events::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(logical.top),
+                bottom: gpui::px(logical.bottom),
+                left: gpui::px(logical.left),
+                right: gpui::px(logical.right),
+            },
+            keyboard: None,
+            keyboard_visible: None,
+            keyboard_insets: None,
+        };
         drop(state);
-        mobile_events::dispatch(
-            self.id,
-            &MobileEvent::Insets(crate::mobile_events::WindowInsets {
-                safe_area: gpui::Edges {
-                    top: gpui::px(logical.top),
-                    bottom: gpui::px(logical.bottom),
-                    left: gpui::px(logical.left),
-                    right: gpui::px(logical.right),
-                },
-                keyboard: None,
-                keyboard_visible: None,
-                keyboard_insets: None,
-            }),
-        );
+        self.update_mobile_insets(mobile_insets);
     }
 
     /// Called on the GPUI thread after the Java UI thread reports typed WindowInsets.
@@ -1166,7 +1203,7 @@ impl AndroidWindow {
                 .map(|edges| f32::from(edges.bottom))
                 .unwrap_or(0.0),
         );
-        mobile_events::dispatch(self.id, &MobileEvent::Insets(insets));
+        self.update_mobile_insets(insets);
         if let Some(mut callback) = callback {
             callback(dimensions, density);
             let mut state = self.state.lock();
@@ -1523,6 +1560,15 @@ impl PlatformWindow for AndroidPlatformWindow {
         }
     }
 
+    fn insets(&self) -> gpui::WindowInsets {
+        let state = self.window.state.lock();
+        platform_insets(&state.mobile_insets)
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        self.window.state.lock().insets_changed_callback = Some(callback);
+    }
+
     fn is_maximized(&self) -> bool {
         // Android windows are always effectively maximized (fullscreen).
         true
@@ -1802,10 +1848,11 @@ impl PlatformWindow for AndroidPlatformWindow {
             let mut cb = send_callback.lock();
             cb(RequestFrameOptions {
                 require_presentation: true,
-                force_render: text_dirty,
+                force_render: text_dirty | crate::render_request::take_force_render(),
                 ..Default::default()
             });
-            if !crate::mobile_events::raw_touch_only() && momentum.lock().scroller.is_active() {
+            if crate::render_request::force_render_pending()
+                || (!crate::mobile_events::raw_touch_only() && momentum.lock().scroller.is_active()) {
                 super::frame_source::schedule_frame();
             }
         });
@@ -2672,6 +2719,90 @@ mod tests {
         assert!((w.scale_factor() - 3.0).abs() < f32::EPSILON);
         assert!(!w.has_surface());
         assert!(!w.is_active());
+    }
+
+    #[test]
+    fn platform_insets_follow_latest_mobile_observation() {
+        let w = AndroidWindow::headless(1080, 1920, 3.0);
+        let platform_window = AndroidPlatformWindow::new(w.clone(), None);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let output = observed.clone();
+        let callback_window = Arc::downgrade(&w);
+        platform_window.on_insets_changed(Box::new(move |insets| {
+            let logical = callback_window
+                .upgrade()
+                .expect("window retained by the test")
+                .safe_area_insets_logical();
+            output.lock().push((insets, logical));
+        }));
+        let attached = crate::mobile_events::WindowInsets {
+            safe_area: gpui::Edges {
+                top: gpui::px(24.0),
+                bottom: gpui::px(16.0),
+                ..Default::default()
+            },
+            keyboard: Some(gpui::Bounds {
+                origin: gpui::point(gpui::px(0.0), gpui::px(400.0)),
+                size: gpui::size(gpui::px(360.0), gpui::px(240.0)),
+            }),
+            keyboard_visible: Some(true),
+            keyboard_insets: Some(gpui::Edges {
+                bottom: gpui::px(240.0),
+                ..Default::default()
+            }),
+        };
+        w.update_window_insets(3.0, attached);
+        assert_eq!(platform_window.insets().ime.bottom, gpui::px(240.0));
+
+        let floating_keyboard = gpui::Bounds {
+            origin: gpui::point(gpui::px(40.0), gpui::px(180.0)),
+            size: gpui::size(gpui::px(180.0), gpui::px(180.0)),
+        };
+        w.update_window_insets(
+            3.0,
+            crate::mobile_events::WindowInsets {
+                safe_area: gpui::Edges {
+                    top: gpui::px(32.0),
+                    bottom: gpui::px(20.0),
+                    ..Default::default()
+                },
+                keyboard: Some(floating_keyboard),
+                keyboard_visible: Some(true),
+                keyboard_insets: Some(gpui::Edges::default()),
+            },
+        );
+        let moved_keyboard = gpui::Bounds {
+            origin: gpui::point(gpui::px(60.0), gpui::px(200.0)),
+            ..floating_keyboard
+        };
+        w.update_window_insets(
+            3.0,
+            crate::mobile_events::WindowInsets {
+                safe_area: gpui::Edges {
+                    top: gpui::px(32.0),
+                    bottom: gpui::px(20.0),
+                    ..Default::default()
+                },
+                keyboard: Some(moved_keyboard),
+                keyboard_visible: Some(true),
+                keyboard_insets: Some(gpui::Edges::default()),
+            },
+        );
+
+        let insets = platform_window.insets();
+        assert_eq!(insets.safe_area.top, gpui::px(32.0));
+        assert_eq!(insets.ime, gpui::Edges::<gpui::Pixels>::default());
+        let observed = observed.lock();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[2].0.safe_area.top, gpui::px(32.0));
+        assert_eq!(observed[2].0.ime, gpui::Edges::<gpui::Pixels>::default());
+        assert!((observed[2].1.top - 96.0).abs() < f32::EPSILON);
+        drop(observed);
+        assert_eq!(
+            w.state.lock().mobile_insets.keyboard,
+            Some(moved_keyboard)
+        );
+        std::mem::forget(platform_window);
     }
 
     #[test]

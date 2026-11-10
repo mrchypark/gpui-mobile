@@ -339,13 +339,14 @@ pub extern "C" fn gpui_ios_request_frame_if_needed(window_ptr: *mut c_void) -> b
         || !window.closed.get(),
         |cb| {
             cb(RequestFrameOptions {
-                force_render: text_dirty,
+                force_render: text_dirty | crate::render_request::take_force_render(),
                 ..Default::default()
             });
         },
     );
     window.frame_demand.is_pending()
         || crate::TEXT_INPUT_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+        || crate::render_request::force_render_pending()
 }
 
 /// Register a main-thread callback that resumes the host's frame source.

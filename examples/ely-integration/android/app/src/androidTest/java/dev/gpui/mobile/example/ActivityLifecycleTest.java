@@ -6,6 +6,7 @@ import android.app.Instrumentation;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.view.View;
 
 import java.lang.reflect.Method;
 import java.util.concurrent.CountDownLatch;
@@ -38,6 +39,8 @@ public final class ActivityLifecycleTest extends Instrumentation {
                 recreate(activity, "recreate_stress".equals(scenario));
             } else if ("background".equals(scenario)) {
                 backgroundResume(activity, launch);
+            } else if ("insets_surface".equals(scenario)) {
+                insetsSurface(activity);
             } else {
                 throw new IllegalArgumentException("Unknown scenario: " + scenario);
             }
@@ -46,6 +49,25 @@ public final class ActivityLifecycleTest extends Instrumentation {
         } catch (Throwable failure) {
             result.putString("stream", "FAIL: " + android.util.Log.getStackTraceString(failure));
             finish(Activity.RESULT_CANCELED, result);
+        }
+    }
+
+    private void insetsSurface(Activity activity) throws Exception {
+        Class<?> observer = Class.forName("dev.gpui.mobile.GpuiInsets");
+        Method find = observer.getDeclaredMethod("findSurface", View.class);
+        find.setAccessible(true);
+        AtomicReference<View> found = new AtomicReference<>();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        runOnMainSync(() -> {
+            try {
+                found.set((View) find.invoke(null, activity.getWindow().getDecorView()));
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        });
+        if (failure.get() != null) throw new AssertionError(failure.get());
+        if (found.get() != activity.getWindow().getDecorView()) {
+            throw new AssertionError("NativeActivity insets must use the rendering window");
         }
     }
 

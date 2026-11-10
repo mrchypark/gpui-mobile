@@ -236,6 +236,21 @@ fn open_window(cx: &mut App) {
     }
     gpui_kit::init(cx);
     ely_gpui_component::init(cx).expect("initialize Ely assets/fonts/theme");
+    #[cfg(feature = "ely-owner-reporter")]
+    ely_gpui_component::forms::set_input_owner_reporter(
+        |owner| {
+            gpui_mobile::mobile_events::report_text_input_owner(
+                gpui_mobile::mobile_events::TextInputOwner {
+                    window: owner.window.as_u64(),
+                    editor: owner.editor.as_u64(),
+                    activation: owner.activation,
+                },
+                owner.focused,
+                owner.disabled,
+            );
+        },
+        cx,
+    );
     set_touch_delivery_policy(TouchDeliveryPolicy::LegacyCompatible);
     cx.open_window(WindowOptions::default(), |window, cx| {
         #[cfg(target_os = "ios")]

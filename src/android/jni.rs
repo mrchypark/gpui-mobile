@@ -1002,6 +1002,8 @@ pub fn run_event_loop(app: &AndroidApp) {
             let pending = WINDOW_INSETS_PENDING.lock().take();
             if let Some((density, insets)) = pending {
                 window.update_window_insets(density, insets);
+                crate::render_request::request_force_render();
+                super::frame_source::schedule_frame();
             }
         }
 

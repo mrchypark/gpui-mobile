@@ -159,6 +159,51 @@ fn appearance_style_changed(previous: Option<i64>, current: Option<i64>) -> bool
     matches!((previous, current), (Some(previous), Some(current)) if previous != current)
 }
 
+fn edge_attached_keyboard_insets(
+    window: Bounds<Pixels>,
+    keyboard: Option<Bounds<Pixels>>,
+) -> gpui::Edges<Pixels> {
+    let Some(keyboard) = keyboard else {
+        return Default::default();
+    };
+    let spans_width = keyboard.left() <= window.left() && keyboard.right() >= window.right();
+    let spans_height = keyboard.top() <= window.top() && keyboard.bottom() >= window.bottom();
+
+    if spans_width && keyboard.bottom() >= window.bottom() {
+        gpui::Edges {
+            bottom: window.bottom() - keyboard.top(),
+            ..Default::default()
+        }
+    } else if spans_width && keyboard.top() <= window.top() {
+        gpui::Edges {
+            top: keyboard.bottom() - window.top(),
+            ..Default::default()
+        }
+    } else if spans_height && keyboard.right() >= window.right() {
+        gpui::Edges {
+            right: window.right() - keyboard.left(),
+            ..Default::default()
+        }
+    } else if spans_height && keyboard.left() <= window.left() {
+        gpui::Edges {
+            left: keyboard.right() - window.left(),
+            ..Default::default()
+        }
+    } else {
+        Default::default()
+    }
+}
+
+fn platform_insets(window: Bounds<Pixels>, insets: &WindowInsets) -> gpui::WindowInsets {
+    gpui::WindowInsets {
+        safe_area: insets.safe_area,
+        ime: insets
+            .keyboard_insets
+            .unwrap_or_else(|| edge_attached_keyboard_insets(window, insets.keyboard)),
+        ..Default::default()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ImeRange {
@@ -873,6 +918,9 @@ pub(crate) struct IosWindowInner {
     mobile_events: RefCell<MobileEventState>,
     legacy_multitouch: Cell<bool>,
     keyboard_bounds: Cell<Option<Bounds<Pixels>>>,
+    /// Latest complete observation, including floating keyboard geometry.
+    mobile_insets: RefCell<WindowInsets>,
+    insets_changed_callback: Callback<Box<dyn FnMut(gpui::WindowInsets)>>,
     /// Velocity tracker — records recent touch samples during drag gestures
     /// so we can compute the release velocity when the finger lifts.
     velocity_tracker: RefCell<VelocityTracker>,
@@ -1053,7 +1101,7 @@ impl IosWindowInner {
             return;
         }
         let (top, bottom, left, right) = self.safe_area_insets();
-        self.emit_mobile_events(vec![MobileEvent::Insets(WindowInsets {
+        let insets = WindowInsets {
             safe_area: gpui::Edges {
                 top: px(top),
                 bottom: px(bottom),
@@ -1063,7 +1111,16 @@ impl IosWindowInner {
             keyboard: self.keyboard_bounds.get(),
             keyboard_visible: Some(self.keyboard_bounds.get().is_some()),
             keyboard_insets: None,
-        })]);
+        };
+        let previous = self.mobile_insets.replace(insets.clone());
+        let changed = previous != insets;
+        let platform_insets = platform_insets(self.bounds.get(), &insets);
+        self.emit_mobile_events(vec![MobileEvent::Insets(insets)]);
+        if changed {
+            self.insets_changed_callback
+                .call(|| !self.closed.get(), |callback| callback(platform_insets));
+            crate::render_request::request_force_render();
+        }
     }
 
     pub fn new(handle: AnyWindowHandle, _params: WindowParams) -> anyhow::Result<Self> {
@@ -1183,6 +1240,8 @@ impl IosWindowInner {
                 mobile_events: RefCell::new(MobileEventState::default()),
                 legacy_multitouch: Cell::new(false),
                 keyboard_bounds: Cell::new(None),
+                mobile_insets: RefCell::new(WindowInsets::default()),
+                insets_changed_callback: Callback::default(),
                 velocity_tracker: RefCell::new(VelocityTracker::new()),
                 momentum_scroller: RefCell::new(MomentumScroller::new()),
                 renderer: Mutex::new(None),
@@ -2062,6 +2121,7 @@ impl Drop for IosWindow {
         self.hit_test_callback.set(None);
         self.close_callback.set(None);
         self.appearance_changed_callback.set(None);
+        self.insets_changed_callback.set(None);
     }
 }
 
@@ -2110,6 +2170,15 @@ impl HasDisplayHandle for IosWindow {
 impl PlatformWindow for IosWindow {
     fn bounds(&self) -> Bounds<Pixels> {
         self.bounds.get()
+    }
+
+    fn insets(&self) -> gpui::WindowInsets {
+        let mobile_insets = self.mobile_insets.borrow();
+        platform_insets(self.bounds.get(), &mobile_insets)
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(gpui::WindowInsets)>) {
+        self.insets_changed_callback.set(Some(callback));
     }
 
     fn is_maximized(&self) -> bool {
@@ -2535,7 +2604,7 @@ impl PlatformAtlas for FallbackAtlas {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyInputSession, appearance_style_changed};
+    use super::{appearance_style_changed, edge_attached_keyboard_insets, ProxyInputSession};
 
     #[test]
     fn appearance_callback_requires_a_real_style_transition() {
@@ -2566,5 +2635,30 @@ mod tests {
 
         assert!(proxy.set_focus(None));
         assert!(!proxy.is_current(returned_to_a));
+    }
+
+    #[test]
+    fn platform_insets_ignore_floating_keyboard_geometry() {
+        let window = gpui::Bounds {
+            origin: gpui::Point::default(),
+            size: gpui::size(gpui::px(400.0), gpui::px(800.0)),
+        };
+        let floating = gpui::Bounds {
+            origin: gpui::point(gpui::px(100.0), gpui::px(300.0)),
+            size: gpui::size(gpui::px(200.0), gpui::px(200.0)),
+        };
+        assert_eq!(
+            edge_attached_keyboard_insets(window, Some(floating)),
+            gpui::Edges::default()
+        );
+
+        let docked = gpui::Bounds {
+            origin: gpui::point(gpui::px(0.0), gpui::px(500.0)),
+            size: gpui::size(gpui::px(400.0), gpui::px(300.0)),
+        };
+        assert_eq!(
+            edge_attached_keyboard_insets(window, Some(docked)).bottom,
+            gpui::px(300.0)
+        );
     }
 }
