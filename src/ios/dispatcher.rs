@@ -26,7 +26,7 @@ const DISPATCH_QUEUE_PRIORITY_LOW: i64 = -2;
 // SAFETY: These are C functions from libdispatch
 unsafe extern "C" {
     static _dispatch_main_q: std::ffi::c_void;
-    fn dispatch_async_f(
+    pub(crate) fn dispatch_async_f(
         queue: dispatch_queue_t,
         context: *mut c_void,
         work: Option<unsafe extern "C" fn(*mut c_void)>,

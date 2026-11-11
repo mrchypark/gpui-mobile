@@ -20,6 +20,8 @@ host="$root/example/ios"
 app="$here/ios-build/ElyIntegration.app"
 mkdir -p "$app"
 cp "$host/Info.plist" "$app/Info.plist"
+# This script builds without Xcode, which normally adds the device families.
+/usr/libexec/PlistBuddy -c 'Add :UIDeviceFamily array' -c 'Add :UIDeviceFamily:0 integer 1' -c 'Add :UIDeviceFamily:1 integer 2' "$app/Info.plist"
 /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier dev.gpui.mobile.ely' "$app/Info.plist"
 /usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable ElyIntegration' "$app/Info.plist"
 /usr/libexec/PlistBuddy -c 'Set :CFBundleName Ely Integration' "$app/Info.plist"

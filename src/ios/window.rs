@@ -918,6 +918,7 @@ pub(crate) struct IosWindowInner {
     mobile_events: RefCell<MobileEventState>,
     legacy_multitouch: Cell<bool>,
     keyboard_bounds: Cell<Option<Bounds<Pixels>>>,
+    tablet_keyboard_guide: Cell<*mut AnyObject>,
     /// Latest complete observation, including floating keyboard geometry.
     mobile_insets: RefCell<WindowInsets>,
     insets_changed_callback: Callback<Box<dyn FnMut(gpui::WindowInsets)>>,
@@ -1240,6 +1241,7 @@ impl IosWindowInner {
                 mobile_events: RefCell::new(MobileEventState::default()),
                 legacy_multitouch: Cell::new(false),
                 keyboard_bounds: Cell::new(None),
+                tablet_keyboard_guide: Cell::new(std::ptr::null_mut()),
                 mobile_insets: RefCell::new(WindowInsets::default()),
                 insets_changed_callback: Callback::default(),
                 velocity_tracker: RefCell::new(VelocityTracker::new()),
@@ -1366,10 +1368,77 @@ impl IosWindowInner {
         self.sync_surface_availability();
     }
 
+    fn update_tablet_keyboard_bounds(&self) {
+        let guide = self.tablet_keyboard_guide.get();
+        if guide.is_null() {
+            return;
+        }
+        unsafe {
+            let frame: ObjcCGRect = msg_send![guide, layoutFrame];
+            let view: ObjcCGRect = msg_send![self.view, bounds];
+            let (_, safe_bottom, _, _) = self.safe_area_insets();
+            // With the keyboard hidden, UIKit leaves a guide as tall as the bottom safe area.
+            let x = frame.x.max(view.x);
+            let y = frame.y.max(view.y);
+            let width = (frame.x + frame.width).min(view.x + view.width) - x;
+            let height = (frame.y + frame.height).min(view.y + view.height) - y;
+            let keyboard = (width > 0.0 && height > f64::from(safe_bottom) + 0.5).then(|| {
+                Bounds::new(point(px(x as f32), px(y as f32)), size(px(width as f32), px(height as f32)))
+            });
+            self.keyboard_bounds.set(keyboard);
+            crate::set_keyboard_height(keyboard.map_or(0.0, |bounds| f32::from(bounds.size.height)));
+        }
+    }
+
+    fn install_tablet_keyboard_guide(&self) {
+        if self.closed.get() {
+            return;
+        }
+        unsafe {
+            let guide: *mut AnyObject = msg_send![self.view, keyboardLayoutGuide];
+            if guide.is_null() {
+                return;
+            }
+            self.tablet_keyboard_guide.set(guide);
+        let _: () = msg_send![guide, setFollowsUndockedKeyboard: true];
+        // A constrained, inert view makes guide movements participate in UIKit layout.
+        let marker: *mut AnyObject = msg_send![class!(UIView), new];
+        let _: () = msg_send![marker, setHidden: true];
+        let _: () = msg_send![marker, setTranslatesAutoresizingMaskIntoConstraints: false];
+        let _: () = msg_send![self.view, addSubview: marker];
+        for anchor in [sel!(leadingAnchor), sel!(trailingAnchor), sel!(topAnchor), sel!(bottomAnchor)] {
+            let a: *mut AnyObject = objc2::msg_send![marker, performSelector: anchor];
+            let b: *mut AnyObject = objc2::msg_send![guide, performSelector: anchor];
+            let constraint: *mut AnyObject = msg_send![a, constraintEqualToAnchor: b];
+            let _: () = msg_send![constraint, setActive: true];
+        }
+        let _: () = msg_send![marker, release];
+        }
+    }
+
     /// Register for keyboard show/hide notifications so we can track the
     /// keyboard height and allow the UI to shift content above the keyboard.
     pub(crate) fn register_keyboard_observers(&self) {
         unsafe {
+            let device: *mut AnyObject = msg_send![class!(UIDevice), currentDevice];
+            let idiom: isize = msg_send![device, userInterfaceIdiom];
+            let supported: bool = msg_send![self.view, respondsToSelector: sel!(keyboardLayoutGuide)];
+            if idiom == 1 && supported {
+                // UIKit can send input-mode notifications while installing the guide.
+                // Install it after GPUI releases its startup App borrow.
+                unsafe extern "C" fn install(handle: *mut c_void) {
+                    if let Some(window) = super::ffi::window_for_handle(handle as usize) {
+                        window.install_tablet_keyboard_guide();
+                    }
+                }
+                super::dispatcher::dispatch_async_f(
+                    super::dispatcher::dispatch_get_main_queue(),
+                    self.handle_id.get() as usize as *mut c_void,
+                    Some(install),
+                );
+                return;
+            }
+
             let notification_center: *mut AnyObject =
                 msg_send![class!(NSNotificationCenter), defaultCenter];
 
@@ -2024,6 +2093,7 @@ impl IosWindowInner {
     /// Queries the current UIView bounds, updates the stored bounds/scale,
     /// reconfigures the Metal layer + wgpu surface, and fires the resize callback.
     pub fn handle_layout_change(&self) {
+        self.update_tablet_keyboard_bounds();
         self.sync_surface_availability();
         self.emit_insets();
         if self.closed.get() {

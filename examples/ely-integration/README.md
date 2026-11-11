@@ -157,13 +157,14 @@ touch-generated mouse/scroll in the canvas; outside controls retain synthesis.
 Safe area and docked bottom keyboard occlusion combine using max, not addition.
 A keyboard rectangle must reach the bottom **and cover the usable content width**
 to count as bottom occlusion. Floating rectangles remain in WindowInsets. The
-focused input's actual painted bounds are checked against keyboard geometry on
-focus/keyboard/frame changes; Ely reveal helpers scroll it only when those bounds
-intersect the keyboard. Unchanged paints and hidden-keyboard updates preserve
-manual scrolling. Ordinary offscreen fields do not trigger keyboard avoidance.
-Full control-area occlusion has no vertical scroll destination and remains a
-limitation. Android IME bottom insets also
-participate in the max. The header scroll area and input remain actual Ely UI.
+focused input is revealed in the laid-out scroll viewport when focus, keyboard
+geometry or viewport bounds change while the keyboard is visible. This also
+covers Android resizing the viewport without reporting a keyboard rectangle.
+For a floating keyboard, the controls use the closest clear strip above or below
+it. If neither strip in the controls is tall enough, the controls can borrow
+space from the canvas. If neither strip in the full window fits, scrolling
+cannot fully reveal the input. Unchanged paints and hidden-keyboard updates
+preserve manual scrolling. Android IME bottom insets participate in the max.
 
 ## Startup and evidence
 

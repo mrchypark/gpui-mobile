@@ -6,6 +6,7 @@ use ely_gpui_component::{
     buttons::Button,
     canvas::InfiniteCanvas,
     forms::{Input, TextInput},
+    primitives::FocusScope,
 };
 use gpui::{
     App, Bounds, Context, Entity, Focusable, IntoElement, Render, Window, WindowOptions, canvas,
@@ -28,9 +29,11 @@ use std::{
 struct ElyRoot {
     mobile: MobileViewport,
     route: Rc<RefCell<GestureRoute>>,
+    focus_scope: gpui::FocusHandle,
     input: Entity<TextInput>,
     second_input: Entity<TextInput>,
     controls_scroll: gpui::ScrollHandle,
+    controls_top_padding: gpui::Pixels,
     keyboard_reveal: Rc<RefCell<floating_keyboard::RevealState>>,
     _focus_subscriptions: Vec<gpui::Subscription>,
     events: usize,
@@ -41,7 +44,20 @@ impl Render for ElyRoot {
         let available = self
             .mobile
             .available(Bounds::new(point(px(0.), px(0.)), window.viewport_size()));
-        let header = px(180.).min(available.size.height);
+        let insets = &self.mobile.insets;
+        let keyboard_visible = insets.keyboard_visible.unwrap_or(insets.keyboard.is_some());
+        let keyboard = insets.keyboard.filter(|_| keyboard_visible);
+        let header = floating_keyboard::controls_height(available, keyboard);
+        let top_padding = header.max(px(180.));
+        if self.controls_top_padding != top_padding {
+            // Keep the controls at their painted position when reserving more scroll room.
+            let offset = self.controls_scroll.offset();
+            self.controls_scroll.set_offset(point(
+                offset.x,
+                (offset.y + self.controls_top_padding - top_padding).min(px(0.)),
+            ));
+            self.controls_top_padding = top_padding;
+        }
         let area = Bounds::new(
             available.origin + point(px(0.), header),
             size(
@@ -56,13 +72,8 @@ impl Render for ElyRoot {
         let focus = self.input.read(cx).focus_handle(cx);
         let second_focus = self.second_input.read(cx).focus_handle(cx);
         let second_scroll = scroll.clone();
-        let keyboard = if self.mobile.insets.keyboard_visible == Some(false) {
-            None
-        } else {
-            self.mobile.insets.keyboard
-        };
-        let second_keyboard = keyboard.clone();
-        div()
+        FocusScope::new(&self.focus_scope)
+            .root()
             .size_full()
             .relative()
             .bg(gpui::rgb(0xf2f4f8))
@@ -79,7 +90,7 @@ impl Render for ElyRoot {
                     .track_scroll(&self.controls_scroll)
                     .child(div()
                     // Leave room to reveal a field above or below a floating keyboard.
-                    .pt(px(180.))
+                    .pt(top_padding)
                     .pb(px(180.))
                     .child(div()
                     .p_3()
@@ -113,6 +124,7 @@ impl Render for ElyRoot {
                                         Some(0),
                                         field,
                                         keyboard,
+                                        keyboard_visible,
                                     )
                                 {
                                     window.request_animation_frame();
@@ -129,7 +141,8 @@ impl Render for ElyRoot {
                                         &second_scroll,
                                         Some(1),
                                         field,
-                                        second_keyboard,
+                                        keyboard,
+                                        keyboard_visible,
                                     )
                                 {
                                     window.request_animation_frame();
@@ -316,11 +329,13 @@ fn open_window(cx: &mut App) {
             let controls_scroll = gpui::ScrollHandle::new();
             controls_scroll.set_offset(point(px(0.), px(-180.)));
             ElyRoot {
+                focus_scope: cx.focus_handle(),
                 mobile: MobileViewport::default(),
                 route: route.clone(),
                 input,
                 second_input,
                 controls_scroll,
+                controls_top_padding: px(180.),
                 keyboard_reveal,
                 _focus_subscriptions: subscriptions,
                 events: 0,
