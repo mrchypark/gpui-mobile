@@ -66,7 +66,7 @@ androidComponents {
 
 android {
     namespace = "dev.gpui.mobile.example"
-    compileSdk = 34
+    compileSdk = 36
     buildFeatures { buildConfig = true }
 
     defaultConfig {
