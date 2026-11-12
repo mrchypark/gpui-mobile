@@ -584,6 +584,10 @@ impl AndroidWindow {
 
         let mut state = self.state.lock();
         let transparent = state.transparent;
+        let same_native_window = state
+            .native_window
+            .as_ref()
+            .is_some_and(|current| current.ptr() == native_window.ptr());
 
         // If a renderer already exists (kept alive across term_window), just
         // replace its surface.  This preserves the atlas and all cached
@@ -602,11 +606,12 @@ impl AndroidWindow {
                 .ok_or_else(|| anyhow::anyhow!("gpu_context missing during surface replacement"))?
                 .instance
                 .clone();
-            state
-                .renderer
-                .as_mut()
-                .unwrap()
-                .replace_surface(&raw, config, &instance)?;
+            let renderer = state.renderer.as_mut().unwrap();
+            if same_native_window {
+                // Vulkan cannot bind two surfaces to the same live native window.
+                renderer.unconfigure_surface();
+            }
+            renderer.replace_surface(&raw, config, &instance)?;
             log::info!(
                 "AndroidWindow::init_window — replaced surface {}×{}",
                 width,
@@ -645,6 +650,8 @@ impl AndroidWindow {
             super::accessibility::init(&handlers);
         }
         super::frame_source::resume();
+        // A new swapchain starts empty, even when the GPUI view cache is clean.
+        crate::render_request::request_force_render();
         Ok(())
     }
 
@@ -2177,6 +2184,9 @@ impl PlatformWindow for AndroidPlatformWindow {
 
                     // ── ACTION_MOVE ──────────────────────────────────────
                     2 => {
+                        if matches!(*ts, TouchState::Idle) {
+                            return;
+                        }
                         if let TouchState::Dragging { start } = *ts {
                             drag(gpui::TouchPhase::Moved, start);
                             return;
@@ -2245,9 +2255,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 }
                                 ms.has_pending_scroll = true;
                             }
-                            TouchState::Idle | TouchState::Dragging { .. } => {
-                                // Spurious move without a preceding down — ignore.
-                            }
+                            TouchState::Idle | TouchState::Dragging { .. } => return,
                         }
 
                         let needs_scroll_frame = ms.has_pending_scroll;

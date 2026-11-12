@@ -595,9 +595,14 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let _: () = msg_send![text, release];
         }
 
-        unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, selection: ImeRange) {
+        unsafe fn update_marked_text(
+            this: *mut AnyObject,
+            text: *mut AnyObject,
+            selection: ImeRange,
+            apply_native: impl FnOnce(),
+        ) {
             if inside_native_ime_edit(this) {
-                let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
+                apply_native();
                 return;
             }
             #[allow(deprecated)]
@@ -605,9 +610,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
             let Some(window) = super::ffi::window_for_handle(handle as usize) else { return; };
             let generation = window.proxy_generation();
             sync_proxy_context(this, &window, true);
-            native_ime_edit(this, || {
-                let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
-            });
+            native_ime_edit(this, apply_native);
             let text = if text.is_null() { String::new() } else {
                 let utf8: *const i8 = msg_send![text, UTF8String];
                 if utf8.is_null() { return; }
@@ -620,6 +623,19 @@ fn register_text_input_view_class() -> &'static AnyClass {
             if window.proxy_generation_is_current(generation) {
                 sync_proxy_context(this, &window, false);
             }
+        }
+
+        unsafe extern "C" fn set_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, selection: ImeRange) {
+            update_marked_text(this, text, selection, || {
+                let _: () = msg_send![super(this, class!(UITextView)), setMarkedText: text, selectedRange: selection];
+            });
+        }
+
+        unsafe extern "C" fn set_attributed_marked_text(this: *mut AnyObject, _sel: Sel, text: *mut AnyObject, selection: ImeRange) {
+            let plain: *mut AnyObject = msg_send![text, string];
+            update_marked_text(this, plain, selection, || {
+                let _: () = msg_send![super(this, class!(UITextView)), setAttributedMarkedText: text, selectedRange: selection];
+            });
         }
 
         unsafe extern "C" fn replace_range(this: *mut AnyObject, _sel: Sel, range: *mut AnyObject, text: *mut AnyObject) {
@@ -760,6 +776,7 @@ fn register_text_input_view_class() -> &'static AnyClass {
             decl.add_method(sel!(caretRectForPosition:), caret_rect as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> ObjcCGRect);
             decl.add_method(sel!(firstRectForRange:), caret_rect as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject) -> ObjcCGRect);
             decl.add_method(sel!(setMarkedText:selectedRange:), set_marked_text as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, ImeRange));
+            decl.add_method(sel!(setAttributedMarkedText:selectedRange:), set_attributed_marked_text as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, ImeRange));
             decl.add_method(sel!(unmarkText), unmark_text as unsafe extern "C" fn(*mut AnyObject, Sel));
             decl.add_method(sel!(replaceRange:withText:), replace_range as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject, *mut AnyObject));
             decl.add_method(
@@ -830,6 +847,8 @@ enum TouchState {
     Pending { start_x: f32, start_y: f32 },
     /// Finger has moved beyond the threshold — we are scrolling.
     Scrolling { prev_x: f32, prev_y: f32 },
+    /// A GPUI control claimed the drag before scrolling started.
+    Dragging { start: Point<Pixels> },
 }
 
 #[allow(clippy::type_complexity)]
@@ -973,9 +992,23 @@ impl IosWindowInner {
         key.as_bool().then_some(self.gpui_handle)
     }
 
-    fn dispatch_input(&self, event: PlatformInput) {
+    fn dispatch_input(&self, event: PlatformInput) -> bool {
         self.input_callback
-            .call(|| !self.closed.get(), |callback| callback(event));
+            .call(|| !self.closed.get(), |callback| callback(event))
+            .is_some_and(|result| result.default_prevented)
+    }
+
+    fn dispatch_touch_drag(
+        &self,
+        phase: gpui::TouchPhase,
+        start_position: Point<Pixels>,
+        position: Point<Pixels>,
+    ) -> bool {
+        self.dispatch_input(PlatformInput::TouchDrag(gpui::TouchDragEvent {
+            phase,
+            start_position,
+            position,
+        }))
     }
 
     pub(crate) fn can_render(&self) -> bool {
@@ -1079,14 +1112,13 @@ impl IosWindowInner {
     }
 
     fn cancel_legacy_touch(&self) {
-        let was_scrolling = matches!(
-            self.touch_state.replace(TouchState::Idle),
-            TouchState::Scrolling { .. }
-        );
+        let state = self.touch_state.replace(TouchState::Idle);
         self.touch_pressed.set(false);
         self.velocity_tracker.borrow_mut().reset();
         self.momentum_scroller.borrow_mut().cancel();
-        if was_scrolling {
+        if let TouchState::Dragging { start } = state {
+            self.dispatch_touch_drag(gpui::TouchPhase::Cancelled, start, self.mouse_position.get());
+        } else if matches!(state, TouchState::Scrolling { .. }) {
             self.dispatch_input(PlatformInput::Scroll(gpui::ScrollEvent {
                 position: self.mouse_position.get(),
                 delta: gpui::ScrollDelta::Pixels(Point::default()),
@@ -1095,6 +1127,26 @@ impl IosWindowInner {
                 source: gpui::ScrollSource::Touch,
             }));
         }
+        if !matches!(state, TouchState::Idle) {
+            self.clear_touch_hover();
+        }
+    }
+
+    fn clear_touch_hover(&self) {
+        // The lifted finger must stop participating in hit tests.
+        let position = point(px(-1.), px(-1.));
+        let modifiers = self.modifiers.get();
+        self.mouse_position.set(position);
+        self.dispatch_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
+            position,
+            modifiers,
+            pressed_button: None,
+        }));
+        self.dispatch_input(PlatformInput::MouseExited(gpui::MouseExitEvent {
+            position,
+            modifiers,
+            pressed_button: None,
+        }));
     }
 
     fn emit_insets(&self) {
@@ -1153,6 +1205,9 @@ impl IosWindowInner {
             let layer: *mut AnyObject = msg_send![view, layer];
             let scale: core_graphics::base::CGFloat = msg_send![screen_obj, scale];
             let _: () = msg_send![layer, setContentsScale: scale];
+            // Keep the drawable at its true scale while UIKit animates the view bounds.
+            let visual_top_left = crate::ios::util::nsstring("bottomLeft");
+            let _: () = msg_send![layer, setContentsGravity: visual_top_left];
 
             // Auto-resize the Metal view when the parent view changes size
             // (e.g. rotation). UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight
@@ -1625,6 +1680,13 @@ impl IosWindowInner {
                         let distance = (dx * dx + dy * dy).sqrt();
 
                         if distance > SCROLL_SLOP {
+                            let start = gpui::point(gpui::px(start_x), gpui::px(start_y));
+                            self.touch_state.set(TouchState::Dragging { start });
+                            let claimed =
+                                self.dispatch_touch_drag(gpui::TouchPhase::Started, start, position);
+                            if claimed || !self.touch_pressed.get() {
+                                return;
+                            }
                             // Promote to scrolling — emit the first scroll
                             // delta from the start position.
                             ts = TouchState::Scrolling {
@@ -1675,6 +1737,10 @@ impl IosWindowInner {
                             modifiers,
                             pressed_button: Some(gpui::MouseButton::Left),
                         }));
+                    }
+                    TouchState::Dragging { start } => {
+                        self.dispatch_touch_drag(gpui::TouchPhase::Moved, start, position);
+                        return;
                     }
                     TouchState::Idle => {
                         // Spurious move without a preceding down — ignore.
@@ -1744,6 +1810,12 @@ impl IosWindowInner {
                             self.frame_demand.wake();
                         }
                     }
+                    TouchState::Dragging { start } => {
+                        self.touch_state.set(TouchState::Idle);
+                        self.dispatch_touch_drag(gpui::TouchPhase::Ended, start, position);
+                        self.clear_touch_hover();
+                        return;
+                    }
                     TouchState::Idle => {}
                 }
                 ts = TouchState::Idle;
@@ -1756,6 +1828,9 @@ impl IosWindowInner {
         }
 
         self.touch_state.set(ts);
+        if matches!(phase, UITouchPhase::Ended) {
+            self.clear_touch_hover();
+        }
     }
 
     /// Query the safe area insets from the UIView.
@@ -1847,6 +1922,7 @@ impl IosWindowInner {
                 touch_phase: gpui::TouchPhase::Ended,
                 source: gpui::ScrollSource::Touch,
             }));
+            self.clear_touch_hover();
         } else {
             self.frame_demand.wake();
         }
