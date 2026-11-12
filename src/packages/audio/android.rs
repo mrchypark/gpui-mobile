@@ -265,12 +265,22 @@ pub fn is_playing(id: u32) -> Result<bool, String> {
 pub fn get_state(id: u32) -> Result<PlayerState, String> {
     jni_helpers::with_env(|env| {
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
-        let state = env.call_static_method(&cls, jni::jni_str!("getState"),
-            jni::jni_sig!("(I)I"), &[JValue::Int(id as i32)]).and_then(|v| v.i()).e()?;
+        let state = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("getState"),
+                jni::jni_sig!("(I)I"),
+                &[JValue::Int(id as i32)],
+            )
+            .and_then(|v| v.i())
+            .e()?;
         match state {
-            0 => Ok(PlayerState::Idle), 1 => Ok(PlayerState::Loading),
-            2 => Ok(PlayerState::Ready), 3 => Ok(PlayerState::Playing),
-            4 => Ok(PlayerState::Paused), 5 => Ok(PlayerState::Completed),
+            0 => Ok(PlayerState::Idle),
+            1 => Ok(PlayerState::Loading),
+            2 => Ok(PlayerState::Ready),
+            3 => Ok(PlayerState::Playing),
+            4 => Ok(PlayerState::Paused),
+            5 => Ok(PlayerState::Completed),
             _ => Err("Unknown native audio state".into()),
         }
     })

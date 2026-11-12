@@ -102,8 +102,11 @@ pub fn is_available() -> Result<bool, String> {
 }
 
 fn validate_coordinates(latitude: f64, longitude: f64) -> Result<(), String> {
-    if !latitude.is_finite() || !longitude.is_finite()
-        || !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
+    if !latitude.is_finite()
+        || !longitude.is_finite()
+        || !(-90.0..=90.0).contains(&latitude)
+        || !(-180.0..=180.0).contains(&longitude)
+    {
         return Err("Coordinates must be finite degrees within latitude/longitude bounds".into());
     }
     Ok(())

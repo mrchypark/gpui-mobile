@@ -99,7 +99,9 @@ fn load_source(id: u32, source: &str, file: bool) -> Result<VideoInfo, String> {
 fn load_source_inner(id: u32, source: &str, file: bool) -> Result<VideoInfo, String> {
     unsafe {
         let main: bool = msg_send![class!(NSThread), isMainThread];
-        if main { return Err("Load media from a worker thread".into()); }
+        if main {
+            return Err("Load media from a worker thread".into());
+        }
     }
     let item = with_player(id, |entry| unsafe {
         let text = make_nsstring(source);
@@ -108,9 +110,13 @@ fn load_source_inner(id: u32, source: &str, file: bool) -> Result<VideoInfo, Str
         } else {
             msg_send![class!(NSURL), URLWithString: text]
         };
-        if url.is_null() { return Err("Invalid media URL".into()); }
+        if url.is_null() {
+            return Err("Invalid media URL".into());
+        }
         let item: *mut AnyObject = msg_send![class!(AVPlayerItem), playerItemWithURL: url];
-        if item.is_null() { return Err("Failed to create video item".into()); }
+        if item.is_null() {
+            return Err("Failed to create video item".into());
+        }
         entry.loops.clear();
         let _: () = msg_send![entry.player, removeAllItems];
         let _: () = msg_send![entry.player, replaceCurrentItemWithPlayerItem: item];
@@ -134,16 +140,24 @@ fn load_source_inner(id: u32, source: &str, file: bool) -> Result<VideoInfo, Str
     }
     with_player(id, |entry| unsafe {
         let current: *mut AnyObject = msg_send![entry.player, currentItem];
-        if current != item.0 { return Err("Video source changed while loading".into()); }
+        if current != item.0 {
+            return Err("Video source changed while loading".into());
+        }
         let info = get_video_info(entry.player)?;
-        if entry.looping { entry.loops.configure(entry.player, true)?; }
+        if entry.looping {
+            entry.loops.configure(entry.player, true)?;
+        }
         Ok(info)
     })
 }
 
 struct LoadingItem(*mut AnyObject);
 impl Drop for LoadingItem {
-    fn drop(&mut self) { unsafe { let _: () = msg_send![self.0, release]; } }
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.0, release];
+        }
+    }
 }
 
 pub fn play(id: u32) -> Result<(), String> {
@@ -189,7 +203,9 @@ pub fn set_speed(id: u32, speed: f32) -> Result<(), String> {
         unsafe {
             let rate: f32 = msg_send![entry.player, rate];
             entry.speed = speed;
-            if rate != 0.0 { let _: () = msg_send![entry.player, setRate: speed]; }
+            if rate != 0.0 {
+                let _: () = msg_send![entry.player, setRate: speed];
+            }
         }
         Ok(())
     })
@@ -373,7 +389,9 @@ mod tests {
             assert!(play(id).is_err());
             let failure = std::thread::spawn(move || {
                 set_file_path(id, "/gpui-nonexistent-media-regression.mp4")
-            }).join().unwrap();
+            })
+            .join()
+            .unwrap();
             assert!(failure.is_err());
             assert!(play(id).is_err());
             // A later valid source must clear the failed-item condition rather
@@ -395,12 +413,17 @@ mod tests {
             wav.resize(16044, 0);
             std::fs::write(&path, wav).unwrap();
             let source = path.to_string_lossy().into_owned();
-            let recovered = std::thread::spawn(move || set_file_path(id, &source)).join().unwrap();
+            let recovered = std::thread::spawn(move || set_file_path(id, &source))
+                .join()
+                .unwrap();
             let playback = recovered.and_then(|_| play(id));
             let _ = pause(id);
             dispose(id).unwrap();
             std::fs::remove_file(path).unwrap();
-            assert!(playback.is_ok(), "valid source did not recover: {playback:?}");
+            assert!(
+                playback.is_ok(),
+                "valid source did not recover: {playback:?}"
+            );
         });
     }
 
@@ -409,9 +432,12 @@ mod tests {
         objc2::rc::autoreleasepool(|_| {
             let id = create_player().unwrap();
             let retained = retain_player(id).unwrap();
-            std::thread::spawn(move || dispose(id).unwrap()).join().unwrap();
+            std::thread::spawn(move || dispose(id).unwrap())
+                .join()
+                .unwrap();
             assert!(retain_player(id).is_none());
-            let alive: bool = unsafe { msg_send![&*retained, isKindOfClass: class!(AVQueuePlayer)] };
+            let alive: bool =
+                unsafe { msg_send![&*retained, isKindOfClass: class!(AVQueuePlayer)] };
             assert!(alive);
             // The guard releases the last reference after the native call, with
             // no registry mutex held across thread joining or native layer work.

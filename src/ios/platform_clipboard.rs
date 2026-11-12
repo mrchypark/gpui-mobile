@@ -1,7 +1,7 @@
 //! Native multi-item clipboard. File providers transfer copies across sandboxes.
 use super::super::util::nsstring;
-use anyhow::{Result, anyhow, bail};
-use futures::{FutureExt, channel::oneshot};
+use anyhow::{anyhow, bail, Result};
+use futures::{channel::oneshot, FutureExt};
 use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image};
 use objc2::{
     class, msg_send,
@@ -438,11 +438,9 @@ mod tests {
             }
             let provider = provider().unwrap();
             register(&provider, TEXT, Vec::new());
-            assert!(
-                futures::executor::block_on(load(&provider, TEXT))
-                    .unwrap()
-                    .is_empty()
-            );
+            assert!(futures::executor::block_on(load(&provider, TEXT))
+                .unwrap()
+                .is_empty());
         });
     }
 }

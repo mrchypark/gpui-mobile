@@ -92,9 +92,6 @@ pub fn render(_router: &Router, cx: &mut Context<Router>) -> impl IntoElement {
         .child(scan_status)
         .child(format!("Worker operations: {} started / {} completed", snapshot.commands_started, snapshot.commands_completed))
         .child(button("ble-open", "Open / request Bluetooth permission").on_click(cx.listener(|_, _, _, cx| { open(); cx.notify(); })))
-        .child(button("ble-qcy-scan", "Scan QCY names (10 seconds)").on_click(cx.listener(|_, _, _, cx| {
-            send(Command::Scan(ble::ScanOptions { name_prefix: Some("QCY".into()), ..Default::default() })); cx.notify();
-        })))
         .child(button("ble-all-scan", "Scan nearby (10 seconds; names/IDs shown locally)").on_click(cx.listener(|_, _, _, cx| {
             send(Command::Scan(ble::ScanOptions::default())); cx.notify();
         })))
@@ -103,9 +100,6 @@ pub fn render(_router: &Router, cx: &mut Context<Router>) -> impl IntoElement {
         })))
         .child(button("ble-background", "Keep connected in background (requires host setup)").on_click(cx.listener(|_, _, _, cx| {
             send(Command::EnableBackground); cx.notify();
-        })))
-        .child(button("ble-qcy-read", "Read QCY firmware/battery if advertised readable (no writes)").on_click(cx.listener(|_, _, _, cx| {
-            send(Command::ReadQcy); cx.notify();
         })))
         .child(button("ble-close", "Close / cancel and clean up").on_click(cx.listener(|_, _, _, cx| { close(); cx.notify(); })));
     if snapshot.finished {
@@ -143,5 +137,4 @@ pub fn render(_router: &Router, cx: &mut Context<Router>) -> impl IntoElement {
     content.child(format!("Notifications: {} · last bytes (local only): {:02x?}", snapshot.notifications, snapshot.value))
         .child(format!("Background enabled: {} · background receipts: {} · last receipt UTC ms: {:?}",
             snapshot.background_enabled, snapshot.background_notifications, snapshot.last_notification_unix_ms))
-        .child(format!("QCY read-only result (local only): {:?}", snapshot.qcy))
 }

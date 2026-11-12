@@ -76,7 +76,9 @@ pub fn open_directions(
     dest_label: Option<&str>,
 ) -> Result<bool, String> {
     if dest_label.is_some_and(|label| !label.is_empty()) {
-        return Err("Android navigation does not support a custom coordinate label; pass None".into());
+        return Err(
+            "Android navigation does not support a custom coordinate label; pass None".into(),
+        );
     }
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
