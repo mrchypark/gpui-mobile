@@ -13,6 +13,20 @@ pub use btleplug::api::{
 pub use btleplug::platform::PeripheralId;
 pub use btleplug::{Error, Result};
 
+/// Tell the shared Java host whether this native binary contains the debug probe exports.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_gpui_mobile_GpuiServiceProbe_nativeAvailable(
+    _: *mut std::ffi::c_void,
+    _: *mut std::ffi::c_void,
+) -> u8 {
+    u8::from(cfg!(all(
+        debug_assertions,
+        feature = "location",
+        feature = "permission_handler"
+    )))
+}
+
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "android")]

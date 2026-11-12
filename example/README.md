@@ -13,16 +13,16 @@ cargo install cargo-ndk
 # Ensure ANDROID_NDK_HOME is set or Android Studio NDK is installed
 
 # 2. Build the native .so
-cd example/android_app
-cargo ndk -t arm64-v8a -o gradle/app/src/main/jniLibs build
+cd example
+cargo ndk -t arm64-v8a -o android/gradle/app/build/generated/jniLibs/debug build --lib
 
 # 3. Build the APK
-cd gradle
+cd android/gradle
 ./gradlew assembleDebug
 
 # 4. Install and run on a connected device
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n dev.gpui.mobile.example/android.app.NativeActivity
+adb shell am start -n dev.gpui.mobile.example/dev.gpui.mobile.GpuiActivity
 
 # 5. Watch logs
 adb logcat -s gpui-mobile-example:V
@@ -200,14 +200,14 @@ cargo install cargo-ndk
 
 ### Step 1: Build the Rust cdylib
 
-From the `example/android_app/` directory:
+From the `example/` directory:
 
 ```bash
 # Debug build (large .so, fast compile)
-cargo ndk -t arm64-v8a -o gradle/app/src/main/jniLibs build
+cargo ndk -t arm64-v8a -o android/gradle/app/build/generated/jniLibs/debug build --lib
 
 # Release build (small .so, slower compile)
-cargo ndk -t arm64-v8a -o gradle/app/src/main/jniLibs build --release
+cargo ndk -t arm64-v8a -o android/gradle/app/build/generated/jniLibs/release build --lib --release
 ```
 
 The `-o` flag tells `cargo-ndk` to copy the output `.so` directly into the
@@ -216,28 +216,30 @@ Gradle `jniLibs` directory — no manual copy step needed.
 ### Step 2: Build the APK
 
 ```bash
-cd gradle
+cd android/gradle
 ./gradlew assembleDebug
 ```
 
-Output: `gradle/app/build/outputs/apk/debug/app-debug.apk`
+Output: `android/gradle/app/build/outputs/apk/debug/app-debug.apk` (relative to `example/`).
+Use `assembleRelease` with the release library. The example release APK uses
+the debug signing key for local installation.
 
 ### Step 3: Install and Run
 
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n dev.gpui.mobile.example/android.app.NativeActivity
+adb shell am start -n dev.gpui.mobile.example/dev.gpui.mobile.GpuiActivity
 ```
 
 ### One-liner (build + package + install)
 
 ```bash
-cd example/android_app \
-  && cargo ndk -t arm64-v8a -o gradle/app/src/main/jniLibs build \
-  && cd gradle \
+cd example \
+  && cargo ndk -t arm64-v8a -o android/gradle/app/build/generated/jniLibs/debug build --lib \
+  && cd android/gradle \
   && ./gradlew assembleDebug \
   && adb install -r app/build/outputs/apk/debug/app-debug.apk \
-  && adb shell am start -n dev.gpui.mobile.example/android.app.NativeActivity
+  && adb shell am start -n dev.gpui.mobile.example/dev.gpui.mobile.GpuiActivity
 ```
 
 ## Key Files Reference
@@ -325,7 +327,7 @@ prevent the activity from being recreated.  Verify the manifest wasn't changed.
 That's a debug build.  Use `--release` for a ~20 MB `.so`:
 
 ```bash
-cargo ndk -t arm64-v8a -o gradle/app/src/main/jniLibs build --release
+cargo ndk -t arm64-v8a -o android/gradle/app/build/generated/jniLibs/release build --lib --release
 ```
 
 ### Touch not working

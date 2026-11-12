@@ -111,8 +111,8 @@ cargo +1.97.1 tree --locked --manifest-path example/Cargo.toml --features ble --
 "$ndk_toolchain/llvm-readelf" -h -d --dyn-syms "$CARGO_TARGET_DIR/aarch64-linux-android/debug/libgpui_mobile_example.so"
 
 # Package the already verified BLE-enabled native library.
-mkdir -p example/android/gradle/app/src/main/jniLibs/arm64-v8a
-cp "$CARGO_TARGET_DIR/aarch64-linux-android/debug/libgpui_mobile_example.so" example/android/gradle/app/src/main/jniLibs/arm64-v8a/
+mkdir -p example/android/gradle/app/build/generated/jniLibs/debug/arm64-v8a
+cp "$CARGO_TARGET_DIR/aarch64-linux-android/debug/libgpui_mobile_example.so" example/android/gradle/app/build/generated/jniLibs/debug/arm64-v8a/
 export JAVA_HOME=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
 export ANDROID_HOME="$HOME/Library/Android/sdk" ANDROID_SDK_ROOT="$HOME/Library/Android/sdk"
 (cd example/android/gradle && sh ./gradlew --no-daemon --max-workers=1 -Pble=true :app:assembleDebug -x :app:buildBleRust)

@@ -3,14 +3,14 @@
 // This module packages the pre-compiled Rust native library into an APK
 // that uses Android's NativeActivity to host the GPUI application.
 //
-// The Rust library must be compiled separately and placed into
-// app/src/main/jniLibs/<abi>/ before building the APK.
+// The Rust library must be compiled separately into the matching variant's
+// app/build/generated/jniLibs/{debug,release}/<abi>/ directory.
 //
 // Quick start:
-//   cd <repo-root>
-//   cargo ndk -t arm64-v8a -o example/android_app/gradle/app/src/main/jniLibs \
-//       build --example android_app --release
-//   cd example/android_app/gradle
+//   cd example
+//   cargo ndk -t arm64-v8a -o android/gradle/app/build/generated/jniLibs/debug \
+//       build --lib
+//   cd android/gradle
 //   ./gradlew assembleDebug
 
 plugins {
@@ -20,6 +20,8 @@ plugins {
 val bleEnabled = providers.gradleProperty("ble").map(String::toBoolean).getOrElse(false)
 val blePackage = rootProject.file("../../../src/packages/ble")
 val bleJava = layout.buildDirectory.dir("ble")
+val debugJniLibs = layout.buildDirectory.dir("generated/jniLibs/debug")
+val releaseJniLibs = layout.buildDirectory.dir("generated/jniLibs/release")
 val prepareBleJava = tasks.register<Exec>("prepareBleJava") {
     onlyIf { bleEnabled }
     commandLine("sh", blePackage.resolve("prepare-android.sh"), bleJava.get().asFile)
@@ -32,11 +34,34 @@ val buildBleRust = tasks.register<Exec>("buildBleRust") {
     onlyIf { bleEnabled }
     workingDir(rootProject.file("../.."))
     commandLine("cargo", "ndk", "-t", "arm64-v8a", "-o",
-        "android/gradle/app/src/main/jniLibs", "build", "--lib", "--features", "ble")
+        debugJniLibs.get().asFile.absolutePath, "build", "--lib", "--features", "ble")
+}
+val buildBleRustRelease = tasks.register<Exec>("buildBleRustRelease") {
+    onlyIf { bleEnabled }
+    workingDir(rootProject.file("../.."))
+    commandLine("cargo", "ndk", "-t", "arm64-v8a", "-o",
+        releaseJniLibs.get().asFile.absolutePath, "build", "--lib", "--features", "ble", "--release")
 }
 
-tasks.named("preBuild") {
-    if (bleEnabled) dependsOn(prepareBleJava, buildBleRust)
+androidComponents {
+    onVariants { variant ->
+        val variantName = variant.name.replaceFirstChar { it.uppercase() }
+        val mergeJniLibs = "merge${variantName}JniLibFolders"
+        tasks.matching { it.name == mergeJniLibs }.configureEach {
+            if (!bleEnabled && variant.buildType == "release") {
+                mustRunAfter(rootProject.tasks.named("buildRustRelease"))
+            }
+            if (bleEnabled) {
+                dependsOn(prepareBleJava)
+                dependsOn(if (variant.buildType == "release") buildBleRustRelease else buildBleRust)
+            }
+        }
+        val compileJava = "compile${variantName}JavaWithJavac"
+        val compileKotlin = "compile${variantName}Kotlin"
+        tasks.matching { it.name == compileJava || it.name == compileKotlin }.configureEach {
+            if (bleEnabled) dependsOn(prepareBleJava)
+        }
+    }
 }
 
 android {
@@ -67,6 +92,8 @@ android {
 
     buildTypes {
         release {
+            // This example APK is for local installation.
+            signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -96,12 +123,14 @@ android {
     // Tell Gradle where the pre-built .so files live.
     sourceSets {
         getByName("main") {
-            jniLibs.srcDirs("src/main/jniLibs")
+            jniLibs.setSrcDirs(emptyList<Any>())
             java.srcDir(blePackage.resolve("java"))
             if (bleEnabled) {
                 java.srcDir(bleJava.get().dir("btleplug-0.13.5/src/droidplug/java/src/main/java").asFile)
             }
         }
+        getByName("debug").jniLibs.setSrcDirs(listOf(debugJniLibs.get().asFile))
+        getByName("release").jniLibs.setSrcDirs(listOf(releaseJniLibs.get().asFile))
     }
 
     packaging {

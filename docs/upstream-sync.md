@@ -29,3 +29,22 @@ The upstream branch was not merged wholesale.
 - The Android test covered release followed by attachment. It did not force
   reattachment to an already configured native window. Attributed IME
   composition and RawOnly map gestures were not exercised on devices.
+
+## Public Ely integration follow-up
+
+The integrated example pins the public Ely revision containing touch image
+cropping and keyboard-aware dialogs. The example installs the shared input
+owner reporter by default. The platform supplies keyboard geometry; Ely
+chooses the visible region and scrolls the focused field.
+
+- The Android emulator passed three same-process Activity recreations and
+  the rendering-surface insets instrumentation check. In the gallery, a
+  narrow landscape dialog kept both fields and Save reachable with the
+  software keyboard open. A test IME composed Korean in each field without
+  mixing the edits.
+- The iPad simulator passed finger crop movement and Korean composition
+  across a focus change. Moving the floating keyboard over the old field
+  location moved the dialog so the field and Save stayed visible.
+- The Android BLE release APK contained the release native library and
+  launched. A debuggable APK intentionally built with that release library
+  also launched, without invoking the unavailable probe exports.

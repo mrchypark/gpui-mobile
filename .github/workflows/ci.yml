@@ -196,12 +196,15 @@ jobs:
           cargo ndk \
             -t arm64-v8a \
             -P 31 \
-            -o android/gradle/app/src/main/jniLibs \
+            -o android/gradle/app/build/generated/jniLibs/debug \
             build --features ble --locked
 
       - name: Assemble BLE debug APK with the already-built Rust library
         working-directory: example/android/gradle
         run: ./gradlew -Pble=true -x :app:buildBleRust assembleDebug
+
+      - name: Verify the APK contains the arm64 native library
+        run: unzip -Z1 example/android/gradle/app/build/outputs/apk/debug/app-debug.apk | grep -Fx lib/arm64-v8a/libgpui_mobile_example.so
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7

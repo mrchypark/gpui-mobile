@@ -6,6 +6,15 @@ import dev.gpui.mobile.example.BuildConfig;
 /** Explicit debug-only developer action; never runs for an ordinary launch. */
 final class GpuiServiceProbe {
     private static volatile boolean watchActive;
+    private static int probeAvailability = -1;
+    private static boolean probeAvailable() {
+        if (!BuildConfig.DEBUG || !BuildConfig.BLE_ENABLED) return false;
+        if (probeAvailability < 0) {
+            try { probeAvailability = nativeAvailable() ? 1 : 0; }
+            catch (UnsatisfiedLinkError unavailable) { probeAvailability = 0; }
+        }
+        return probeAvailability == 1;
+    }
     static int mode(String value) {
         if ("ble".equals(value)) return 1;
         if ("gps".equals(value)) return 2;
@@ -17,7 +26,7 @@ final class GpuiServiceProbe {
         return 0;
     }
     static void resumed(Activity activity) {
-        if (!BuildConfig.DEBUG || !BuildConfig.BLE_ENABLED) return;
+        if (!probeAvailable()) return;
         nativeForeground(true);
         String value = activity.getIntent().getStringExtra("gpui.service_probe");
         activity.getIntent().removeExtra("gpui.service_probe");
@@ -38,20 +47,21 @@ final class GpuiServiceProbe {
         }, 1000);
     }
     static void paused() {
-        if (BuildConfig.DEBUG && BuildConfig.BLE_ENABLED) nativeForeground(false);
+        if (probeAvailable()) nativeForeground(false);
     }
+    private static native boolean nativeAvailable();
     private static native void nativeForeground(boolean resumed);
     private static native void nativeRun(int mode);
     private static native boolean nativeLocationWatch();
     public static boolean moveWatchToBackground(long token) {
-        if (!BuildConfig.DEBUG || !BuildConfig.BLE_ENABLED || !watchActive) return false;
+        if (!probeAvailable() || !watchActive) return false;
         return GpuiLocation.probeMoveToBackground(token, () -> watchActive);
     }
     public static void finishLocationWatch() { watchActive = false; }
     public static int locationState(long token) {
-        return BuildConfig.DEBUG && BuildConfig.BLE_ENABLED ? GpuiLocation.probeState(token) : -1;
+        return probeAvailable() ? GpuiLocation.probeState(token) : -1;
     }
     public static long locationPhase(long token, long timestamp, long boundary, boolean resumed) {
-        return BuildConfig.DEBUG && BuildConfig.BLE_ENABLED ? GpuiLocation.probePhase(token, timestamp, boundary, resumed) : -1;
+        return probeAvailable() ? GpuiLocation.probePhase(token, timestamp, boundary, resumed) : -1;
     }
 }

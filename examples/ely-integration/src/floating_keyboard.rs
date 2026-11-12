@@ -1,5 +1,9 @@
-use ely_gpui_component::layout::{reveal_in_bounds, reveal_offset};
-use gpui::{Bounds, Pixels, ScrollHandle, point, px, size};
+use ely_gpui_component::layout::{keyboard_reveal_region, reveal_in_bounds};
+#[cfg(any(test, debug_assertions))]
+use ely_gpui_component::layout::reveal_offset;
+use gpui::{Bounds, Pixels, ScrollHandle, px, size};
+#[cfg(any(test, debug_assertions))]
+use gpui::point;
 
 fn overlaps(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
     a.left() < b.right() && a.right() > b.left() && a.top() < b.bottom() && a.bottom() > b.top()
@@ -20,43 +24,12 @@ pub fn controls_height(available: Bounds<Pixels>, keyboard: Option<Bounds<Pixels
     height
 }
 
-/// Choose a vertical scroll destination only for the actual focused field.
 fn visible_region(
     field: Bounds<Pixels>,
     frame: Bounds<Pixels>,
     keyboard: Option<Bounds<Pixels>>,
 ) -> Option<Bounds<Pixels>> {
-    let Some(keyboard) = keyboard.filter(|keyboard| overlaps(frame, *keyboard)) else {
-        return Some(frame);
-    };
-    if field.right() <= keyboard.left() || field.left() >= keyboard.right() {
-        return Some(frame);
-    }
-    // Keep the field border clear of the keyboard’s rounded backdrop.
-    let gap = px(24.);
-    let above = Bounds::new(
-        frame.origin,
-        size(
-            frame.size.width,
-            ((keyboard.top() - gap).min(frame.bottom()) - frame.top()).max(px(0.)),
-        ),
-    );
-    let below_top = (keyboard.bottom() + gap)
-        .max(frame.top())
-        .min(frame.bottom());
-    let below = Bounds::new(
-        point(frame.left(), below_top),
-        size(frame.size.width, frame.bottom() - below_top),
-    );
-    // shortcut: full control-area occlusion has no scroll destination; reflow the panel to support it.
-    [above, below]
-        .into_iter()
-        .filter(|region| region.size.height >= field.size.height)
-        .min_by(|a, b| {
-            let a = f32::from(reveal_offset(field, *a).y).abs();
-            let b = f32::from(reveal_offset(field, *b).y).abs();
-            a.total_cmp(&b)
-        })
+    keyboard_reveal_region(field, frame, keyboard, px(24.))
 }
 
 #[derive(Default)]

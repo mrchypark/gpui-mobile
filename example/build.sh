@@ -434,7 +434,7 @@ build_android() {
     # ── Build the Rust shared library via cargo-ndk ──────────────────────
     step "Building Rust shared library for ${ndk_abi} (${PROFILE})"
 
-    local jni_libs_dir="$ANDROID_GRADLE_DIR/app/src/main/jniLibs"
+    local jni_libs_dir="$ANDROID_GRADLE_DIR/app/build/generated/jniLibs/${apk_variant}"
 
     cd "$EXAMPLES_DIR"
     cargo ndk \

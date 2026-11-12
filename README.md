@@ -49,7 +49,7 @@ xcodebuild -project GpuiExample.xcodeproj -scheme GpuiExample build
 # Android
 rustup target add aarch64-linux-android
 cd example
-cargo ndk -t arm64-v8a -P 31 -o android/gradle/app/src/main/jniLibs build
+cargo ndk -t arm64-v8a -P 31 -o android/gradle/app/build/generated/jniLibs/debug build
 cd android/gradle && ./gradlew assembleDebug
 ```
 

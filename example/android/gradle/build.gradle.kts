@@ -4,8 +4,8 @@
 // (compiled separately via cargo-ndk) into an APK using NativeActivity.
 //
 // Build steps:
-//   1. Compile the Rust library:
-//      cargo ndk -t arm64-v8a -o app/src/main/jniLibs build --example android_app --release
+//   1. Compile the Rust library from `example/`:
+//      cargo ndk -t arm64-v8a -o android/gradle/app/build/generated/jniLibs/debug build --lib
 //
 //   2. Build the APK:
 //      ./gradlew assembleDebug
@@ -33,30 +33,32 @@ tasks.register("clean", Delete::class) {
 tasks.register<Exec>("buildRustRelease") {
     group = "rust"
     description = "Compile the Rust native library for arm64-v8a using cargo-ndk."
-    workingDir = rootProject.projectDir.parentFile.parentFile.parentFile // -> gpui/
+    workingDir = rootProject.projectDir.parentFile.parentFile // -> example/
     commandLine(
         "cargo", "ndk",
         "-t", "arm64-v8a",
-        "-o", "example/android_app/gradle/app/src/main/jniLibs",
-        "build", "--example", "android_app", "--release"
+        "-o", "android/gradle/app/build/generated/jniLibs/release",
+        "build", "--lib", "--release"
     )
 }
 
 tasks.register<Exec>("buildRustDebug") {
     group = "rust"
     description = "Compile the Rust native library for arm64-v8a (debug) using cargo-ndk."
-    workingDir = rootProject.projectDir.parentFile.parentFile.parentFile
+    workingDir = rootProject.projectDir.parentFile.parentFile
     commandLine(
         "cargo", "ndk",
         "-t", "arm64-v8a",
-        "-o", "example/android_app/gradle/app/src/main/jniLibs",
-        "build", "--example", "android_app"
+        "-o", "android/gradle/app/build/generated/jniLibs/debug",
+        "build", "--lib"
     )
 }
 
 tasks.register("buildAll") {
     group = "rust"
-    description = "Build Rust library (release) and then assemble the debug APK."
-    dependsOn("buildRustRelease")
-    finalizedBy(":app:assembleDebug")
+    description = "Build the release Rust library and assemble the release APK."
+    if (!providers.gradleProperty("ble").map(String::toBoolean).getOrElse(false)) {
+        dependsOn("buildRustRelease")
+    }
+    dependsOn(":app:assembleRelease")
 }

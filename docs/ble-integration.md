@@ -284,7 +284,7 @@ compilation, and APK packaging. Build-Tools 36 used existing accepted SDK licens
 no new license prompt was accepted.
 
 After copying the independently verified BLE-enabled `.so` into
-`example/android/gradle/app/src/main/jniLibs/arm64-v8a/`, run from
+`example/android/gradle/app/build/generated/jniLibs/debug/arm64-v8a/`, run from
 `example/android/gradle` with JDK 21 and the installed Android SDK environment:
 
 ```sh

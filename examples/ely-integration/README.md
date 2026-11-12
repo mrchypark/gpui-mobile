@@ -237,7 +237,6 @@ Android runtime validation is unavailable: elevated `adb devices` found no
 connected device, and the SDK emulator executable is absent. The keyboard
 assertions executed on iOS as described above; Android runtime remains unverified.
 
-The optional `ely-owner-reporter` feature registers Ely's app-wide input-owner
-reporter for every text input. The pinned Ely revision includes
-`forms::set_input_owner_reporter`. Enable this feature for compound controls as
-well as individually configured inputs.
+The example registers Ely's app-wide input-owner reporter at startup. Register
+`forms::set_input_owner_reporter` in mobile hosts so native IME edits reach the
+currently focused Ely field, including fields inside compound controls.
