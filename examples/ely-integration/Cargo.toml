@@ -22,13 +22,13 @@ crate-type = ["rlib", "staticlib"]
 gpui-mobile = { path = "../.." }
 gpui = { package = "gpui-fast", version = "=0.1.12", default-features = false }
 gpui-kit = { version = "=0.8.1", default-features = false, features = ["component", "gpui-fast"] }
-ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "3603c99758c00102bff5330f78088e50a6bf784e", default-features = false }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "8a8d1f9dc3cd40ee2b4ed120f369dbbd52306135", default-features = false }
 # Devices cannot read Ely assets from the build machine's filesystem in debug builds.
 rust-embed = { version = "8.12", features = ["debug-embed"] }
 
 [dev-dependencies]
 gpui = { package = "gpui-fast", version = "=0.1.12", features = ["test-support"] }
-ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "3603c99758c00102bff5330f78088e50a6bf784e", features = ["test-support"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "8a8d1f9dc3cd40ee2b4ed120f369dbbd52306135", features = ["test-support"] }
 naga = { version = "=30.0.1", features = ["wgsl-in"] }
 
 # Cargo only honors patches at the invoking workspace root.

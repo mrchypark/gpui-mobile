@@ -114,6 +114,17 @@ NativeActivity/JNI exports and APK v2 debug signature verification passed; see
 `evidence/native-android.txt` for hashes and commands. AndroidX adds biometric,
 fingerprint and internal receiver permissions through manifest merging.
 
+## Current integration boundary
+
+This example is the only layer here that composes Ely with the mobile host.
+`gpui-mobile` translates platform input and provides window geometry. On Android
+it offers a touch drag to GPUI before starting a scroll. Ely decides whether an
+individual control claims that gesture and owns the resulting UI state. The iOS
+example host declares its window behavior; rotation layout stays with the UI.
+
+Use the Ely revision in this example's `Cargo.toml` and build with `--locked`.
+The example's lockfile records the same revision for both regular and test builds.
+
 ## Historical source identity (2026-10-15)
 
 - Ely: published `https://github.com/mrchypark/Ely-GPUI-Components`,
