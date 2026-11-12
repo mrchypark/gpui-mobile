@@ -2117,6 +2117,8 @@ impl PlatformWindow for AndroidPlatformWindow {
                 Pending { start_x: f32, start_y: f32 },
                 /// Finger has moved beyond the threshold — we are scrolling.
                 Scrolling { prev_x: f32, prev_y: f32 },
+                /// A component claimed the gesture before scroll began.
+                Dragging { start: gpui::Point<gpui::Pixels> },
             }
 
             let state = Mutex::new(TouchState::Idle);
@@ -2132,6 +2134,15 @@ impl PlatformWindow for AndroidPlatformWindow {
                 let logical_x = touch.x / scale_factor;
                 let logical_y = touch.y / scale_factor;
                 let modifiers = gpui::Modifiers::default();
+                let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
+                let drag = |phase, start_position| {
+                    cb.lock()(gpui::PlatformInput::TouchDrag(gpui::TouchDragEvent {
+                        phase,
+                        start_position,
+                        position,
+                    }))
+                    .default_prevented
+                };
 
                 let mut ts = state.lock();
 
@@ -2166,6 +2177,19 @@ impl PlatformWindow for AndroidPlatformWindow {
 
                     // ── ACTION_MOVE ──────────────────────────────────────
                     2 => {
+                        if let TouchState::Dragging { start } = *ts {
+                            drag(gpui::TouchPhase::Moved, start);
+                            return;
+                        }
+                        if let TouchState::Pending { start_x, start_y } = *ts {
+                            if (logical_x - start_x).hypot(logical_y - start_y) > SCROLL_SLOP {
+                                let start = gpui::point(gpui::px(start_x), gpui::px(start_y));
+                                if drag(gpui::TouchPhase::Started, start) {
+                                    *ts = TouchState::Dragging { start };
+                                    return;
+                                }
+                            }
+                        }
                         // Instead of emitting a ScrollWheel event for every
                         // single MOVE, accumulate the delta in MomentumState.
                         // The frame callback will drain and emit one coalesced
@@ -2221,7 +2245,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 }
                                 ms.has_pending_scroll = true;
                             }
-                            TouchState::Idle => {
+                            TouchState::Idle | TouchState::Dragging { .. } => {
                                 // Spurious move without a preceding down — ignore.
                             }
                         }
@@ -2236,7 +2260,6 @@ impl PlatformWindow for AndroidPlatformWindow {
                         // Always emit MouseMove so interactive screens can
                         // track finger position (drag line in Animations,
                         // gradient control in Shaders).
-                        let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
                         let mut guard = cb.lock();
                         let _ = guard(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
                             position,
@@ -2246,6 +2269,11 @@ impl PlatformWindow for AndroidPlatformWindow {
                     }
 
                     3 => {
+                        if let TouchState::Dragging { start } = *ts {
+                            *ts = TouchState::Idle;
+                            drag(gpui::TouchPhase::Cancelled, start);
+                            return;
+                        }
                         let was_scrolling = matches!(*ts, TouchState::Scrolling { .. });
                         let position = match *ts {
                             TouchState::Scrolling { prev_x, prev_y } => {
@@ -2273,8 +2301,6 @@ impl PlatformWindow for AndroidPlatformWindow {
                     }
                     // ── ACTION_UP ────────────────────────────────────────
                     1 => {
-                        let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
-
                         match *ts {
                             TouchState::Pending { start_x, start_y } => {
                                 // Finger lifted without exceeding slop →
@@ -2355,6 +2381,9 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     modifiers,
                                     click_count: 1,
                                 }));
+                            }
+                            TouchState::Dragging { start } => {
+                                drag(gpui::TouchPhase::Ended, start);
                             }
                             TouchState::Idle => {}
                         }
