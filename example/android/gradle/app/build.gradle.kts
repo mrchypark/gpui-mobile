@@ -158,7 +158,7 @@ dependencies {
     implementation("com.google.android.gms:play-services-maps:20.0.0")
     implementation("com.google.android.play:review:2.0.2")
     // AndroidX core for NotificationCompat (used by GpuiNotifications)
-    implementation("androidx.core:core:1.12.0")
+    implementation("androidx.core:core:1.18.0")
     // AndroidX SplashScreen compat (used by GpuiActivity to hold splash until native init)
     implementation("androidx.core:core-splashscreen:1.0.1")
     // AndroidX Biometric for BiometricPrompt (used by GpuiAuthActivity)
