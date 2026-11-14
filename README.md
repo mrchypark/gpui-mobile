@@ -69,11 +69,11 @@ are not in the corresponding crates.io releases:
 
 | Dependency | Registry source | Local change |
 |------------|-----------------|--------------|
-| `gpui-fast` | `=0.1.12` | Deferred draw-phase invalidation fix. |
-| `gpui-fast-wgpu` | `=0.1.12` | Mobile present-mode selection and unaligned path buffer handling. |
+| `gpui-fast` | `=0.1.14` | Deferred draw-phase invalidation and Android foreground task fixes. |
+| `gpui-fast-wgpu` | `=0.1.14` | Mobile present-mode selection and unaligned path buffer handling. |
 | `btleplug` | `=0.13.5` | Android service-addressed GATT identity and disconnect handling. |
 
-`gpui-kit` 0.8.1 uses its `gpui-fast` feature. Its unconditional dependencies
+`gpui-kit` 0.9.1 uses its `gpui-fast` feature. Its unconditional dependencies
 still include `gpui-pre`, but the mobile application and renderer use `gpui-fast`.
 Fast scroll-layer caching is not compiled for Android or iOS upstream.
 

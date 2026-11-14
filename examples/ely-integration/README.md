@@ -1,6 +1,6 @@
 # Native Ely mobile viewport
 
-The integration uses GPUI Kit 0.8.1, GPUI Fast 0.1.12, and a pinned public
+The integration uses GPUI Kit 0.9.1, GPUI Fast 0.1.14, and a pinned public
 Ely fork revision. Cargo applies the local Fast overrides in the application
 workspace; dependencies do not inherit patches from other manifests.
 
