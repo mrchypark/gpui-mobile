@@ -108,8 +108,11 @@ fn keystroke(key_code: u32, modifier_flags: u32, unmodified: &str, characters: &
     Keystroke {
         modifiers,
         key,
-        key_char: if !named_key && !modifiers.platform && !modifiers.control
-            && !characters.is_empty() && !characters.chars().any(char::is_control)
+        key_char: if !named_key
+            && !modifiers.platform
+            && !modifiers.control
+            && !characters.is_empty()
+            && !characters.chars().any(char::is_control)
         {
             Some(characters.to_owned())
         } else {
@@ -119,7 +122,12 @@ fn keystroke(key_code: u32, modifier_flags: u32, unmodified: &str, characters: &
 }
 
 /// Create a key down event from a key code and UIKit characters.
-pub fn key_code_to_key_down(key_code: u32, modifier_flags: u32, unmodified: &str, characters: &str) -> PlatformInput {
+pub fn key_code_to_key_down(
+    key_code: u32,
+    modifier_flags: u32,
+    unmodified: &str,
+    characters: &str,
+) -> PlatformInput {
     PlatformInput::KeyDown(KeyDownEvent {
         keystroke: keystroke(key_code, modifier_flags, unmodified, characters),
         is_held: false,
@@ -128,7 +136,12 @@ pub fn key_code_to_key_down(key_code: u32, modifier_flags: u32, unmodified: &str
 }
 
 /// Create a key up event from a key code and modifiers.
-pub fn key_code_to_key_up(key_code: u32, modifier_flags: u32, unmodified: &str, characters: &str) -> PlatformInput {
+pub fn key_code_to_key_up(
+    key_code: u32,
+    modifier_flags: u32,
+    unmodified: &str,
+    characters: &str,
+) -> PlatformInput {
     PlatformInput::KeyUp(gpui::KeyUpEvent {
         keystroke: keystroke(key_code, modifier_flags, unmodified, characters),
     })
@@ -151,7 +164,8 @@ mod tests {
 
     #[test]
     fn key_up_keeps_the_physical_key_and_modifier() {
-        let PlatformInput::KeyUp(event) = key_code_to_key_up(0x4F, 1 << 17, "\u{f703}", "\u{f703}") else {
+        let PlatformInput::KeyUp(event) = key_code_to_key_up(0x4F, 1 << 17, "\u{f703}", "\u{f703}")
+        else {
             panic!("expected key up");
         };
         assert_eq!(event.keystroke.key, "right");
@@ -160,12 +174,18 @@ mod tests {
 
     #[test]
     fn layout_and_modified_characters_are_preserved() {
-        let PlatformInput::KeyDown(event) = key_code_to_key_down(0x14, 1 << 17, "a", "A") else { panic!("expected key down") };
+        let PlatformInput::KeyDown(event) = key_code_to_key_down(0x14, 1 << 17, "a", "A") else {
+            panic!("expected key down")
+        };
         assert_eq!(event.keystroke.key, "a");
         assert_eq!(event.keystroke.key_char.as_deref(), Some("A"));
-        let PlatformInput::KeyDown(event) = key_code_to_key_down(0x16, 1 << 19, "s", "ß") else { panic!("expected key down") };
+        let PlatformInput::KeyDown(event) = key_code_to_key_down(0x16, 1 << 19, "s", "ß") else {
+            panic!("expected key down")
+        };
         assert_eq!(event.keystroke.key_char.as_deref(), Some("ß"));
-        let PlatformInput::KeyDown(event) = key_code_to_key_down(0x04, 1 << 18, "a", "a") else { panic!("expected key down") };
+        let PlatformInput::KeyDown(event) = key_code_to_key_down(0x04, 1 << 18, "a", "a") else {
+            panic!("expected key down")
+        };
         assert_eq!(event.keystroke.key_char, None);
     }
 }

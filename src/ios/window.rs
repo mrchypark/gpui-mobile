@@ -20,11 +20,11 @@ use crate::mobile_events::{
 };
 use crate::momentum::{MomentumScroller, VelocityTracker};
 use gpui::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, Capslock,
-    DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, Scene, Size, TileId, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowParams, point, px, size,
+    point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
+    Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -2854,7 +2854,7 @@ fn step_pinch_delta(last: &Cell<Option<f32>>, phase: gpui::TouchPhase, scale: f3
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyInputSession, appearance_style_changed, edge_attached_keyboard_insets};
+    use super::{appearance_style_changed, edge_attached_keyboard_insets, ProxyInputSession};
 
     #[test]
     fn appearance_callback_requires_a_real_style_transition() {

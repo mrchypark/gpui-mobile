@@ -29,12 +29,12 @@ use std::{
 
 use super::accesskit_adapter::InjectingAdapter;
 use accesskit_android::jni::{
-    JNIEnv, JavaVM,
     objects::{GlobalRef, JObject, JString},
+    JNIEnv, JavaVM,
 };
 use gpui::{
-    A11yCallbacks,
     accesskit::{ActionHandler, ActionRequest, ActivationHandler, TreeUpdate},
+    A11yCallbacks,
 };
 
 static BRIDGE: Mutex<Option<Bridge>> = Mutex::new(None);

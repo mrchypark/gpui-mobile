@@ -41,8 +41,8 @@
 use std::{
     ffi::c_void,
     sync::{
-        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -138,23 +138,38 @@ pub(crate) fn end_thermal_listener(generation: i64) {
 /// Java supplies only owned scalar values; no GPUI callback runs on this thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeStatusChanged(
-    _env: *mut c_void, _class: *mut c_void, generation: i64, status: i32,
+    _env: *mut c_void,
+    _class: *mut c_void,
+    generation: i64,
+    status: i32,
 ) {
-    if generation <= 0 || !(0..=6).contains(&status)
-        || THERMAL_GENERATION.load(Ordering::Acquire) != generation { return; }
+    if generation <= 0
+        || !(0..=6).contains(&status)
+        || THERMAL_GENERATION.load(Ordering::Acquire) != generation
+    {
+        return;
+    }
     THERMAL_EVENTS.lock().unwrap().push((generation, status));
-    if let Some(app) = android_app() { app.create_waker().wake(); }
+    if let Some(app) = android_app() {
+        app.create_waker().wake();
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeListenerStopped(
-    _env: *mut c_void, _class: *mut c_void, generation: i64,
+    _env: *mut c_void,
+    _class: *mut c_void,
+    generation: i64,
 ) {
-    if generation > 0 && THERMAL_GENERATION.compare_exchange(
-        generation, 0, Ordering::AcqRel, Ordering::Acquire,
-    ).is_ok() {
+    if generation > 0
+        && THERMAL_GENERATION
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
         THERMAL_STOP_PENDING.store(true, Ordering::Release);
-        if let Some(app) = android_app() { app.create_waker().wake(); }
+        if let Some(app) = android_app() {
+            app.create_waker().wake();
+        }
     }
 }
 
@@ -166,7 +181,9 @@ fn drain_platform_events() {
     if THERMAL_STOP_PENDING.swap(false, Ordering::AcqRel)
         && THERMAL_GENERATION.load(Ordering::Acquire) == 0
     {
-        if let Some(platform) = platform() { platform.on_thermal_host_destroyed(); }
+        if let Some(platform) = platform() {
+            platform.on_thermal_host_destroyed();
+        }
     }
     let thermal = std::mem::take(&mut *THERMAL_EVENTS.lock().unwrap());
     if let Some(platform) = platform() {
@@ -183,12 +200,15 @@ fn drain_platform_events() {
         }
     }
     let text = std::mem::take(&mut *IME_TEXT.lock().unwrap());
-    if let Some(window) = platform()
-        .and_then(|platform| platform.primary_window())
-    {
+    if let Some(window) = platform().and_then(|platform| platform.primary_window()) {
         for (session, editor, input) in text {
             if let Some(lease) = crate::mobile_events::active_text_input_lease() {
-                if !window.gpui_handle().is_some_and(|handle| handle.window_id().as_u64() == lease.owner().window) { continue; }
+                if !window
+                    .gpui_handle()
+                    .is_some_and(|handle| handle.window_id().as_u64() == lease.owner().window)
+                {
+                    continue;
+                }
             }
             log::info!("IME drain session={session} editor={editor} active={} current_session={} current_editor={} accepted={}",
                 IME_ACTIVE.load(Ordering::Acquire), IME_GENERATION.load(Ordering::Acquire),
@@ -302,8 +322,8 @@ use android_activity::{AndroidApp, MainEvent, PollEvent};
 
 use super::platform::{AndroidPlatform, SharedPlatform};
 
-use jni::JavaVM;
 use jni::objects::{JObject, JString, JValue};
+use jni::JavaVM;
 
 // ── JNI helpers (safe `jni` crate wrappers) ──────────────────────────────────
 
@@ -354,15 +374,24 @@ pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Resu
 pub fn activity<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, String> {
     let app = android_app().ok_or_else(|| "Activity not available".to_string())?;
     let object = unsafe { JObject::from_raw(env, app.activity_as_ptr() as jni::sys::jobject) };
-    env.new_local_ref(&object).map_err(|error| error.to_string())
+    env.new_local_ref(&object)
+        .map_err(|error| error.to_string())
 }
 
 fn query_activity_focus() -> Result<bool, String> {
     with_env(|env| {
         let activity = activity(env)?;
-        env.call_method(&activity, jni::jni_str!("gpuiHasWindowFocus"), jni::jni_sig!("()Z"), &[])
-            .and_then(|value| value.z())
-            .map_err(|error| { env.exception_clear(); error.to_string() })
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiHasWindowFocus"),
+            jni::jni_sig!("()Z"),
+            &[],
+        )
+        .and_then(|value| value.z())
+        .map_err(|error| {
+            env.exception_clear();
+            error.to_string()
+        })
     })
 }
 
@@ -914,7 +943,8 @@ pub fn run_event_loop(app: &AndroidApp) {
 
                             let succeeded = match platform
                                 .initialize_gpu_context(&native_window)
-                                .and_then(|()| existing.init_window(native_window, gpu_ctx.clone())) {
+                                .and_then(|()| existing.init_window(native_window, gpu_ctx.clone()))
+                            {
                                 Ok(()) => true,
                                 Err(e) => {
                                     log::warn!(
@@ -996,9 +1026,7 @@ pub fn run_event_loop(app: &AndroidApp) {
         }
 
         // 4. ConfigChanged
-        if let Some(window) = platform()
-            .and_then(|platform| platform.primary_window())
-        {
+        if let Some(window) = platform().and_then(|platform| platform.primary_window()) {
             let pending = WINDOW_INSETS_PENDING.lock().take();
             if let Some((density, insets)) = pending {
                 window.update_window_insets(density, insets);
@@ -1145,7 +1173,6 @@ pub fn run_event_loop(app: &AndroidApp) {
                 }
             }
         }
-
     }
 
     log::info!("run_event_loop: exiting main loop");
@@ -1222,12 +1249,18 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 
         MainEvent::GainedFocus => {
             log::info!("MainEvent::GainedFocus");
-            FOCUS_PENDING.lock().unwrap().push((FOCUS_GENERATION.load(Ordering::Acquire), true));
+            FOCUS_PENDING
+                .lock()
+                .unwrap()
+                .push((FOCUS_GENERATION.load(Ordering::Acquire), true));
         }
 
         MainEvent::LostFocus => {
             log::info!("MainEvent::LostFocus");
-            FOCUS_PENDING.lock().unwrap().push((FOCUS_GENERATION.load(Ordering::Acquire), false));
+            FOCUS_PENDING
+                .lock()
+                .unwrap()
+                .push((FOCUS_GENERATION.load(Ordering::Acquire), false));
         }
 
         MainEvent::Resume { .. } => {
@@ -1719,9 +1752,18 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
         .with(|configuration| crate::mobile_events::android_input_traits(&configuration.borrow()));
     let secure = IME_PASSWORD.get();
     let (flags, options) = crate::mobile_events::android_password_traits(flags, options, secure);
-    let key = (keyboard_type, flags, options, IME_EDITOR.load(Ordering::Acquire));
-    if IME_LOGICAL_OWNER.load(Ordering::Acquire) && IME_ACTIVE.load(Ordering::Acquire)
-        && IME_SHOWN_KEY.get() == Some(key) { return; }
+    let key = (
+        keyboard_type,
+        flags,
+        options,
+        IME_EDITOR.load(Ordering::Acquire),
+    );
+    if IME_LOGICAL_OWNER.load(Ordering::Acquire)
+        && IME_ACTIVE.load(Ordering::Acquire)
+        && IME_SHOWN_KEY.get() == Some(key)
+    {
+        return;
+    }
     IME_SHOWN_KEY.set(Some(key));
     IME_TYPE.set(keyboard_type);
     IME_ACTIVE.store(true, Ordering::Release);
@@ -1739,14 +1781,18 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
             let result = with_env(|env| {
                 let class = find_app_class(env, "dev.gpui.mobile.GpuiKeyboard")?;
                 let activity = activity(env)?;
-                let mut input_type = if secure { 0x81 } else { match keyboard_type {
-                    crate::KeyboardType::Default => 1,
-                    crate::KeyboardType::EmailAddress => 0x21,
-                    crate::KeyboardType::Phone => 3,
-                    crate::KeyboardType::NumberPad => 2,
-                    crate::KeyboardType::URL => 0x11,
-                    crate::KeyboardType::Decimal => 0x2002,
-                }};
+                let mut input_type = if secure {
+                    0x81
+                } else {
+                    match keyboard_type {
+                        crate::KeyboardType::Default => 1,
+                        crate::KeyboardType::EmailAddress => 0x21,
+                        crate::KeyboardType::Phone => 3,
+                        crate::KeyboardType::NumberPad => 2,
+                        crate::KeyboardType::URL => 0x11,
+                        crate::KeyboardType::Decimal => 0x2002,
+                    }
+                };
                 if input_type & 0xf == 1 {
                     input_type |= flags;
                 }
@@ -1836,8 +1882,11 @@ pub(crate) fn input_handler_changed() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_hasLogicalOwner(
-    _env: *mut c_void, _class: *mut c_void,
-) -> u8 { IME_LOGICAL_OWNER.load(Ordering::Acquire) as u8 }
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> u8 {
+    IME_LOGICAL_OWNER.load(Ordering::Acquire) as u8
+}
 thread_local! {
     static IME_PASSWORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static IME_SHOWN_KEY: std::cell::Cell<Option<(crate::KeyboardType, i32, i32, i64)>> = const { std::cell::Cell::new(None) };
@@ -1866,14 +1915,20 @@ pub(crate) fn restart_ime_connection(session: i64, editor: i64) -> bool {
     if !ime_delivery_current(session, editor) || !IME_LOGICAL_OWNER.load(Ordering::Acquire) {
         return false;
     }
-    let Some(next_editor) = editor.checked_add(1) else { return false; };
-    if IME_EDITOR.compare_exchange(editor, next_editor, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    let Some(next_editor) = editor.checked_add(1) else {
+        return false;
+    };
+    if IME_EDITOR
+        .compare_exchange(editor, next_editor, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return false;
     }
     if let Some(app) = android_app() {
         app.run_on_java_main_thread(Box::new(move || {
             if !ime_delivery_current(session, next_editor)
-                || !IME_LOGICAL_OWNER.load(Ordering::Acquire) {
+                || !IME_LOGICAL_OWNER.load(Ordering::Acquire)
+            {
                 return;
             }
             let result = with_env(|env| {
@@ -1883,10 +1938,17 @@ pub(crate) fn restart_ime_connection(session: i64, editor: i64) -> bool {
                     &class,
                     jni::jni_str!("restart"),
                     jni::jni_sig!("(Landroid/app/Activity;JJ)V"),
-                    &[JValue::Object(&activity), JValue::Long(session), JValue::Long(next_editor)],
+                    &[
+                        JValue::Object(&activity),
+                        JValue::Long(session),
+                        JValue::Long(next_editor),
+                    ],
                 )
                 .map(|_| ())
-                .map_err(|error| { env.exception_clear(); error.to_string() })
+                .map_err(|error| {
+                    env.exception_clear();
+                    error.to_string()
+                })
             });
             if let Err(error) = result {
                 log::warn!("restart_ime_connection: {error}");
@@ -1931,7 +1993,9 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_committed(
         let text = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
         let text = get_string(env, &text);
         log::info!("IME JNI commit session={session} editor={editor} action={action}");
-        let Some(input) = crate::mobile_events::ime_action(action, text) else { return Ok(()); };
+        let Some(input) = crate::mobile_events::ime_action(action, text) else {
+            return Ok(());
+        };
         IME_TEXT.lock().unwrap().push((session, editor, input));
         if let Some(app) = android_app() {
             app.create_waker().wake();
@@ -1943,18 +2007,33 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_committed(
 /// Marked updates preserve their originating connection/owner; never become commits.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composed(
-    _env: *mut c_void, _class: *mut c_void, session: i64, editor: i64,
-    text: *mut c_void, start: i32, end: i32,
+    _env: *mut c_void,
+    _class: *mut c_void,
+    session: i64,
+    editor: i64,
+    text: *mut c_void,
+    start: i32,
+    end: i32,
 ) {
     let _ = with_env(|env| {
         let object = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
         let text = get_string(env, &object);
         let len = text.encode_utf16().count();
-        if start < 0 || end < start || end as usize > len { return Ok(()); }
-        IME_TEXT.lock().unwrap().push((session, editor, crate::mobile_events::ImeInput::Compose {
-            text, selection: start as usize..end as usize, region: None,
-        }));
-        if let Some(app) = android_app() { app.create_waker().wake(); }
+        if start < 0 || end < start || end as usize > len {
+            return Ok(());
+        }
+        IME_TEXT.lock().unwrap().push((
+            session,
+            editor,
+            crate::mobile_events::ImeInput::Compose {
+                text,
+                selection: start as usize..end as usize,
+                region: None,
+            },
+        ));
+        if let Some(app) = android_app() {
+            app.create_waker().wake();
+        }
         Ok(())
     });
 }
@@ -1962,19 +2041,36 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composed(
 /// Preserve an IME-declared composing region until its following marked update.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_composingRegion(
-    _env: *mut c_void, _class: *mut c_void, session: i64, editor: i64,
-    text: *mut c_void, start_offset: i32, end_offset: i32,
+    _env: *mut c_void,
+    _class: *mut c_void,
+    session: i64,
+    editor: i64,
+    text: *mut c_void,
+    start_offset: i32,
+    end_offset: i32,
 ) {
     let _ = with_env(|env| {
         let object = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
         let text = get_string(env, &object);
-        if start_offset > end_offset { return Ok(()); }
-        IME_TEXT.lock().unwrap().push((session, editor,
+        if start_offset > end_offset {
+            return Ok(());
+        }
+        IME_TEXT.lock().unwrap().push((
+            session,
+            editor,
             crate::mobile_events::ImeInput::Compose {
-                text: String::new(), selection: 0..0,
-                region: Some(crate::mobile_events::ImeComposeRegion { text, start_offset, end_offset }),
-            }));
-        if let Some(app) = android_app() { app.create_waker().wake(); }
+                text: String::new(),
+                selection: 0..0,
+                region: Some(crate::mobile_events::ImeComposeRegion {
+                    text,
+                    start_offset,
+                    end_offset,
+                }),
+            },
+        ));
+        if let Some(app) = android_app() {
+            app.create_waker().wake();
+        }
         Ok(())
     });
 }
@@ -2025,14 +2121,21 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeWindowFocusChan
     focused: u8,
 ) {
     let generation = FOCUS_GENERATION.load(Ordering::Acquire);
-    let Some(app) = android_app() else { return; };
+    let Some(app) = android_app() else {
+        return;
+    };
     let is_current = with_env(|env| {
         let source = unsafe { JObject::from_raw(env, activity_ref as jni::sys::jobject) };
         let current = unsafe { JObject::from_raw(env, app.activity_as_ptr() as jni::sys::jobject) };
-        env.is_same_object(&source, &current).map_err(|error| error.to_string())
-    }).unwrap_or(false);
+        env.is_same_object(&source, &current)
+            .map_err(|error| error.to_string())
+    })
+    .unwrap_or(false);
     if is_current {
-        FOCUS_PENDING.lock().unwrap().push((generation, focused != 0));
+        FOCUS_PENDING
+            .lock()
+            .unwrap()
+            .push((generation, focused != 0));
         app.create_waker().wake();
     }
 }

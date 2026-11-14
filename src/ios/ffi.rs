@@ -357,7 +357,9 @@ pub extern "C" fn gpui_ios_set_frame_waker(
     context: *mut c_void,
 ) {
     if let Some(window) = window_for_handle(window_ptr as usize) {
-        window.frame_demand.set_host_waker(waker.map(|waker| (waker, context)));
+        window
+            .frame_demand
+            .set_host_waker(waker.map(|waker| (waker, context)));
     }
 }
 
@@ -456,10 +458,18 @@ pub extern "C" fn gpui_ios_handle_key_event(
             String::new()
         } else {
             // The host supplies UTF-8 strings valid for this call.
-            unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+            unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned()
         }
     };
-    window.handle_key_event(key_code, modifiers, &string(unmodified), &string(characters), is_key_down);
+    window.handle_key_event(
+        key_code,
+        modifiers,
+        &string(unmodified),
+        &string(characters),
+        is_key_down,
+    );
 }
 
 /// Called from ObjC when the app receives a URL to open.

@@ -19,11 +19,11 @@ extern "C" {}
 
 struct SessionState {
     operations: Arc<Mutex<()>>,
-    session: *mut AnyObject,       // AVCaptureSession
-    device: *mut AnyObject,        // AVCaptureDevice
-    device_input: *mut AnyObject,  // AVCaptureDeviceInput
-    photo_output: *mut AnyObject,  // AVCapturePhotoOutput
-    video_output: *mut AnyObject,  // AVCaptureMovieFileOutput (may be null)
+    session: *mut AnyObject,      // AVCaptureSession
+    device: *mut AnyObject,       // AVCaptureDevice
+    device_input: *mut AnyObject, // AVCaptureDeviceInput
+    photo_output: *mut AnyObject, // AVCapturePhotoOutput
+    video_output: *mut AnyObject, // AVCaptureMovieFileOutput (may be null)
     _enable_audio: bool,
     _audio_input: *mut AnyObject, // AVCaptureDeviceInput for audio (may be null)
     flash_mode: FlashMode,
@@ -78,7 +78,10 @@ fn sessions() -> std::sync::MutexGuard<'static, Option<HashMap<usize, SessionSta
 }
 
 fn camera_operations(id: usize) -> Result<Arc<Mutex<()>>, String> {
-    sessions().as_ref().unwrap().get(&id)
+    sessions()
+        .as_ref()
+        .unwrap()
+        .get(&id)
         .map(|state| Arc::clone(&state.operations))
         .ok_or_else(|| "Invalid camera handle".into())
 }
@@ -98,12 +101,10 @@ unsafe fn release(object: *mut AnyObject) {
 /// The caller owns the returned reference and must release it.
 pub fn get_session_ptr(id: usize) -> Option<*mut AnyObject> {
     let guard = sessions();
-    guard
-        .as_ref()
-        .and_then(|map| {
-            map.get(&id)
-                .map(|state| unsafe { msg_send![state.session, retain] })
-        })
+    guard.as_ref().and_then(|map| {
+        map.get(&id)
+            .map(|state| unsafe { msg_send![state.session, retain] })
+    })
 }
 
 /// Retain the AVCaptureSession while the registry lock is held. The caller owns
@@ -399,8 +400,8 @@ use crate::ios::util::nsstring;
 
 fn av_flash_mode(mode: FlashMode) -> i64 {
     match mode {
-        FlashMode::Always => 1, // AVCaptureFlashModeOn
-        FlashMode::Auto => 2,   // AVCaptureFlashModeAuto
+        FlashMode::Always => 1,                 // AVCaptureFlashModeOn
+        FlashMode::Auto => 2,                   // AVCaptureFlashModeAuto
         FlashMode::Off | FlashMode::Torch => 0, // AVCaptureFlashModeOff
     }
 }
@@ -1163,10 +1164,7 @@ pub fn dispose(handle: CameraHandle) -> Result<(), String> {
             let recording: Bool = unsafe { msg_send![state.video_output, isRecording] };
             recording.as_bool()
         };
-        let video_result = video_receivers()
-            .as_mut()
-            .unwrap()
-            .remove(&handle.id);
+        let video_result = video_receivers().as_mut().unwrap().remove(&handle.id);
         (state.video_output, recording, video_result)
     };
 
@@ -1263,7 +1261,10 @@ mod tests {
         let (finished_tx, finished_rx) = mpsc::channel();
         let (cleaned_tx, cleaned_rx) = mpsc::channel();
         let worker = after_finalization(finished_rx, move || cleaned_tx.send(()).unwrap());
-        assert!(matches!(cleaned_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            cleaned_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         finished_tx.send(()).unwrap();
         worker.join().unwrap();
         assert_eq!(cleaned_rx.try_recv(), Ok(()));
@@ -1287,12 +1288,8 @@ mod tests {
     #[test]
     fn bounded_wait_reports_timeout() {
         let (_tx, rx) = mpsc::channel();
-        let error = recv_bounded::<CapturedImage>(
-            rx,
-            Duration::from_millis(5),
-            "Photo capture",
-        )
-        .unwrap_err();
+        let error = recv_bounded::<CapturedImage>(rx, Duration::from_millis(5), "Photo capture")
+            .unwrap_err();
         assert_eq!(error, "Photo capture timed out");
     }
 

@@ -783,27 +783,21 @@ mod attachment_tests {
         on_main(|| unsafe {
             let frame = ObjcCGRect::new(0.0, 0.0, 120.0, 90.0);
             let mut params = PlatformViewParams::default();
-            assert!(
-                IosPlatformView::create_camera_preview_view(frame, &params)
-                    .unwrap_err()
-                    .contains("requires session_id")
-            );
+            assert!(IosPlatformView::create_camera_preview_view(frame, &params)
+                .unwrap_err()
+                .contains("requires session_id"));
             params
                 .creation_params
                 .insert("session_id".into(), "invalid".into());
-            assert!(
-                IosPlatformView::create_camera_preview_view(frame, &params)
-                    .unwrap_err()
-                    .contains("unsigned integer")
-            );
+            assert!(IosPlatformView::create_camera_preview_view(frame, &params)
+                .unwrap_err()
+                .contains("unsigned integer"));
             params
                 .creation_params
                 .insert("session_id".into(), usize::MAX.to_string());
-            assert!(
-                IosPlatformView::create_camera_preview_view(frame, &params)
-                    .unwrap_err()
-                    .contains("disposed or missing")
-            );
+            assert!(IosPlatformView::create_camera_preview_view(frame, &params)
+                .unwrap_err()
+                .contains("disposed or missing"));
         });
     }
 }
