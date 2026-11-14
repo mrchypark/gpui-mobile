@@ -490,7 +490,9 @@ impl Drop for AndroidDispatcher {
 unsafe extern "C" fn looper_callback(fd: RawFd, _events: i32, data: *mut std::ffi::c_void) -> i32 {
     // A callback may unregister itself; retain its own queue reference.
     let queue_ptr = data as *const Mutex<MainQueue>;
-    unsafe { Arc::increment_strong_count(queue_ptr); }
+    unsafe {
+        Arc::increment_strong_count(queue_ptr);
+    }
     let queue_arc = unsafe { Arc::from_raw(queue_ptr) };
 
     // Drain the wake pipe (ignore errors — just consume the byte(s)).

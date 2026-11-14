@@ -41,9 +41,8 @@ use std::{
     cell::RefCell,
     ptr,
     sync::{
-        OnceLock,
         atomic::{AtomicBool, AtomicPtr, Ordering},
-        mpsc,
+        mpsc, OnceLock,
     },
     time::{Duration, Instant},
 };

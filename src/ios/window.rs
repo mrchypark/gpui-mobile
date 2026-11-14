@@ -20,11 +20,11 @@ use crate::mobile_events::{
 };
 use crate::momentum::{MomentumScroller, VelocityTracker};
 use gpui::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile, Bounds, Capslock,
-    DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, Scene, Size, TileId, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowParams, point, px, size,
+    point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
+    Bounds, Capslock, DevicePixels, DispatchEventResult, GpuSpecs, Modifiers, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PromptButton, PromptLevel, RequestFrameOptions, Scene, Size, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use gpui_wgpu::{GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -109,31 +109,58 @@ unsafe fn clear_proxy_context(this: *mut AnyObject, window: &IosWindowInner) {
 unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, before_edit: bool) {
     let native: *mut AnyObject = msg_send![this, text];
     let utf8: *const i8 = msg_send![native, UTF8String];
-    let native = if utf8.is_null() { String::new() } else {
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+    let native = if utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
     };
     // UIKit can mutate textStorage directly before invoking insertText. Verify
     // the last acknowledged document, not this partially applied native edit.
-    let expected = if before_edit { window.proxy_text.borrow().clone() } else { native.clone() };
-    let (context, matches) = window.input_handler.call(|| !window.closed.get(), |handler| {
-        let (accepts, owner) = mobile_events::query_text_input_owner(|| handler.query_accepts_text_input());
-        if !accepts { return (None, false); }
-        let context = handler.selected_text_range(false).map(|selection| (owner, selection.range));
-        let matches = window.proxy_base.get().and_then(|base| {
-            let end = base.checked_add(expected.encode_utf16().count())?;
-            let range = base..end;
-            let mut adjusted = None;
-            let actual = handler.text_for_range(range.clone(), &mut adjusted)?;
-            Some(actual == expected && adjusted.is_none_or(|adjusted| adjusted == range))
-        }).unwrap_or(false);
-        (context, matches)
-    }).unwrap_or((None, false));
+    let expected = if before_edit {
+        window.proxy_text.borrow().clone()
+    } else {
+        native.clone()
+    };
+    let (context, matches) = window
+        .input_handler
+        .call(
+            || !window.closed.get(),
+            |handler| {
+                let (accepts, owner) =
+                    mobile_events::query_text_input_owner(|| handler.query_accepts_text_input());
+                if !accepts {
+                    return (None, false);
+                }
+                let context = handler
+                    .selected_text_range(false)
+                    .map(|selection| (owner, selection.range));
+                let matches = window
+                    .proxy_base
+                    .get()
+                    .and_then(|base| {
+                        let end = base.checked_add(expected.encode_utf16().count())?;
+                        let range = base..end;
+                        let mut adjusted = None;
+                        let actual = handler.text_for_range(range.clone(), &mut adjusted)?;
+                        Some(
+                            actual == expected && adjusted.is_none_or(|adjusted| adjusted == range),
+                        )
+                    })
+                    .unwrap_or(false);
+                (context, matches)
+            },
+        )
+        .unwrap_or((None, false));
     let changed = *window.proxy_context.borrow() != context;
-    let owner_changed = window.proxy_context.borrow().as_ref().map(|c| c.0)
-        != context.as_ref().map(|c| c.0);
+    let owner_changed =
+        window.proxy_context.borrow().as_ref().map(|c| c.0) != context.as_ref().map(|c| c.0);
     if (before_edit && changed) || owner_changed || !matches {
         clear_proxy_context(this, window);
-        window.proxy_base.set(context.as_ref().map(|(_, range)| range.start));
+        window
+            .proxy_base
+            .set(context.as_ref().map(|(_, range)| range.start));
     } else if !before_edit {
         // A void handler callback is not acceptance. Only authoritative text
         // at the original anchor can certify this native document's mapping.
@@ -146,10 +173,19 @@ unsafe fn sync_proxy_context(this: *mut AnyObject, window: &IosWindowInner, befo
 // Describe one whole native edit, including textStorage mutations that precede
 // an overridden callback. Offsets are UTF-16; comparison boundaries are scalars.
 fn native_text_edit<'a>(before: &str, after: &'a str) -> (std::ops::Range<usize>, &'a str) {
-    let prefix = before.chars().zip(after.chars()).take_while(|(a, b)| a == b)
-        .map(|(ch, _)| ch.len_utf8()).sum::<usize>();
-    let suffix = before[prefix..].chars().rev().zip(after[prefix..].chars().rev())
-        .take_while(|(a, b)| a == b).map(|(ch, _)| ch.len_utf8()).sum::<usize>();
+    let prefix = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum::<usize>();
+    let suffix = before[prefix..]
+        .chars()
+        .rev()
+        .zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(ch, _)| ch.len_utf8())
+        .sum::<usize>();
     let start = before[..prefix].encode_utf16().count();
     let end = before[..before.len() - suffix].encode_utf16().count();
     (start..end, &after[prefix..after.len() - suffix])
@@ -472,14 +508,28 @@ fn register_metal_view_class() -> &'static AnyClass {
                 let center: super::cg_types::ObjcCGPoint =
                     msg_send![recognizer, locationInView: this];
                 let scale: f64 = msg_send![recognizer, scale];
+                let center_pt = point(px(center.x as f32), px(center.y as f32));
+                let scale_f32 = scale as f32;
                 let event = window.mobile_events.borrow_mut().pinch(
                     phase,
-                    point(px(center.x as f32), px(center.y as f32)),
-                    scale as f32,
+                    center_pt,
+                    scale_f32,
                     std::time::Duration::ZERO,
                 );
                 if let Some(event) = event {
                     window.emit_mobile_events(vec![event]);
+                }
+                if !crate::mobile_events::raw_touch_only() && !window.closed.get() {
+                    if let Some(delta) =
+                        step_pinch_delta(&window.last_pinch_scale, phase, scale_f32)
+                    {
+                        window.dispatch_input(PlatformInput::Pinch(gpui::PinchEvent {
+                            position: center_pt,
+                            delta,
+                            modifiers: window.modifiers.get(),
+                            phase,
+                        }));
+                    }
                 }
             }
             decl.add_method(
@@ -894,7 +944,12 @@ pub(crate) struct IosWindowInner {
     /// Input handler for text input
     input_handler: Callback<PlatformInputHandler>,
     proxy_input_session: RefCell<ProxyInputSession<gpui::FocusId>>,
-    proxy_context: RefCell<Option<(Option<mobile_events::TextInputOwner>, std::ops::Range<usize>)>>,
+    proxy_context: RefCell<
+        Option<(
+            Option<mobile_events::TextInputOwner>,
+            std::ops::Range<usize>,
+        )>,
+    >,
     proxy_base: Cell<Option<usize>>,
     proxy_mapping_valid: Cell<bool>,
     proxy_text: RefCell<String>,
@@ -936,6 +991,7 @@ pub(crate) struct IosWindowInner {
     touch_state: Cell<TouchState>,
     mobile_events: RefCell<MobileEventState>,
     legacy_multitouch: Cell<bool>,
+    last_pinch_scale: Cell<Option<f32>>,
     keyboard_bounds: Cell<Option<Bounds<Pixels>>>,
     tablet_keyboard_guide: Cell<*mut AnyObject>,
     /// Latest complete observation, including floating keyboard geometry.
@@ -1085,6 +1141,7 @@ impl IosWindowInner {
                     return;
                 }
                 self.legacy_multitouch.set(false);
+                self.last_pinch_scale.set(None);
             }
             self.surface_available.set(available);
             if available {
@@ -1117,7 +1174,11 @@ impl IosWindowInner {
         self.velocity_tracker.borrow_mut().reset();
         self.momentum_scroller.borrow_mut().cancel();
         if let TouchState::Dragging { start } = state {
-            self.dispatch_touch_drag(gpui::TouchPhase::Cancelled, start, self.mouse_position.get());
+            self.dispatch_touch_drag(
+                gpui::TouchPhase::Cancelled,
+                start,
+                self.mouse_position.get(),
+            );
         } else if matches!(state, TouchState::Scrolling { .. }) {
             self.dispatch_input(PlatformInput::Scroll(gpui::ScrollEvent {
                 position: self.mouse_position.get(),
@@ -1295,6 +1356,7 @@ impl IosWindowInner {
                 touch_state: Cell::new(TouchState::Idle),
                 mobile_events: RefCell::new(MobileEventState::default()),
                 legacy_multitouch: Cell::new(false),
+                last_pinch_scale: Cell::new(None),
                 keyboard_bounds: Cell::new(None),
                 tablet_keyboard_guide: Cell::new(std::ptr::null_mut()),
                 mobile_insets: RefCell::new(WindowInsets::default()),
@@ -1438,10 +1500,15 @@ impl IosWindowInner {
             let width = (frame.x + frame.width).min(view.x + view.width) - x;
             let height = (frame.y + frame.height).min(view.y + view.height) - y;
             let keyboard = (width > 0.0 && height > f64::from(safe_bottom) + 0.5).then(|| {
-                Bounds::new(point(px(x as f32), px(y as f32)), size(px(width as f32), px(height as f32)))
+                Bounds::new(
+                    point(px(x as f32), px(y as f32)),
+                    size(px(width as f32), px(height as f32)),
+                )
             });
             self.keyboard_bounds.set(keyboard);
-            crate::set_keyboard_height(keyboard.map_or(0.0, |bounds| f32::from(bounds.size.height)));
+            crate::set_keyboard_height(
+                keyboard.map_or(0.0, |bounds| f32::from(bounds.size.height)),
+            );
         }
     }
 
@@ -1455,19 +1522,24 @@ impl IosWindowInner {
                 return;
             }
             self.tablet_keyboard_guide.set(guide);
-        let _: () = msg_send![guide, setFollowsUndockedKeyboard: true];
-        // A constrained, inert view makes guide movements participate in UIKit layout.
-        let marker: *mut AnyObject = msg_send![class!(UIView), new];
-        let _: () = msg_send![marker, setHidden: true];
-        let _: () = msg_send![marker, setTranslatesAutoresizingMaskIntoConstraints: false];
-        let _: () = msg_send![self.view, addSubview: marker];
-        for anchor in [sel!(leadingAnchor), sel!(trailingAnchor), sel!(topAnchor), sel!(bottomAnchor)] {
-            let a: *mut AnyObject = objc2::msg_send![marker, performSelector: anchor];
-            let b: *mut AnyObject = objc2::msg_send![guide, performSelector: anchor];
-            let constraint: *mut AnyObject = msg_send![a, constraintEqualToAnchor: b];
-            let _: () = msg_send![constraint, setActive: true];
-        }
-        let _: () = msg_send![marker, release];
+            let _: () = msg_send![guide, setFollowsUndockedKeyboard: true];
+            // A constrained, inert view makes guide movements participate in UIKit layout.
+            let marker: *mut AnyObject = msg_send![class!(UIView), new];
+            let _: () = msg_send![marker, setHidden: true];
+            let _: () = msg_send![marker, setTranslatesAutoresizingMaskIntoConstraints: false];
+            let _: () = msg_send![self.view, addSubview: marker];
+            for anchor in [
+                sel!(leadingAnchor),
+                sel!(trailingAnchor),
+                sel!(topAnchor),
+                sel!(bottomAnchor),
+            ] {
+                let a: *mut AnyObject = objc2::msg_send![marker, performSelector: anchor];
+                let b: *mut AnyObject = objc2::msg_send![guide, performSelector: anchor];
+                let constraint: *mut AnyObject = msg_send![a, constraintEqualToAnchor: b];
+                let _: () = msg_send![constraint, setActive: true];
+            }
+            let _: () = msg_send![marker, release];
         }
     }
 
@@ -1477,7 +1549,8 @@ impl IosWindowInner {
         unsafe {
             let device: *mut AnyObject = msg_send![class!(UIDevice), currentDevice];
             let idiom: isize = msg_send![device, userInterfaceIdiom];
-            let supported: bool = msg_send![self.view, respondsToSelector: sel!(keyboardLayoutGuide)];
+            let supported: bool =
+                msg_send![self.view, respondsToSelector: sel!(keyboardLayoutGuide)];
             if idiom == 1 && supported {
                 // UIKit can send input-mode notifications while installing the guide.
                 // Install it after GPUI releases its startup App borrow.
@@ -1682,8 +1755,11 @@ impl IosWindowInner {
                         if distance > SCROLL_SLOP {
                             let start = gpui::point(gpui::px(start_x), gpui::px(start_y));
                             self.touch_state.set(TouchState::Dragging { start });
-                            let claimed =
-                                self.dispatch_touch_drag(gpui::TouchPhase::Started, start, position);
+                            let claimed = self.dispatch_touch_drag(
+                                gpui::TouchPhase::Started,
+                                start,
+                                position,
+                            );
                             if claimed || !self.touch_pressed.get() {
                                 return;
                             }
@@ -2075,7 +2151,14 @@ impl IosWindowInner {
     }
 
     /// Handle a key event from an external keyboard
-    pub fn handle_key_event(&self, key_code: u32, modifier_flags: u32, unmodified: &str, characters: &str, is_key_down: bool) {
+    pub fn handle_key_event(
+        &self,
+        key_code: u32,
+        modifier_flags: u32,
+        unmodified: &str,
+        characters: &str,
+        is_key_down: bool,
+    ) {
         use super::text_input::{
             key_code_to_key_down, key_code_to_key_up, key_code_to_string,
             modifier_flags_to_modifiers,
@@ -2748,6 +2831,27 @@ impl PlatformAtlas for FallbackAtlas {
     }
 }
 
+fn step_pinch_delta(last: &Cell<Option<f32>>, phase: gpui::TouchPhase, scale: f32) -> Option<f32> {
+    match phase {
+        gpui::TouchPhase::Started => {
+            if !scale.is_finite() || scale <= 0.0 {
+                return None;
+            }
+            last.set(Some(scale));
+            Some(0.0)
+        }
+        gpui::TouchPhase::Moved => {
+            if !scale.is_finite() || scale <= 0.0 {
+                return None;
+            }
+            let prev = last.get()?.max(1e-4);
+            last.set(Some(scale));
+            Some((scale / prev).clamp(0.2, 5.0).ln())
+        }
+        gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => last.take().map(|_| 0.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{appearance_style_changed, edge_attached_keyboard_insets, ProxyInputSession};
@@ -2806,5 +2910,24 @@ mod tests {
             edge_attached_keyboard_insets(window, Some(docked)).bottom,
             gpui::px(300.0)
         );
+    }
+
+    #[test]
+    fn step_pinch_delta_tracks_incremental_log_scale() {
+        let last = Cell::new(None);
+        assert_eq!(step_pinch_delta(&last, gpui::TouchPhase::Moved, 1.5), None);
+        assert_eq!(
+            step_pinch_delta(&last, gpui::TouchPhase::Started, 1.0),
+            Some(0.0)
+        );
+        let d1 = step_pinch_delta(&last, gpui::TouchPhase::Moved, 1.25).unwrap();
+        assert!((d1.exp() - 1.25).abs() < 1e-5);
+        let d2 = step_pinch_delta(&last, gpui::TouchPhase::Moved, 1.5).unwrap();
+        assert!((d2.exp() - 1.2).abs() < 1e-5);
+        assert_eq!(
+            step_pinch_delta(&last, gpui::TouchPhase::Ended, 1.5),
+            Some(0.0)
+        );
+        assert_eq!(last.get(), None);
     }
 }

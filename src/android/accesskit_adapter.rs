@@ -19,10 +19,10 @@
 // the LICENSE-MIT file), at your option.
 
 use accesskit_android::jni::{
-    JNIEnv, JavaVM, NativeMethod,
     errors::Result,
     objects::{GlobalRef, JClass, JObject, WeakRef},
-    sys::{JNI_FALSE, JNI_TRUE, jboolean, jfloat, jint, jlong},
+    sys::{jboolean, jfloat, jint, jlong, JNI_FALSE, JNI_TRUE},
+    JNIEnv, JavaVM, NativeMethod,
 };
 use gpui::accesskit::{ActionHandler, ActivationHandler, TreeUpdate};
 use log::debug;
@@ -31,8 +31,8 @@ use std::{
     ffi::c_void,
     fmt::{Debug, Formatter},
     sync::{
-        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicI64, Ordering},
+        Arc, Mutex, OnceLock, Weak,
     },
 };
 

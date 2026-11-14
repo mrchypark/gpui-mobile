@@ -1148,7 +1148,10 @@ impl AndroidPlatform {
     }
     /// Preferred wgpu backend.
     pub fn preferred_backend(&self) -> AndroidBackend {
-        self.state.lock().preferred_backend.unwrap_or(AndroidBackend::Vulkan)
+        self.state
+            .lock()
+            .preferred_backend
+            .unwrap_or(AndroidBackend::Vulkan)
     }
 
     /// Override the wgpu backend before the first window initializes the GPU.
