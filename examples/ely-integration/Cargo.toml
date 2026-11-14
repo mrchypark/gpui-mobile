@@ -36,6 +36,8 @@ gpui-fast = { path = "../../vendor/gpui-fast" }
 gpui-fast-wgpu = { path = "../../vendor/gpui-fast-wgpu" }
 gpui-pre = { path = "../../vendor/gpui-pre" }
 gpui-pre-wgpu = { path = "../../vendor/gpui-pre-wgpu" }
+gpui-fast-macos = { path = "../../vendor/gpui-fast-macos" }
+gpui-pre-macos = { path = "../../vendor/gpui-pre-macos" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
