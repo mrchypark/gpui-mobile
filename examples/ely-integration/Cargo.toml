@@ -19,15 +19,15 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 gpui-mobile = { path = "../.." }
-gpui = { package = "gpui-fast", version = "=0.1.12", default-features = false }
-gpui-kit = { version = "=0.8.1", default-features = false, features = ["component", "gpui-fast"] }
-ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "a8324b9e621666dc5def1b97cdc6dc86dc713303", default-features = false }
+gpui = { package = "gpui-fast", version = "=0.1.14", default-features = false }
+gpui-kit = { version = "=0.9.1", default-features = false, features = ["component", "gpui-fast"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "7378fb6f66465cfd44bad3d71ce3d105a619faf3", default-features = false }
 # Devices cannot read Ely assets from the build machine's filesystem in debug builds.
 rust-embed = { version = "8.12", features = ["debug-embed"] }
 
 [dev-dependencies]
-gpui = { package = "gpui-fast", version = "=0.1.12", features = ["test-support"] }
-ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "a8324b9e621666dc5def1b97cdc6dc86dc713303", features = ["test-support"] }
+gpui = { package = "gpui-fast", version = "=0.1.14", features = ["test-support"] }
+ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "7378fb6f66465cfd44bad3d71ce3d105a619faf3", features = ["test-support"] }
 naga = { version = "=30.0.1", features = ["wgsl-in"] }
 
 # Cargo only honors patches at the invoking workspace root.
@@ -36,6 +36,8 @@ gpui-fast = { path = "../../vendor/gpui-fast" }
 gpui-fast-wgpu = { path = "../../vendor/gpui-fast-wgpu" }
 gpui-pre = { path = "../../vendor/gpui-pre" }
 gpui-pre-wgpu = { path = "../../vendor/gpui-pre-wgpu" }
+gpui-fast-macos = { path = "../../vendor/gpui-fast-macos" }
+gpui-pre-macos = { path = "../../vendor/gpui-pre-macos" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }

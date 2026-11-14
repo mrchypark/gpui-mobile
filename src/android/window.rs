@@ -1364,7 +1364,15 @@ impl AndroidWindow {
                 raw_window_handle: raw.window_handle()?.as_raw(),
             })?
         };
-        let context = WgpuContext::new(instance, &surface, None)?;
+        let config = WgpuSurfaceConfig {
+            size: gpui::size(
+                gpui::DevicePixels(native_window.width().max(1)),
+                gpui::DevicePixels(native_window.height().max(1)),
+            ),
+            transparent: false,
+            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+        };
+        let context = WgpuContext::new(instance, &surface, &config, None)?;
         log::info!(
             "Android GPU backend selected: {:?}",
             context.adapter.get_info().backend
@@ -1383,6 +1391,11 @@ impl AndroidWindow {
         transparent: bool,
     ) -> Result<WgpuRenderer> {
         let raw = Self::raw_window(native_window);
+        let config = WgpuSurfaceConfig {
+            size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
+            transparent,
+            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+        };
 
         let mut qemu = [0 as libc::c_char; libc::PROP_VALUE_MAX as usize];
         // Android's property API writes at most PROP_VALUE_MAX bytes, including NUL.
@@ -1408,18 +1421,12 @@ impl AndroidWindow {
                     raw_window_handle: raw.window_handle()?.as_raw(),
                 })?
             };
-            let context = WgpuContext::new(instance, &surface, None)?;
+            let context = WgpuContext::new(instance, &surface, &config, None)?;
             *gpu_context.borrow_mut() = Some(context);
             log::info!(
                 "Android emulator workaround: using OpenGL ES instead of SwiftShader Vulkan"
             );
         }
-
-        let config = WgpuSurfaceConfig {
-            size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
-            transparent,
-            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
-        };
 
         WgpuRenderer::new(gpu_context, &raw, config, None)
     }

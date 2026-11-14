@@ -673,12 +673,7 @@ pub(crate) fn carry_over_line_layouts(previous: &mut FrameCache, current: &mut F
     // Wrapped lines hold the lines they were wrapped from, so they are swept
     // first, letting a line they were the last to hold go with them.
     carry_over(&mut previous.wrapped_lines, &mut current.wrapped_lines);
-    carry_over(
-        &mut previous.wrapped_lines_by_hash,
-        &mut current.wrapped_lines_by_hash,
-    );
     carry_over(&mut previous.lines, &mut current.lines);
-    carry_over(&mut previous.lines_by_hash, &mut current.lines_by_hash);
 
     // The used lists index what this frame laid out, which is what a view
     // reused next frame looks its lines up by.
@@ -687,18 +682,8 @@ pub(crate) fn carry_over_line_layouts(previous: &mut FrameCache, current: &mut F
         &mut previous.used_wrapped_lines,
         &mut current.used_wrapped_lines,
     );
-    mem::swap(
-        &mut previous.used_lines_by_hash,
-        &mut current.used_lines_by_hash,
-    );
-    mem::swap(
-        &mut previous.used_wrapped_lines_by_hash,
-        &mut current.used_wrapped_lines_by_hash,
-    );
     current.used_lines.clear();
     current.used_wrapped_lines.clear();
-    current.used_lines_by_hash.clear();
-    current.used_wrapped_lines_by_hash.clear();
 }
 
 impl LineLayoutIndex {
@@ -710,11 +695,6 @@ impl LineLayoutIndex {
             lines_index: self.lines_index - from.lines_index + to.lines_index,
             wrapped_lines_index: self.wrapped_lines_index - from.wrapped_lines_index
                 + to.wrapped_lines_index,
-            lines_by_hash_index: self.lines_by_hash_index - from.lines_by_hash_index
-                + to.lines_by_hash_index,
-            wrapped_lines_by_hash_index: self.wrapped_lines_by_hash_index
-                - from.wrapped_lines_by_hash_index
-                + to.wrapped_lines_by_hash_index,
         }
     }
 }
@@ -1016,14 +996,10 @@ impl PartialEq for LineLayoutIndex {
             font_generation,
             lines_index,
             wrapped_lines_index,
-            lines_by_hash_index,
-            wrapped_lines_by_hash_index,
         } = self;
         *font_generation == other.font_generation
             && *lines_index == other.lines_index
             && *wrapped_lines_index == other.wrapped_lines_index
-            && *lines_by_hash_index == other.lines_by_hash_index
-            && *wrapped_lines_by_hash_index == other.wrapped_lines_by_hash_index
     }
 }
 
@@ -1033,15 +1009,11 @@ impl std::fmt::Debug for LineLayoutIndex {
             font_generation,
             lines_index,
             wrapped_lines_index,
-            lines_by_hash_index,
-            wrapped_lines_by_hash_index,
         } = self;
         f.debug_struct("LineLayoutIndex")
             .field("font_generation", font_generation)
             .field("lines_index", lines_index)
             .field("wrapped_lines_index", wrapped_lines_index)
-            .field("lines_by_hash_index", lines_by_hash_index)
-            .field("wrapped_lines_by_hash_index", wrapped_lines_by_hash_index)
             .finish()
     }
 }

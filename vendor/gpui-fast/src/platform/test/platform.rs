@@ -84,7 +84,7 @@ impl ScreenCaptureSource for TestScreenCaptureSource {
         _foreground_executor: &ForegroundExecutor,
         _frame_callback: Box<dyn Fn(ScreenCaptureFrame) + Send>,
     ) -> oneshot::Receiver<Result<Box<dyn ScreenCaptureStream>>> {
-        let (mut tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let stream = TestScreenCaptureStream {};
         tx.send(Ok(Box::new(stream) as Box<dyn ScreenCaptureStream>))
             .ok();
@@ -127,6 +127,11 @@ pub(crate) struct TestPrompts {
 }
 
 impl TestPlatform {
+    #[cfg(test)]
+    pub(crate) fn cursor_style(&self) -> CursorStyle {
+        *self.active_cursor.lock()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn new(executor: BackgroundExecutor, foreground_executor: ForegroundExecutor) -> Rc<Self> {
         Self::with_platform(
@@ -146,6 +151,7 @@ impl TestPlatform {
         Self::with_platform(executor, foreground_executor, text_system, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn simulate_display_added(
         &self,
         display_id: DisplayId,
@@ -157,6 +163,7 @@ impl TestPlatform {
 
     /// Adds a display without telling App yet, as when the platform's
     /// notifications about a window arrive before those about displays.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn connect_display(
         &self,
         display_id: DisplayId,
@@ -167,6 +174,7 @@ impl TestPlatform {
         self.displays.borrow_mut().push(display);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn simulate_display_removed(&self, display_id: DisplayId) {
         self.displays
             .borrow_mut()
@@ -174,6 +182,7 @@ impl TestPlatform {
         self.report_displays_changed();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn simulate_display_refresh_interval_change(
         &self,
         display_id: DisplayId,
@@ -187,6 +196,7 @@ impl TestPlatform {
         self.report_displays_changed();
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn report_displays_changed(&self) {
         let callback = self.displays_changed_callback.borrow_mut().take();
         if let Some(mut callback) = callback {
@@ -574,7 +584,7 @@ impl Platform for TestPlatform {
     fn screen_capture_sources(
         &self,
     ) -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
-        let (mut tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         tx.send(Ok(self
             .screen_capture_sources
             .borrow()
