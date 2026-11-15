@@ -155,6 +155,7 @@ pub(crate) struct WgpuPipelines {
     pub(crate) quads: wgpu::RenderPipeline,
     pub(crate) shadows: wgpu::RenderPipeline,
     pub(crate) path_rasterization: wgpu::RenderPipeline,
+    pub(crate) path_rasterization_rebased: Option<wgpu::RenderPipeline>,
     pub(crate) paths: wgpu::RenderPipeline,
     pub(crate) underlines: wgpu::RenderPipeline,
     pub(crate) mono_sprites: wgpu::RenderPipeline,
@@ -892,6 +893,33 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
+        // Inspect the backend only; the HAL device is not modified or retained.
+        #[cfg(target_os = "android")]
+        let rebase_paths = !uses_webgl_instance_data
+            && unsafe { device.as_hal::<wgpu::hal::api::Gles>().is_some() };
+        #[cfg(not(target_os = "android"))]
+        let rebase_paths = false;
+        // Build the variant in tests so the headless regression can exercise it.
+        let rebase_paths = rebase_paths || (cfg!(test) && !uses_webgl_instance_data);
+        let path_rasterization_rebased = rebase_paths.then(|| {
+            create_pipeline(
+                "path_rasterization_rebased",
+                "vs_path_rasterization_rebased",
+                "fs_path_rasterization",
+                &layouts.globals,
+                &layouts.instances,
+                None,
+                wgpu::PrimitiveTopology::TriangleList,
+                &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                path_sample_count,
+                &shader_module,
+            )
+        });
+
         let paths = create_pipeline(
             "paths",
             "vs_path",
@@ -999,6 +1027,7 @@ impl WgpuRendererCore {
             quads,
             shadows,
             path_rasterization,
+            path_rasterization_rebased,
             paths,
             underlines,
             mono_sprites,

@@ -122,6 +122,131 @@ fn multisampled_paths_on_whole_pixels_draw_as_quads_do() {
     }
 }
 
+/// Force the Android GL draw convention through the real headless renderer.
+#[test]
+fn rebased_path_groups_match_quads() {
+    let Ok(mut renderer) = WgpuHeadlessRenderer::new() else {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::TEST_REBASED_PATHS.with(|flag| flag.set(false));
+        }
+    }
+    super::TEST_REBASED_PATHS.with(|flag| flag.set(true));
+    let _reset = Reset;
+    let path_scene = scene(4., 4., true);
+    assert_eq!(path_passes(&path_scene), 2);
+    let target = size(DevicePixels(64), DevicePixels(64));
+    let paths = renderer.render_scene_to_image(&path_scene, target).unwrap();
+    let quads = renderer
+        .render_scene_to_image(&scene(4., 4., false), target)
+        .unwrap();
+    assert_same_pixels(&paths, &quads, 0);
+}
+
+/// A visible layer tile whose content contains two overlapping path groups.
+fn path_layer(x: f32, y: f32, generation: u64) -> Scene {
+    use gpui::{
+        AtlasTile, Corners, LayerFrame, LayerKey, PolychromeSprite, TileCoord, layer_tile_id,
+        layer_tile_texture_id,
+    };
+
+    let content = scene(x, y, true);
+    assert_eq!(path_passes(&content), 2);
+    let key = LayerKey(123);
+    let tile = TileCoord { x: 0, y: 0 };
+    let layer = LayerFrame {
+        key,
+        generation,
+        background: gpui::rgba(0xffffffff),
+        tile_size: 512,
+        content: content.into(),
+        dirty_tiles: vec![tile],
+    };
+    let mut frame = Scene::default();
+    frame.insert_primitive(PolychromeSprite {
+        order: 0,
+        pad: 0,
+        grayscale: false.into(),
+        opacity: 1.,
+        bounds: layer.tile_bounds(tile),
+        content_mask: ContentMask {
+            bounds: bounds(0., 0., 64., 64.),
+        },
+        corner_radii: Corners::default(),
+        tile: AtlasTile {
+            texture_id: layer_tile_texture_id(key),
+            tile_id: layer_tile_id(tile),
+            padding: 0,
+            bounds: Bounds {
+                origin: point(DevicePixels(0), DevicePixels(0)),
+                size: size(DevicePixels(512), DevicePixels(512)),
+            },
+        },
+    });
+    frame.layers.frames.push(layer);
+    frame.finish();
+    frame
+}
+
+/// Exercise the actual layer tile rasterizer, including a new generation and
+/// a cached frame, with a quad reference rendered without a layer.
+#[test]
+fn rebased_path_layer_matches_reference_across_frames() {
+    let mut renderer = match WgpuHeadlessRenderer::new() {
+        Ok(renderer) => renderer,
+        Err(error) if format!("{error:#}").contains("No usable headless GPU adapter found") => {
+            eprintln!("skipped: no usable headless GPU adapter: {error:#}");
+            return;
+        }
+        Err(error) => panic!("headless renderer initialization failed: {error:#}"),
+    };
+    let mut reference_renderer = WgpuHeadlessRenderer::new()
+        .expect("reference renderer must initialize after the first renderer");
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::TEST_REBASED_PATHS.with(|flag| flag.set(false));
+        }
+    }
+    super::TEST_REBASED_PATHS.with(|flag| flag.set(true));
+    let _reset = Reset;
+    let target = size(DevicePixels(64), DevicePixels(64));
+
+    for (frame, (x, y, generation)) in [(4., 4., 1), (20., 30., 2), (20., 30., 2)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut reference = Scene::default();
+        reference.insert_primitive(rectangle_quad(0., 0., 64., 64., 0xffffffff));
+        let shapes = scene(x, y, false);
+        reference.replay(0..shapes.len(), &shapes);
+        reference.finish();
+        let expected = reference_renderer
+            .render_scene_to_image(&reference, target)
+            .unwrap();
+        let actual = renderer
+            .render_scene_to_image(&path_layer(x, y, generation), target)
+            .unwrap();
+        assert_ne!(
+            expected.get_pixel((x + 2.) as u32, (y + 2.) as u32),
+            expected.get_pixel(63, 0)
+        );
+        assert_ne!(
+            expected.get_pixel((x + 14.) as u32, (y + 10.) as u32),
+            expected.get_pixel(63, 0)
+        );
+        assert_ne!(
+            expected.get_pixel((x + 2.) as u32, (y + 2.) as u32),
+            expected.get_pixel((x + 14.) as u32, (y + 10.) as u32)
+        );
+        assert_same_pixels(&actual, &expected, frame);
+    }
+}
+
 /// GPU time of frames of 8 layers of paths covering the target, each layer
 /// drawn over a transparent quad that covers the one before so that it is
 /// rasterized in a pass of its own, waiting for each frame to complete,
