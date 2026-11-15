@@ -10,6 +10,7 @@
 #define GPUI_IOS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -71,9 +72,14 @@ void gpui_ios_will_terminate(void* app_ptr);
 /// - event_ptr: Pointer to the UIEvent object
 void gpui_ios_handle_touch(void* window_ptr, void* touch_ptr, void* event_ptr);
 
-/// Request a frame to be rendered.
+/// Give GPUI a frame. Returns whether GPUI wants another one.
 ///
-/// This should be called from CADisplayLink callback.
+/// Call this from the CADisplayLink callback. GPUI draws only if something
+/// changed; the return value says whether more frames are wanted. A host that
+/// registered a waker with gpui_ios_set_frame_waker() can pause its display
+/// link on false and resume it from the waker; a host that ticks every vsync
+/// may ignore the return value. A NULL window_ptr returns false: there is no
+/// window to draw, so a pausing host stays paused until it registers a real one.
 /// The window_ptr should be the value returned by gpui_ios_get_window().
 void gpui_ios_request_frame(void* window_ptr);
 bool gpui_ios_request_frame_if_needed(void* window_ptr);

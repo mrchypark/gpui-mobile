@@ -9,7 +9,8 @@
 //! ```text
 //! gpui_ios_run_demo()          // sets up platform + invokes finish-launching
 //! gpui_ios_get_window()        // retrieve the GPUI window pointer
-//! gpui_ios_request_frame(ptr)  // called every CADisplayLink tick
+//! gpui_ios_request_frame(ptr)  // compatibility tick for every CADisplayLink tick
+//! gpui_ios_request_frame_if_needed(ptr) // returns whether another frame is needed
 //! ```
 
 use gpui::{App, AppContext, Application, RequestFrameOptions, WindowOptions};
@@ -23,6 +24,18 @@ static IOS_APP_STATE: OnceLock<IosAppState> = OnceLock::new();
 thread_local! {
     // UIKit owns the run loop, so the strong GPUI handle must outlive run_app().
     static APPLICATION: std::cell::RefCell<Option<gpui::ApplicationHandle>> = const { std::cell::RefCell::new(None) };
+    // Embedding must be selected before the application creates its first window.
+    static EMBEDDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn is_embedded() -> bool {
+    EMBEDDED.with(|embedded| embedded.get())
+}
+
+/// Select UIKit child-controller embedding before starting the application.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_set_embedded() {
+    EMBEDDED.with(|embedded| embedded.set(true));
 }
 
 /// Holds the state needed for iOS FFI callbacks.
@@ -70,6 +83,27 @@ pub(crate) fn window_for_handle(id: usize) -> Option<std::rc::Rc<super::window::
 
 pub(crate) fn unregister_window(id: usize) {
     WINDOWS.with(|registry| registry.remove(id));
+}
+
+/// Return the UIKit controller for an embedded GPUI window.
+///
+/// The opaque window handle must come from [`gpui_ios_get_window`] and remains
+/// valid only while that window is alive. Call this on the UIKit main thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_view_controller(window: *mut c_void) -> *mut c_void {
+    window_for_handle(window as usize)
+        .map(|window| window.view_controller_ptr().cast())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Synchronize GPUI after the embedding host changes the controller view bounds.
+///
+/// Call this on the UIKit main thread after assigning the embedded view's frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn gpui_ios_layout_view(window: *mut c_void) {
+    if let Some(window) = window_for_handle(window as usize) {
+        window.handle_layout_change();
+    }
 }
 
 /// Initialize the GPUI iOS application.
@@ -312,7 +346,7 @@ pub extern "C" fn gpui_ios_request_frame_if_needed(window_ptr: *mut c_void) -> b
         return false;
     }
 
-    // Safety: window_ptr must be a valid pointer to an IosWindow
+    // The opaque handle must identify a live iOS window.
     let Some(window) = window_for_handle(window_ptr as usize) else {
         return false;
     };

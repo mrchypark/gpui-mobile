@@ -34,6 +34,12 @@
 //! Lifecycle events (window creation/destruction, focus changes, etc.) are
 //! delivered via `AndroidApp::poll_events()`.  Input events are obtained via
 //! `AndroidApp::input_events_iter()`.
+//!
+//! ## Frames
+//!
+//! The loop blocks on the looper between events and draws only when GPUI
+//! asked for a frame and a vsync has passed since — see
+//! [`super::frame_source`].
 
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
@@ -324,6 +330,7 @@ use super::platform::{AndroidPlatform, SharedPlatform};
 
 use jni::objects::{JObject, JString, JValue};
 use jni::JavaVM;
+use std::sync::{atomic::AtomicPtr, Mutex};
 
 // ── JNI helpers (safe `jni` crate wrappers) ──────────────────────────────────
 
@@ -519,6 +526,50 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 
 // ── public accessors ──────────────────────────────────────────────────────────
 
+/// JVM for the **host-driven** entry point ([`super::host`]), which has no
+/// `AndroidApp` to read it from.
+static HOST_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Current Activity for the host-driven entry point, as a JNI global reference we
+/// own. Replaced on every Activity creation so [`activity_as_ptr`] always names the
+/// *live* Activity.
+///
+/// The outgoing reference is kept one generation longer: `activity_as_ptr` hands out a
+/// raw `jobject`, and a call on the render thread may still be using the previous
+/// Activity while the UI thread installs the next one.
+static HOST_ACTIVITY: Mutex<HostActivity> = Mutex::new(HostActivity {
+    current: None,
+    previous: None,
+});
+
+struct HostActivity {
+    current: Option<jni::refs::Global<JObject<'static>>>,
+    previous: Option<jni::refs::Global<JObject<'static>>>,
+}
+
+/// Register the current Activity when running without `android-activity`.
+///
+/// Call from a JNI entry point in `Activity.onCreate`, every time — a recreated
+/// Activity is a new object. This module takes its own global reference and records
+/// the JVM, so `java_vm()` / `activity_as_ptr()` and everything built on them (IME,
+/// safe areas, file pickers, `rustls-platform-verifier`) work exactly as on the
+/// `android-activity` path. A no-op when `android-activity` owns the process.
+pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
+    if ANDROID_APP.lock().is_some() {
+        return Ok(());
+    }
+    let global = env.new_global_ref(activity).e()?;
+    let vm = env.get_java_vm().e()?;
+    HOST_VM.store(
+        vm.get_raw() as *mut c_void,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
+    slot.previous = slot.current.take();
+    slot.current = Some(global);
+    Ok(())
+}
+
 /// Public accessor for the JavaVM pointer.
 ///
 /// Uses `AndroidApp::vm_as_ptr()` from the stored `AndroidApp`.
@@ -526,7 +577,7 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 pub fn java_vm() -> *mut c_void {
     android_app()
         .map(|app| app.vm_as_ptr())
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|| HOST_VM.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Public accessor for the current Activity's JNI object reference.
@@ -541,12 +592,29 @@ pub fn java_vm() -> *mut c_void {
 pub fn activity_as_ptr() -> *mut c_void {
     android_app()
         .map(|app| app.activity_as_ptr())
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|| {
+            HOST_ACTIVITY
+                .lock()
+                .expect("poisoned")
+                .current
+                .as_ref()
+                .map(|activity| activity.as_raw() as *mut c_void)
+                .unwrap_or(std::ptr::null_mut())
+        })
 }
 
 /// Returns a clone of the stored `AndroidApp`, if initialised.
 pub fn android_app() -> Option<AndroidApp> {
     ANDROID_APP.lock().clone()
+}
+
+/// Install the platform built by the host-driven path (`super::host`).
+pub(crate) fn set_host_platform(platform: Arc<AndroidPlatform>) {
+    let mut slot = PLATFORM.lock();
+    if slot.is_some() {
+        log::warn!("set_host_platform: PLATFORM already set — both entry points in one process?");
+    }
+    *slot = Some(platform);
 }
 
 /// Returns the current Activity's platform, if initialised.
@@ -1823,6 +1891,20 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
 /// Hide the software keyboard on Android.
 ///
 /// Schedule JNI InputMethodManager/View access on Java's main thread.
+/// Re-open the software keyboard after the host Activity recreates its input proxy.
+pub(crate) fn restore_keyboard() {
+    if IME_ACTIVE.load(Ordering::Acquire) {
+        show_keyboard_android(IME_TYPE.get());
+    }
+}
+
+/// Restart the active input connection so Android drops stale composing spans.
+pub(crate) fn reset_keyboard_composition() {
+    if IME_ACTIVE.load(Ordering::Acquire) {
+        show_keyboard_android(IME_TYPE.get());
+    }
+}
+
 pub fn hide_keyboard_android() {
     IME_ACTIVE.store(false, Ordering::Release);
     IME_HAS_HANDLER.store(false, Ordering::Release);

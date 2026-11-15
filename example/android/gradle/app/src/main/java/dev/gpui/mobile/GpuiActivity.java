@@ -32,7 +32,7 @@ import org.gpui.mobile.ble.Ble;
  * - Volume key routing to the MUSIC audio stream
  * - Media button events via MediaSessionCompat
  */
-public class GpuiActivity extends NativeActivity {
+public class GpuiActivity extends GpuiInputActivity {
 
     /** Whether the native .so has been loaded via System.loadLibrary. */
     private static volatile boolean sNativeLibLoaded = false;
