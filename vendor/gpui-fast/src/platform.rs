@@ -2233,6 +2233,29 @@ impl PlatformInputHandler {
         })
     }
 
+    /// Returns the selected endpoint in window coordinates, including during composition.
+    pub(crate) fn caret_bounds_in_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        let selection = self.handler.selected_text_range(true, window, cx)?;
+        let offset = if selection.reversed {
+            selection.range.start
+        } else {
+            selection.range.end
+        };
+        self.handler.bounds_for_range(offset..offset, window, cx)
+    }
+
+    pub(crate) fn element_bounds_in_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.handler.element_bounds(window, cx)
+    }
+
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
         let marked_range = self.marked_text_range();
         let selection = self.selected_text_range(true)?;

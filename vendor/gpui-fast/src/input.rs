@@ -347,6 +347,9 @@ mod tests {
                 focus_handle: cx.focus_handle(),
                 configuration: custom,
                 accepts_text_input: true,
+                selection: None,
+                marked: None,
+                inset: crate::px(0.),
             }
         });
         let view = window.root(cx).unwrap();
@@ -425,11 +428,286 @@ mod tests {
     }
 
     #[gpui::test]
+    fn focused_geometry_tracks_painted_handler_and_focus(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+            accepts_text_input: true,
+            selection: None,
+            marked: None,
+            inset: crate::px(0.),
+        });
+        let view = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(window.focused_text_input_geometry().is_none());
+            let focus = view.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+            let (element, caret) = window.focused_text_input_geometry().unwrap();
+            let painted = element.unwrap();
+            assert!(caret.is_none());
+            view.update(cx, |view, cx| {
+                view.inset = crate::px(40.);
+                cx.notify();
+            });
+            window.refresh();
+            assert!(
+                window.focused_text_input_geometry().is_none(),
+                "geometry must not be used while invalidated layout awaits paint"
+            );
+            let rejected = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = rejected.clone();
+            window.on_next_frame(move |window, _| {
+                observed.set(window.focused_text_input_geometry().is_none());
+            });
+            window.simulate_next_frame(cx);
+            assert!(rejected.get(), "a pre-draw callback must not see stale geometry");
+            window.draw(cx).clear(cx);
+            let repainted = window.focused_text_input_geometry().unwrap().0.unwrap();
+            assert_eq!(repainted.left(), painted.left() + crate::px(40.));
+            let other = cx.focus_handle();
+            window.focus(&other, cx);
+            assert!(window.focused_text_input_geometry().is_none());
+            window.focus(&focus, cx);
+            assert!(
+                window.focused_text_input_geometry().is_none(),
+                "a previous focus generation must not restore stale geometry"
+            );
+            window.draw(cx).clear(cx);
+            assert!(window.focused_text_input_geometry().is_some());
+            view.update(cx, |view, cx| {
+                view.accepts_text_input = false;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            assert!(window.focused_text_input_geometry().is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn focused_geometry_uses_the_active_selection_endpoint(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+            accepts_text_input: true,
+            selection: Some((2..7, false)),
+            marked: Some(1..9),
+            inset: crate::px(0.),
+        });
+        let view = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.focus(&view.read(cx).focus_handle.clone(), cx);
+            window.draw(cx).clear(cx);
+            let (_, caret) = window.focused_text_input_geometry().unwrap();
+            assert_eq!(caret.unwrap().origin.x, crate::px(7.));
+            view.update(cx, |view, cx| {
+                view.selection = Some((2..7, true));
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            let (_, caret) = window.focused_text_input_geometry().unwrap();
+            assert_eq!(caret.unwrap().origin.x, crate::px(2.));
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn focused_geometry_rejects_changed_visible_bounds_without_callback(cx: &mut TestAppContext) {
+        use crate::PlatformWindow as _;
+
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+            accepts_text_input: true,
+            selection: None,
+            marked: None,
+            inset: crate::px(0.),
+        });
+        let view = window.root(cx).unwrap();
+        let mut platform_window = cx.test_window(window.into());
+        platform_window.simulate_resize(crate::size(crate::px(400.), crate::px(800.)));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.focus(&view.read(cx).focus_handle.clone(), cx);
+            window.draw(cx).clear(cx);
+            assert!(window.focused_text_input_geometry().is_some());
+        })
+        .unwrap();
+
+        // Some backends expose updated insets without delivering their callback.
+        platform_window.on_insets_changed(Box::new(|_| {}));
+        platform_window.simulate_insets_change(crate::WindowInsets {
+            ime: crate::Edges {
+                bottom: crate::px(300.),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(window.focused_text_input_geometry().is_none());
+            window.draw(cx).clear(cx);
+            assert!(window.focused_text_input_geometry().is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn focused_geometry_after_next_paint_runs_after_draw_and_can_retry(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+            accepts_text_input: true,
+            selection: None,
+            marked: None,
+            inset: crate::px(0.),
+        });
+        let view = window.root(cx).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let old_left = cx.update_window(window.into(), |_, window, cx| {
+            window.focus(&view.read(cx).focus_handle.clone(), cx);
+            window.draw(cx).clear(cx);
+            let old_left = window.focused_text_input_geometry().unwrap().0.unwrap().left();
+            view.update(cx, |view, cx| {
+                view.inset = crate::px(40.);
+                cx.notify();
+            });
+            old_left
+        })
+        .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            let callback_calls = calls.clone();
+            window.after_next_paint(move |window, _| {
+                let left = window.focused_text_input_geometry().unwrap().0.unwrap().left();
+                assert_eq!(left, old_left + crate::px(40.));
+                callback_calls.set(callback_calls.get() + 1);
+                let calls = callback_calls.clone();
+                window.after_next_paint(move |_, _| calls.set(calls.get() + 1));
+            });
+            assert_eq!(calls.get(), 0);
+            window.simulate_next_frame(cx);
+            assert_eq!(calls.get(), 0, "the pre-draw frame callback is too early");
+            window.draw(cx).clear(cx);
+            assert_eq!(calls.get(), 0, "callback must wait for the window update to end");
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(calls.get(), 1);
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 2, "a retry must run after a later draw");
+    }
+
+    #[gpui::test]
+    fn focused_geometry_after_paint_waits_for_chained_effects(cx: &mut TestAppContext) {
+        use std::{cell::{Cell, RefCell}, rc::Rc};
+
+        struct ChainedPaintView {
+            input: Entity<ConfigurationTestView>,
+            armed: Rc<Cell<bool>>,
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+
+        impl Render for ChainedPaintView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let input = self.input.clone();
+                let armed = self.armed.clone();
+                let events = self.events.clone();
+                div().size_full().child(self.input.clone()).child(
+                    canvas(|_, _, _| {}, move |_, _, _, cx| {
+                        if armed.replace(false) {
+                            let input = input.clone();
+                            let events = events.clone();
+                            cx.defer(move |cx| {
+                                events.borrow_mut().push("effect-a");
+                                cx.defer(move |cx| {
+                                    events.borrow_mut().push("effect-b");
+                                    input.update(cx, |input, cx| {
+                                        input.inset = crate::px(40.);
+                                        cx.notify();
+                                    });
+                                });
+                            });
+                        }
+                    }).absolute().size_full(),
+                )
+            }
+        }
+
+        let armed = Rc::new(Cell::new(false));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let armed = armed.clone();
+            let events = events.clone();
+            move |_, cx| ChainedPaintView {
+                input: cx.new(|cx| ConfigurationTestView {
+                    focus_handle: cx.focus_handle(),
+                    configuration: TextInputConfiguration::default(),
+                    accepts_text_input: true,
+                    selection: None,
+                    marked: None,
+                    inset: crate::px(0.),
+                }),
+                armed,
+                events,
+            }
+        });
+        let view = window.root(cx).unwrap();
+        let platform_window = cx.test_window(window.into());
+        platform_window.simulate_active_status_change(true);
+        let old_left = cx.update_window(window.into(), |_, window, cx| {
+            let input = view.read(cx).input.clone();
+            window.focus(&input.read(cx).focus_handle.clone(), cx);
+            window.draw(cx).clear(cx);
+            window.focused_text_input_geometry().unwrap().0.unwrap().left()
+        }).unwrap();
+        let observed = Rc::new(RefCell::new(None));
+        cx.update_window(window.into(), |_, window, _| {
+            let observed = observed.clone();
+            let events = events.clone();
+            window.after_next_paint(move |window, _| {
+                events.borrow_mut().push("callback");
+                *observed.borrow_mut() = Some(
+                    window.focused_text_input_geometry().and_then(|(element, _)| element.map(|b| b.left()))
+                );
+            });
+        }).unwrap();
+        armed.set(true);
+        platform_window.simulate_frame_request(crate::RequestFrameOptions {
+            require_presentation: true,
+            ..Default::default()
+        });
+        assert_eq!(&*events.borrow(), &["effect-a", "effect-b", "callback"]);
+        let result = observed.borrow().expect("post-paint callback did not run");
+        if let Some(left) = result {
+            assert_eq!(left, old_left + crate::px(40.));
+        } else {
+            let retried = observed.clone();
+            cx.update_window(window.into(), |_, window, _| {
+                window.after_next_paint(move |window, _| {
+                    *retried.borrow_mut() = Some(window.focused_text_input_geometry()
+                        .and_then(|(element, _)| element.map(|b| b.left())));
+                });
+            }).unwrap();
+            platform_window.simulate_frame_request(crate::RequestFrameOptions {
+                require_presentation: true,
+                ..Default::default()
+            });
+            assert_eq!(*observed.borrow(), Some(Some(old_left + crate::px(40.))));
+        }
+    }
+
+    #[gpui::test]
     fn text_notifications_require_a_focused_input_and_track_field_changes(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, cx| ConfigurationTestView {
             focus_handle: cx.focus_handle(),
             configuration: TextInputConfiguration::default(),
             accepts_text_input: true,
+            selection: None,
+            marked: None,
+            inset: crate::px(0.),
         });
         let view = window.root(cx).unwrap();
         let mut test_window = cx.test_window(window.into());
@@ -513,25 +791,32 @@ mod tests {
         focus_handle: FocusHandle,
         configuration: TextInputConfiguration,
         accepts_text_input: bool,
+        selection: Option<(std::ops::Range<usize>, bool)>,
+        marked: Option<std::ops::Range<usize>>,
+        inset: Pixels,
     }
 
     impl Render for ConfigurationTestView {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let view = cx.entity();
             let focus_handle = self.focus_handle.clone();
-            div().size_full().track_focus(&self.focus_handle).child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, _, window, cx| {
-                        window.handle_input(
-                            &focus_handle,
-                            ElementInputHandler::new(bounds, view),
-                            cx,
-                        );
-                    },
+            div()
+                .size_full()
+                .pl(self.inset)
+                .track_focus(&self.focus_handle)
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            window.handle_input(
+                                &focus_handle,
+                                ElementInputHandler::new(bounds, view),
+                                cx,
+                            );
+                        },
+                    )
+                    .size_full(),
                 )
-                .size_full(),
-            )
         }
     }
 
@@ -556,7 +841,12 @@ mod tests {
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) -> Option<UTF16Selection> {
-            None
+            self.selection
+                .as_ref()
+                .map(|(range, reversed)| UTF16Selection {
+                    range: range.clone(),
+                    reversed: *reversed,
+                })
         }
 
         fn marked_text_range(
@@ -564,7 +854,7 @@ mod tests {
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) -> Option<std::ops::Range<usize>> {
-            None
+            self.marked.clone()
         }
 
         fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
@@ -590,12 +880,17 @@ mod tests {
 
         fn bounds_for_range(
             &mut self,
-            _range_utf16: std::ops::Range<usize>,
+            range_utf16: std::ops::Range<usize>,
             _element_bounds: Bounds<Pixels>,
             _window: &mut Window,
             _cx: &mut Context<Self>,
         ) -> Option<Bounds<Pixels>> {
-            None
+            self.selection.as_ref().map(|_| {
+                Bounds::new(
+                    crate::point(crate::px(range_utf16.start as f32), crate::px(20.)),
+                    crate::size(crate::px(1.), crate::px(12.)),
+                )
+            })
         }
 
         fn character_index_for_point(
