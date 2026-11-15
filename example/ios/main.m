@@ -195,7 +195,9 @@ static void GPUIResumeFrames(void *context);
     if (self.gpuiWindow) {
         NSLog(@"Got GPUI window pointer: %p", self.gpuiWindow);
 
-        // Setup CADisplayLink to drive rendering
+        // Setup CADisplayLink to drive rendering. GPUI says after each frame
+        // whether it wants another; the link is paused in between and resumed
+        // by the waker, so an idle screen costs no CPU.
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(renderFrame)];
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
         gpui_ios_set_frame_waker(self.gpuiWindow, GPUIResumeFrames, (__bridge void *)self);

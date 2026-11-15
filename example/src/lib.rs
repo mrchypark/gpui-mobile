@@ -149,10 +149,17 @@ struct NsLogLogger;
 
 #[cfg(target_os = "ios")]
 impl log::Log for NsLogLogger {
-    fn enabled(&self, _metadata: &log::Metadata) -> bool { true }
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            let msg = format!("[{}] {}: {}", record.level(), record.target(), record.args());
+            let msg = format!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
             nslog(&msg);
         }
     }
@@ -165,7 +172,9 @@ fn nslog(msg: &str) {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
     unsafe {
-        extern "C" { fn NSLog(fmt: *mut AnyObject, ...); }
+        extern "C" {
+            fn NSLog(fmt: *mut AnyObject, ...);
+        }
         let c_msg = std::ffi::CString::new(msg).unwrap_or_default();
         let ns_msg: *mut AnyObject = msg_send![class!(NSString), alloc];
         let ns_msg: *mut AnyObject = msg_send![ns_msg, initWithUTF8String: c_msg.as_ptr()];
@@ -189,7 +198,14 @@ pub extern "C" fn gpui_ios_register_app() {
     }));
 
     gpui_mobile::ios::ffi::set_app_callback(Box::new(|cx: &mut App| {
-        open_main_window(cx);
+        gpui_kit::init(cx);
+        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Light, None, cx);
+        screens::markdown::init(cx);
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            let content = cx.new(|cx| screens::ai_chat::AiChat::new(window, cx));
+            cx.new(|cx| gpui_kit::component::Root::new(content, window, cx))
+        })
+        .expect("open embedded Markdown view");
     }));
 }
 
@@ -217,11 +233,14 @@ fn open_main_window(cx: &mut App) {
     gpui_mobile::mobile_events::set_mobile_event_handler(Some(Box::new(|_, event| {
         screens::on_mobile_event(event);
     })));
+    gpui_kit::init(cx);
+    gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
     // Set up HTTP client so gpui::img() can fetch remote images (e.g. picsum.photos).
     // The rustls-tls feature supplies WebPKI roots, including on iOS.
     log::info!("Setting up HTTP client for image loading...");
     cx.set_http_client(std::sync::Arc::new(reqwest_client::ReqwestClient::new()));
     log::info!("HTTP client configured successfully");
+    screens::markdown::init(cx);
 
     // Check if the app was launched via a deeplink and determine the initial screen.
     let initial_screen = match gpui_mobile::packages::deeplink::get_initial_link() {
@@ -238,6 +257,12 @@ fn open_main_window(cx: &mut App) {
             screens::Screen::default()
         }
     };
+    // Allows simulator smoke tests to open a specific demo without tapping
+    // through the home screen, e.g. SIMCTL_CHILD_GPUI_INITIAL_SCREEN=markdown.
+    let initial_screen = std::env::var("GPUI_INITIAL_SCREEN")
+        .ok()
+        .and_then(|screen| screens::Screen::from_deeplink_url(&format!("gpui://{screen}")))
+        .unwrap_or(initial_screen);
     log::info!("Initial screen: {:?}", initial_screen);
 
     match cx.open_window(
@@ -245,7 +270,10 @@ fn open_main_window(cx: &mut App) {
             window_bounds: None,
             ..Default::default()
         },
-        |_, cx| cx.new(|_| Router::with_initial_screen(initial_screen)),
+        |window, cx| {
+            let router = cx.new(|_| Router::with_initial_screen(initial_screen));
+            cx.new(|cx| gpui_kit::component::Root::new(router, window, cx))
+        },
     ) {
         Ok(_handle) => {
             #[cfg(target_os = "android")]

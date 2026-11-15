@@ -12,10 +12,10 @@
 //!
 //! ## Integration with GPUI
 //!
-//! This crate depends on the `gpui` crate from the Zed repository for all
+//! This crate depends on the `gpui-pre` snapshot (imported as `gpui`) for all
 //! core types: `Platform`, `PlatformWindow`, `PlatformDisplay`, `Pixels`,
 //! `DevicePixels`, `Size`, `Point`, `Bounds`, event types, text system traits,
-//! etc.  It also depends on `gpui_wgpu` for the GPU renderer (`WgpuRenderer`)
+//! etc. It also depends on `gpui-pre-wgpu` for the GPU renderer (`WgpuRenderer`)
 //! and text system (`CosmicTextSystem`) on both platforms.
 //!
 //! ## iOS
@@ -176,6 +176,11 @@ pub(crate) fn mark_text_input_dirty() {
 ///
 /// Only one callback can be active at a time. Call with `None` to clear it.
 /// This is typically called by the text input component when it gains focus.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) fn has_text_input_callback() -> bool {
+    mobile_dispatch::has_text_handler()
+}
+
 pub fn set_text_input_callback(callback: Option<TextInputCallbackFn>) {
     mobile_dispatch::set_text_handler(callback);
 }

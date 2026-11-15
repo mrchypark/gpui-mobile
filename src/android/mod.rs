@@ -157,10 +157,14 @@ mod accessibility;
 mod accesskit_adapter;
 pub mod dispatcher;
 pub mod display;
+mod document_picker;
+pub(crate) mod frame_source;
+pub mod host;
 pub mod jni;
 pub mod keyboard;
 pub mod platform;
 pub mod platform_view;
+mod text_input;
 pub mod window;
 
 // ── public re-exports ─────────────────────────────────────────────────────────
@@ -255,4 +259,3 @@ pub fn init_logger() {
         log::info!("gpui-android logger initialised");
     });
 }
-pub(crate) mod frame_source;

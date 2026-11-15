@@ -1211,6 +1211,11 @@ impl AndroidPlatform {
         dispatcher.tick();
     }
 
+    /// Delayed tasks are released by the dispatcher timer thread.
+    pub fn next_delayed_due(&self) -> Option<std::time::Instant> {
+        self.state.lock().dispatcher.next_delayed_due()
+    }
+
     /// Drain all pending main-thread tasks synchronously.
     ///
     /// Useful in headless tests where there is no real ALooper.

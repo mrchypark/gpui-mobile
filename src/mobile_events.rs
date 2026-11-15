@@ -649,15 +649,17 @@ pub(crate) enum ImeInput {
     FinishComposition,
     Enter,
     Backspace,
+    /// Android surrounding deletion. `after` supports forward delete.
     DeleteBefore {
-        count: usize,
+        before: usize,
+        after: usize,
         codepoints: bool,
     },
 }
 
-pub(crate) use mobile_ime_core::{
-    ime_compose_region_range, ime_delete_units, ImeComposeRegion, ImeComposeState,
-};
+#[cfg(test)]
+pub(crate) use mobile_ime_core::ime_delete_units;
+pub(crate) use mobile_ime_core::{ime_compose_region_range, ImeComposeRegion, ImeComposeState};
 
 /// JNI action conversion. Empty commits replace (and can delete) marked text.
 pub(crate) fn ime_action(action: i32, text: String) -> Option<ImeInput> {
@@ -676,14 +678,62 @@ pub(crate) fn ime_delete_request(
     has_handler: bool,
     legacy: bool,
 ) -> Option<ImeInput> {
+    ime_delete_surrounding_request(count, 0, codepoints, has_handler, legacy)
+}
+
+pub(crate) fn ime_delete_surrounding_request(
+    before: usize,
+    after: usize,
+    codepoints: bool,
+    has_handler: bool,
+    legacy: bool,
+) -> Option<ImeInput> {
     if has_handler {
-        Some(ImeInput::DeleteBefore { count, codepoints })
-    } else if count == 1 && legacy {
+        Some(ImeInput::DeleteBefore {
+            before,
+            after,
+            codepoints,
+        })
+    } else if before == 1 && after == 0 && legacy {
         // Compatibility command only; the string callback exposes no range units.
         Some(ImeInput::Backspace)
     } else {
         None
     }
+}
+
+/// Convert Android's UTF-16 or code-point deletion counts into a UTF-16 range.
+/// UTF-16 requests round endpoints outwards so they never split a surrogate pair.
+pub(crate) fn ime_delete_range(
+    text: &str,
+    cursor: usize,
+    before: usize,
+    after: usize,
+    codepoints: bool,
+) -> Option<std::ops::Range<usize>> {
+    let mut boundaries = vec![0usize];
+    for ch in text.chars() {
+        boundaries.push(boundaries.last().copied()?.saturating_add(ch.len_utf16()));
+    }
+    let total = *boundaries.last()?;
+    if cursor > total {
+        return None;
+    }
+    let cursor_index = boundaries.binary_search(&cursor).ok()?;
+    if codepoints {
+        return Some(
+            boundaries[cursor_index.saturating_sub(before)]
+                ..boundaries[(cursor_index + after).min(boundaries.len() - 1)],
+        );
+    }
+
+    let start = cursor.saturating_sub(before);
+    let end = cursor.saturating_add(after).min(total);
+    let start_index = boundaries
+        .partition_point(|offset| *offset <= start)
+        .saturating_sub(1);
+    let end_index = boundaries.partition_point(|offset| *offset < end);
+    Some(boundaries[start_index]..boundaries[end_index])
 }
 
 /// Android password editors must not suggest or learn their contents.
@@ -820,6 +870,35 @@ mod tests {
         assert_eq!(super::ime_delete_units("e\u{301}", 1, true), Some(1));
         assert_eq!(super::ime_delete_units("a", 2, true), None);
         assert_eq!(super::ime_delete_units("", 0, false), Some(0));
+    }
+
+    #[test]
+    fn ime_surrounding_delete_uses_utf16_ranges_without_splitting_pairs() {
+        // Cursor after the emoji: one UTF-16 unit before lands inside it and
+        // must expand to the complete scalar; one unit after deletes `b`.
+        assert_eq!(super::ime_delete_range("a😀b", 3, 1, 1, false), Some(1..4));
+        // Forward-only deletion also expands across a surrogate pair.
+        assert_eq!(super::ime_delete_range("a😀b", 1, 0, 1, false), Some(1..3));
+    }
+
+    #[test]
+    fn ime_surrounding_delete_uses_codepoint_ranges() {
+        // Counts are Unicode scalars, not UTF-16 units.
+        assert_eq!(super::ime_delete_range("a😀b", 3, 1, 1, true), Some(1..4));
+        assert_eq!(super::ime_delete_range("a😀b", 1, 1, 1, true), Some(0..3));
+    }
+
+    #[test]
+    fn ime_surrounding_delete_preserves_forward_count_for_native_handlers() {
+        assert!(matches!(
+            super::ime_delete_surrounding_request(1, 2, false, true, false),
+            Some(super::ImeInput::DeleteBefore {
+                before: 1,
+                after: 2,
+                codepoints: false,
+            })
+        ));
+        assert!(super::ime_delete_surrounding_request(0, 1, false, false, true).is_none());
     }
 
     use super::*;

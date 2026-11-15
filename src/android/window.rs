@@ -226,6 +226,10 @@ pub type ActiveStatusCallback = Box<dyn FnMut(bool) + Send + 'static>;
 /// Called when a key event arrives.
 pub type KeyCallback = Box<dyn FnMut(AndroidKeyEvent) + Send + 'static>;
 
+fn same_surface_requires_recovery(renderer_exists: bool, previous: usize, incoming: usize) -> bool {
+    renderer_exists && incoming != 0 && previous == incoming
+}
+
 /// Called when the window is resized.
 pub type ResizeCallback = Box<dyn FnMut(Size<DevicePixels>, f32) + Send + 'static>;
 
@@ -296,6 +300,10 @@ struct WindowState {
     /// (Clone acquires, Drop releases).  `None` while the surface is
     /// unavailable (between `term_window` and the next `init_window`).
     native_window: Option<NativeWindow>,
+    /// Address of the last native window attached to the renderer.
+    /// `term_window` releases `native_window`, but the renderer's cached surface
+    /// still identifies this address until it is destroyed or replaced.
+    surface_window_addr: usize,
 
     /// Shared GPU context (instance + adapter + device + queue).
     /// Created once and reused across window re-creations.
@@ -490,6 +498,7 @@ impl AndroidWindow {
             gpui_handle: None,
             key_meta_state: 0,
             native_window: Some(native_window),
+            surface_window_addr: id as usize,
             gpu_context,
             renderer: Some(renderer),
             width,
@@ -535,6 +544,7 @@ impl AndroidWindow {
             gpui_handle: None,
             key_meta_state: 0,
             native_window: None,
+            surface_window_addr: 0,
             gpu_context: Rc::new(RefCell::new(None)),
             renderer: None,
             width,
@@ -581,15 +591,31 @@ impl AndroidWindow {
 
         let mut state = self.state.lock();
         let transparent = state.transparent;
-        let same_native_window = state
-            .native_window
-            .as_ref()
-            .is_some_and(|current| current.ptr() == native_window.ptr());
+        let incoming_addr = native_window.ptr().as_ptr() as usize;
+        let same_native_window = same_surface_requires_recovery(
+            state.renderer.is_some(),
+            state.surface_window_addr,
+            incoming_addr,
+        );
 
         // If a renderer already exists (kept alive across term_window), just
         // replace its surface.  This preserves the atlas and all cached
         // AtlasTextureIds so GPUI's scene cache remains valid.
-        if state.renderer.is_some() {
+        if state.renderer.is_some() && same_native_window {
+            // `replace_surface` creates the replacement before dropping the old
+            // surface. Vulkan rejects two live surfaces for the same ANativeWindow.
+            // Release the old surface first, then recover the renderer and its atlas.
+            let raw = Self::raw_window(&native_window);
+            let renderer = state.renderer.as_mut().unwrap();
+            renderer.destroy();
+            renderer
+                .recover(&raw)
+                .context("failed to rebuild the surface on the same native window")?;
+            renderer.update_drawable_size(gpui::size(
+                gpui::DevicePixels(width),
+                gpui::DevicePixels(height),
+            ));
+        } else if state.renderer.is_some() {
             let raw = Self::raw_window(&native_window);
             let config = WgpuSurfaceConfig {
                 size: gpui::size(gpui::DevicePixels(width), gpui::DevicePixels(height)),
@@ -604,10 +630,6 @@ impl AndroidWindow {
                 .instance
                 .clone();
             let renderer = state.renderer.as_mut().unwrap();
-            if same_native_window {
-                // Vulkan cannot bind two surfaces to the same live native window.
-                renderer.unconfigure_surface();
-            }
             renderer.replace_surface(&raw, config, &instance)?;
             log::info!(
                 "AndroidWindow::init_window — replaced surface {}×{}",
@@ -631,6 +653,8 @@ impl AndroidWindow {
                 height
             );
         }
+
+        state.surface_window_addr = incoming_addr;
 
         // Store the new native window (drops previous one if any).
         state.native_window = Some(native_window);
@@ -2131,7 +2155,11 @@ impl PlatformWindow for AndroidPlatformWindow {
                                         candidate.replace_text_in_range(None, "\n");
                                     }
                                 }
-                                ImeInput::DeleteBefore { count, codepoints } => {
+                                ImeInput::DeleteBefore {
+                                    before,
+                                    after,
+                                    codepoints,
+                                } => {
                                     compose_state.clear_region();
                                     let Some(selection) = candidate.selected_text_range(true)
                                     else {
@@ -2144,24 +2172,35 @@ impl PlatformWindow for AndroidPlatformWindow {
                                         candidate.replace_text_in_range(Some(selection.range), "");
                                         return;
                                     }
-                                    let end = selection.range.start;
-                                    let start = end.saturating_sub(count.saturating_mul(2));
+                                    let cursor = selection.range.start;
+                                    let start = cursor.saturating_sub(before.saturating_mul(2));
+                                    let end = cursor.saturating_add(after.saturating_mul(2));
                                     let mut adjusted = None;
                                     let Some(text) =
                                         candidate.text_for_range(start..end, &mut adjusted)
                                     else {
                                         return;
                                     };
-                                    if adjusted.unwrap_or(start..end).end != end
-                                        || !verify(candidate)
-                                    {
+                                    let actual = adjusted.unwrap_or(start..end);
+                                    let Some(local_cursor) = cursor.checked_sub(actual.start)
+                                    else {
+                                        return;
+                                    };
+                                    if cursor > actual.end || !verify(candidate) {
                                         return;
                                     }
-                                    if let Some(units) = crate::mobile_events::ime_delete_units(
-                                        &text, count, codepoints,
+                                    if let Some(range) = crate::mobile_events::ime_delete_range(
+                                        &text,
+                                        local_cursor,
+                                        before,
+                                        after,
+                                        codepoints,
                                     ) {
                                         candidate.replace_text_in_range(
-                                            Some(end.saturating_sub(units)..end),
+                                            Some(
+                                                actual.start + range.start
+                                                    ..actual.start + range.end,
+                                            ),
                                             "",
                                         );
                                     }
@@ -2171,8 +2210,13 @@ impl PlatformWindow for AndroidPlatformWindow {
                     );
                     return;
                 }
-                if let crate::mobile_events::ImeInput::DeleteBefore { count, codepoints } = &input {
-                    let (count, codepoints) = (*count, *codepoints);
+                if let crate::mobile_events::ImeInput::DeleteBefore {
+                    before,
+                    after,
+                    codepoints,
+                } = &input
+                {
+                    let (before, after, codepoints) = (*before, *after, *codepoints);
                     handler.call(
                         || super::jni::ime_delivery_current(session, editor),
                         |handler| {
@@ -2184,26 +2228,41 @@ impl PlatformWindow for AndroidPlatformWindow {
                             };
                             // The proxy has no document mirror. Query only enough real editor
                             // context for this operation and retain Android's unit distinction.
-                            let end = selection.range.start;
-                            let start = end.saturating_sub(count.saturating_mul(2));
+                            if !selection.range.is_empty() {
+                                handler.replace_text_in_range(Some(selection.range), "");
+                                return;
+                            }
+                            let cursor = selection.range.start;
+                            let start = cursor.saturating_sub(before.saturating_mul(2));
+                            let end = cursor.saturating_add(after.saturating_mul(2));
                             let mut adjusted = None;
                             let Some(text) = handler.text_for_range(start..end, &mut adjusted)
                             else {
                                 return;
                             };
                             let actual = adjusted.unwrap_or(start..end);
-                            if actual.end != end {
+                            let Some(local_cursor) = cursor.checked_sub(actual.start) else {
+                                return;
+                            };
+                            if cursor > actual.end {
                                 return;
                             }
-                            let Some(units) =
-                                crate::mobile_events::ime_delete_units(&text, count, codepoints)
-                            else {
+                            let Some(range) = crate::mobile_events::ime_delete_range(
+                                &text,
+                                local_cursor,
+                                before,
+                                after,
+                                codepoints,
+                            ) else {
                                 return;
                             };
                             if !super::jni::ime_delivery_current(session, editor) {
                                 return;
                             }
-                            handler.replace_text_in_range(Some(end.saturating_sub(units)..end), "");
+                            handler.replace_text_in_range(
+                                Some(actual.start + range.start..actual.start + range.end),
+                                "",
+                            );
                         },
                     );
                     return;
@@ -3173,5 +3232,13 @@ mod tests {
     fn gpu_specs_none_for_headless() {
         let w = AndroidWindow::headless(1080, 1920, 2.0);
         assert!(w.gpu_specs().is_none());
+    }
+
+    #[test]
+    fn same_native_window_recovery_requires_a_live_renderer_and_matching_address() {
+        assert!(same_surface_requires_recovery(true, 0x1234, 0x1234));
+        assert!(!same_surface_requires_recovery(true, 0x1234, 0x5678));
+        assert!(!same_surface_requires_recovery(false, 0x1234, 0x1234));
+        assert!(!same_surface_requires_recovery(true, 0, 0));
     }
 }

@@ -34,6 +34,12 @@
 //! Lifecycle events (window creation/destruction, focus changes, etc.) are
 //! delivered via `AndroidApp::poll_events()`.  Input events are obtained via
 //! `AndroidApp::input_events_iter()`.
+//!
+//! ## Frames
+//!
+//! The loop blocks on the looper between events and draws only when GPUI
+//! asked for a frame and a vsync has passed since — see
+//! [`super::frame_source`].
 
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
@@ -210,9 +216,13 @@ fn drain_platform_events() {
                     continue;
                 }
             }
-            log::info!("IME drain session={session} editor={editor} active={} current_session={} current_editor={} accepted={}",
-                IME_ACTIVE.load(Ordering::Acquire), IME_GENERATION.load(Ordering::Acquire),
-                IME_EDITOR.load(Ordering::Acquire), ime_delivery_current(session, editor));
+            log::info!(
+                "IME drain session={session} editor={editor} active={} current_session={} current_editor={} accepted={}",
+                IME_ACTIVE.load(Ordering::Acquire),
+                IME_GENERATION.load(Ordering::Acquire),
+                IME_EDITOR.load(Ordering::Acquire),
+                ime_delivery_current(session, editor)
+            );
             if ime_delivery_current(session, editor) {
                 window.handle_ime_input(session, editor, input);
             }
@@ -324,6 +334,7 @@ use super::platform::{AndroidPlatform, SharedPlatform};
 
 use jni::objects::{JObject, JString, JValue};
 use jni::JavaVM;
+use std::sync::{atomic::AtomicPtr, Mutex};
 
 // ── JNI helpers (safe `jni` crate wrappers) ──────────────────────────────────
 
@@ -372,10 +383,52 @@ pub fn obtain_env<T>(f: impl FnOnce(&mut jni::Env) -> Result<T, String>) -> Resu
 ///
 /// Return a local reference so the object remains valid if the Activity ends.
 pub fn activity<'local>(env: &mut jni::Env<'local>) -> Result<JObject<'local>, String> {
-    let app = android_app().ok_or_else(|| "Activity not available".to_string())?;
-    let object = unsafe { JObject::from_raw(env, app.activity_as_ptr() as jni::sys::jobject) };
+    let activity = activity_as_ptr();
+    if activity.is_null() {
+        return Err("Activity not available".to_string());
+    }
+    let object = unsafe { JObject::from_raw(env, activity as jni::sys::jobject) };
     env.new_local_ref(&object)
         .map_err(|error| error.to_string())
+}
+
+/// Drain InputConnection events from the host-driven Activity on its render thread.
+pub(crate) fn drain_host_ime_events() {
+    let Some(window) = platform().and_then(|platform| platform.primary_window()) else {
+        return;
+    };
+    window.refresh_ime_owner();
+    for event in super::text_input::take_events() {
+        let Ok(session) = i64::try_from(event.session) else {
+            continue;
+        };
+        let input = match event.kind {
+            0 if event.start <= event.end => crate::mobile_events::ImeInput::Compose {
+                text: event.text,
+                selection: event.start..event.end,
+                region: None,
+            },
+            1 => crate::mobile_events::ImeInput::Commit(event.text),
+            2 | 3 => {
+                let Some(input) = crate::mobile_events::ime_delete_surrounding_request(
+                    event.start,
+                    event.end,
+                    event.kind == 3,
+                    IME_HAS_HANDLER.load(Ordering::Acquire),
+                    IME_LEGACY_ENABLED.load(Ordering::Acquire),
+                ) else {
+                    continue;
+                };
+                input
+            }
+            4 => crate::mobile_events::ImeInput::FinishComposition,
+            _ => continue,
+        };
+        let editor = IME_EDITOR.load(Ordering::Acquire);
+        if ime_delivery_current(session, editor) {
+            window.handle_ime_input(session, editor, input);
+        }
+    }
 }
 
 fn query_activity_focus() -> Result<bool, String> {
@@ -519,6 +572,50 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 
 // ── public accessors ──────────────────────────────────────────────────────────
 
+/// JVM for the **host-driven** entry point ([`super::host`]), which has no
+/// `AndroidApp` to read it from.
+static HOST_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Current Activity for the host-driven entry point, as a JNI global reference we
+/// own. Replaced on every Activity creation so [`activity_as_ptr`] always names the
+/// *live* Activity.
+///
+/// The outgoing reference is kept one generation longer: `activity_as_ptr` hands out a
+/// raw `jobject`, and a call on the render thread may still be using the previous
+/// Activity while the UI thread installs the next one.
+static HOST_ACTIVITY: Mutex<HostActivity> = Mutex::new(HostActivity {
+    current: None,
+    previous: None,
+});
+
+struct HostActivity {
+    current: Option<jni::refs::Global<JObject<'static>>>,
+    previous: Option<jni::refs::Global<JObject<'static>>>,
+}
+
+/// Register the current Activity when running without `android-activity`.
+///
+/// Call from a JNI entry point in `Activity.onCreate`, every time — a recreated
+/// Activity is a new object. This module takes its own global reference and records
+/// the JVM, so `java_vm()` / `activity_as_ptr()` and everything built on them (IME,
+/// safe areas, file pickers, `rustls-platform-verifier`) work exactly as on the
+/// `android-activity` path. A no-op when `android-activity` owns the process.
+pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Result<(), String> {
+    if ANDROID_APP.lock().is_some() {
+        return Ok(());
+    }
+    let global = env.new_global_ref(activity).e()?;
+    let vm = env.get_java_vm().e()?;
+    HOST_VM.store(
+        vm.get_raw() as *mut c_void,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
+    slot.previous = slot.current.take();
+    slot.current = Some(global);
+    Ok(())
+}
+
 /// Public accessor for the JavaVM pointer.
 ///
 /// Uses `AndroidApp::vm_as_ptr()` from the stored `AndroidApp`.
@@ -526,7 +623,7 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 pub fn java_vm() -> *mut c_void {
     android_app()
         .map(|app| app.vm_as_ptr())
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|| HOST_VM.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Public accessor for the current Activity's JNI object reference.
@@ -541,12 +638,29 @@ pub fn java_vm() -> *mut c_void {
 pub fn activity_as_ptr() -> *mut c_void {
     android_app()
         .map(|app| app.activity_as_ptr())
-        .unwrap_or(std::ptr::null_mut())
+        .unwrap_or_else(|| {
+            HOST_ACTIVITY
+                .lock()
+                .expect("poisoned")
+                .current
+                .as_ref()
+                .map(|activity| activity.as_raw() as *mut c_void)
+                .unwrap_or(std::ptr::null_mut())
+        })
 }
 
 /// Returns a clone of the stored `AndroidApp`, if initialised.
 pub fn android_app() -> Option<AndroidApp> {
     ANDROID_APP.lock().clone()
+}
+
+/// Install the platform built by the host-driven path (`super::host`).
+pub(crate) fn set_host_platform(platform: Arc<AndroidPlatform>) {
+    let mut slot = PLATFORM.lock();
+    if slot.is_some() {
+        log::warn!("set_host_platform: PLATFORM already set — both entry points in one process?");
+    }
+    *slot = Some(platform);
 }
 
 /// Returns the current Activity's platform, if initialised.
@@ -1747,11 +1861,31 @@ mod prompt_tests {
 ///
 /// `android-activity` accesses InputMethodManager and Views through JNI on the
 /// calling thread, so schedule the operation on Java's main thread explicitly.
+fn android_input_type(keyboard_type: crate::KeyboardType, flags: i32, secure: bool) -> i32 {
+    let mut input_type = if secure {
+        0x81
+    } else {
+        match keyboard_type {
+            crate::KeyboardType::Default => 1,
+            crate::KeyboardType::EmailAddress => 0x21,
+            crate::KeyboardType::Phone => 3,
+            crate::KeyboardType::NumberPad => 2,
+            crate::KeyboardType::URL => 0x11,
+            crate::KeyboardType::Decimal => 0x2002,
+        }
+    };
+    if input_type & 0xf == 1 {
+        input_type |= flags;
+    }
+    input_type
+}
+
 pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
     let (flags, options) = IME_CONFIGURATION
         .with(|configuration| crate::mobile_events::android_input_traits(&configuration.borrow()));
     let secure = IME_PASSWORD.get();
     let (flags, options) = crate::mobile_events::android_password_traits(flags, options, secure);
+    let input_type = android_input_type(keyboard_type, flags, secure);
     let key = (
         keyboard_type,
         flags,
@@ -1772,6 +1906,7 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
         Ordering::Release,
     );
     let session = IME_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    super::text_input::set_session(session as u64);
     IME_LEGACY_GENERATION.set(crate::mobile_dispatch::text_handler_generation());
     if let Some(app) = android_app() {
         app.run_on_java_main_thread(Box::new(move || {
@@ -1781,21 +1916,6 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
             let result = with_env(|env| {
                 let class = find_app_class(env, "dev.gpui.mobile.GpuiKeyboard")?;
                 let activity = activity(env)?;
-                let mut input_type = if secure {
-                    0x81
-                } else {
-                    match keyboard_type {
-                        crate::KeyboardType::Default => 1,
-                        crate::KeyboardType::EmailAddress => 0x21,
-                        crate::KeyboardType::Phone => 3,
-                        crate::KeyboardType::NumberPad => 2,
-                        crate::KeyboardType::URL => 0x11,
-                        crate::KeyboardType::Decimal => 0x2002,
-                    }
-                };
-                if input_type & 0xf == 1 {
-                    input_type |= flags;
-                }
                 env.call_static_method(
                     &class,
                     jni::jni_str!("show"),
@@ -1817,17 +1937,53 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
                 log::warn!("show_keyboard_android: {error}");
             }
         }));
+    } else {
+        if let Err(error) = with_env(|env| {
+            let activity = activity(env)?;
+            env.call_method(
+                &activity,
+                jni::jni_str!("gpuiShowKeyboard"),
+                jni::jni_sig!("(IIJ)V"),
+                &[
+                    JValue::Int(input_type),
+                    JValue::Int(options),
+                    JValue::Long(session),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                env.exception_clear();
+                error.to_string()
+            })
+        }) {
+            log::warn!("show_keyboard_android host: {error}");
+        }
     }
 }
 
 /// Hide the software keyboard on Android.
 ///
 /// Schedule JNI InputMethodManager/View access on Java's main thread.
+/// Re-open the software keyboard after the host Activity recreates its input proxy.
+pub(crate) fn restore_keyboard() {
+    if IME_ACTIVE.load(Ordering::Acquire) {
+        show_keyboard_android(IME_TYPE.get());
+    }
+}
+
+/// Restart the active input connection so Android drops stale composing spans.
+pub(crate) fn reset_keyboard_composition() {
+    if IME_ACTIVE.load(Ordering::Acquire) {
+        show_keyboard_android(IME_TYPE.get());
+    }
+}
+
 pub fn hide_keyboard_android() {
     IME_ACTIVE.store(false, Ordering::Release);
     IME_HAS_HANDLER.store(false, Ordering::Release);
     IME_LEGACY_ENABLED.store(false, Ordering::Release);
     let session = IME_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    super::text_input::set_session(session as u64);
     if let Some(app) = android_app() {
         app.run_on_java_main_thread(Box::new(move || {
             if IME_GENERATION.load(Ordering::Acquire) != session {
@@ -1852,6 +2008,21 @@ pub fn hide_keyboard_android() {
                 log::warn!("hide_keyboard_android: {error}");
             }
         }));
+    } else if let Err(error) = with_env(|env| {
+        let activity = activity(env)?;
+        env.call_method(
+            &activity,
+            jni::jni_str!("gpuiHideKeyboard"),
+            jni::jni_sig!("(J)V"),
+            &[JValue::Long(session)],
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            env.exception_clear();
+            error.to_string()
+        })
+    }) {
+        log::warn!("hide_keyboard_android host: {error}");
     }
 }
 
@@ -2112,6 +2283,36 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_deleteBefore(
     1
 }
 
+/// Host-driven Activity InputConnection callback.
+///
+/// The Java UI thread only copies the event; [`super::host`] applies it on the
+/// GPUI render thread after validating the current IME session and editor.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeIme(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    session: i64,
+    kind: i32,
+    text: *mut c_void,
+    start: i32,
+    end: i32,
+) {
+    if session <= 0 || start < 0 || end < 0 {
+        return;
+    }
+    let _ = with_env(|env| {
+        let text = unsafe { JObject::from_raw(env, text as jni::sys::jobject) };
+        super::host::ime_event(
+            session as u64,
+            kind,
+            get_string(env, &text),
+            start as usize,
+            end as usize,
+        );
+        Ok(())
+    });
+}
+
 // ── JNI export for GpuiActivity splash screen ────────────────────────────────
 
 #[unsafe(no_mangle)]
@@ -2285,6 +2486,18 @@ mod tests {
     #[test]
     fn android_app_returns_none_before_init() {
         assert!(android_app().is_none());
+    }
+
+    #[test]
+    fn host_input_type_matches_secure_android_app_input_type() {
+        assert_eq!(
+            android_input_type(crate::KeyboardType::Default, 0x80000, true),
+            0x80081
+        );
+        assert_eq!(
+            android_input_type(crate::KeyboardType::Phone, 0x80000, false),
+            3
+        );
     }
 
     #[test]

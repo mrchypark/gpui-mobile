@@ -1044,7 +1044,17 @@ impl IosWindowInner {
         if self.closed.get() || !self.app_active.get() {
             return None;
         }
-        let key: Bool = unsafe { msg_send![self.window, isKeyWindow] };
+        let window = unsafe {
+            if self.window.is_null() {
+                msg_send![self.view, window]
+            } else {
+                self.window
+            }
+        };
+        if window.is_null() {
+            return None;
+        }
+        let key: Bool = unsafe { msg_send![window, isKeyWindow] };
         key.as_bool().then_some(self.gpui_handle)
     }
 
@@ -1247,8 +1257,12 @@ impl IosWindowInner {
             // Create UIWindow
             let screen_obj: *mut AnyObject = msg_send![class!(UIScreen), mainScreen];
             let screen_bounds_cg: ObjcCGRect = msg_send![screen_obj, bounds];
-            let window: *mut AnyObject = msg_send![class!(UIWindow), alloc];
-            let window: *mut AnyObject = msg_send![window, initWithFrame: screen_bounds_cg];
+            let window: *mut AnyObject = if super::ffi::is_embedded() {
+                ptr::null_mut()
+            } else {
+                let window: *mut AnyObject = msg_send![class!(UIWindow), alloc];
+                msg_send![window, initWithFrame: screen_bounds_cg]
+            };
 
             // Create our custom UIViewController subclass that supports
             // dynamic `preferredStatusBarStyle` overrides.
@@ -1288,11 +1302,10 @@ impl IosWindowInner {
             // Set the view as the view controller's view
             let _: () = msg_send![view_controller, setView: view];
 
-            // Set the root view controller
-            let _: () = msg_send![window, setRootViewController: view_controller];
-
-            // Make the window visible
-            let _: () = msg_send![window, makeKeyAndVisible];
+            if !window.is_null() {
+                let _: () = msg_send![window, setRootViewController: view_controller];
+                let _: () = msg_send![window, makeKeyAndVisible];
+            }
 
             // Create a hidden text input view for keyboard handling.
             // Uses our custom GPUITextInputView which implements UIKeyInput
@@ -2265,6 +2278,9 @@ impl IosWindowInner {
 
             let new_w = view_bounds.width as f32;
             let new_h = view_bounds.height as f32;
+            if new_w <= 0.0 || new_h <= 0.0 {
+                return;
+            }
             let new_scale = scale as f32;
 
             let old_bounds = self.bounds.get();
@@ -2565,9 +2581,10 @@ impl PlatformWindow for IosWindow {
     }
 
     fn activate(&self) {
-        let inner = self.inner.clone();
-        unsafe {
-            let _: () = msg_send![inner.window, makeKeyAndVisible];
+        if !self.window.is_null() {
+            unsafe {
+                let _: () = msg_send![self.window, makeKeyAndVisible];
+            }
         }
     }
 
@@ -2575,7 +2592,12 @@ impl PlatformWindow for IosWindow {
         unsafe {
             let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
             let key_window: *mut AnyObject = msg_send![app, keyWindow];
-            self.window == key_window
+            let window = if self.window.is_null() {
+                msg_send![self.view, window]
+            } else {
+                self.window
+            };
+            !window.is_null() && window == key_window
         }
     }
 
