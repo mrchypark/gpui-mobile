@@ -30,11 +30,23 @@ pub(super) fn new_session() -> u64 {
     session
 }
 
+/// Align the host Activity queue with the JNI keyboard generation.
+pub(super) fn set_session(session: u64) {
+    SESSION.store(session, Ordering::Release);
+    EVENTS.lock().clear();
+    COMPOSING.store(false, Ordering::Release);
+}
+
 pub(super) fn enqueue(event: ImeEvent) {
     if event.session == SESSION.load(Ordering::Acquire) {
         EVENTS.lock().push_back(event);
         crate::mark_text_input_dirty();
     }
+}
+
+/// Take the host Activity's queued events on the GPUI render thread.
+pub(super) fn take_events() -> VecDeque<ImeEvent> {
+    std::mem::take(&mut *EVENTS.lock())
 }
 
 pub(super) fn drain(

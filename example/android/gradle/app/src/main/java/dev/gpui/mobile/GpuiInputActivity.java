@@ -4,7 +4,6 @@ import android.app.NativeActivity;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.text.Editable;
-import android.text.InputType;
 import android.text.Selection;
 import android.text.TextWatcher;
 import android.view.KeyEvent;
@@ -32,7 +31,7 @@ public class GpuiInputActivity extends NativeActivity {
         super.onCreate(state);
     }
 
-    public void gpuiShowKeyboard(int keyboardType, long session) {
+    public void gpuiShowKeyboard(int inputType, int imeOptions, long session) {
         runOnUiThread(() -> {
             if (input == null) {
                 input = new InputProxy();
@@ -41,16 +40,8 @@ public class GpuiInputActivity extends NativeActivity {
                 addContentView(input, new ViewGroup.LayoutParams(1, 1));
             }
             input.reset(session);
-            int type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE;
-            switch (keyboardType) {
-                case 1: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS; break;
-                case 2: type = InputType.TYPE_CLASS_PHONE; break;
-                case 3: type = InputType.TYPE_CLASS_NUMBER; break;
-                case 4: type = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI; break;
-                case 5: type = InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL; break;
-            }
-            input.setInputType(type);
-            input.setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+            input.setInputType(inputType);
+            input.setImeOptions(imeOptions);
             input.requestFocus();
             InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
             imm.restartInput(input);

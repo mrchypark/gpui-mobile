@@ -48,12 +48,9 @@
 //!   surface. That wait is mandatory: destroying a `Surface` while a thread sits inside
 //!   `ANativeWindow_lock` is a use-after-free.
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
-        Arc, Mutex, OnceLock,
-    },
-    time::Duration,
+use std::sync::{
+    atomic::{AtomicPtr, AtomicU32, Ordering},
+    Arc, Condvar, Mutex, OnceLock,
 };
 
 use gpui::{App, Application, ApplicationHandle};
@@ -71,8 +68,58 @@ static COMMANDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 /// Set once the render thread is running; guards against a second spawn.
 static STARTED: OnceLock<()> = OnceLock::new();
 
-/// Cleared by the render thread once it has released the outgoing surface.
-static SURFACE_RELEASED: AtomicBool = AtomicBool::new(true);
+/// Lets `surface_destroyed` wait until the render thread releases the native surface.
+struct SurfaceRelease {
+    sequences: Mutex<(u64, u64)>,
+    changed: Condvar,
+}
+
+impl SurfaceRelease {
+    const fn new() -> Self {
+        Self {
+            sequences: Mutex::new((0, 0)),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn request(&self) -> u64 {
+        let mut sequences = self.sequences.lock().expect("poisoned");
+        sequences.0 = sequences
+            .0
+            .checked_add(1)
+            .expect("surface sequence overflow");
+        sequences.0
+    }
+
+    fn finish(&self, sequence: u64) {
+        let mut sequences = self.sequences.lock().expect("poisoned");
+        sequences.1 = sequences.1.max(sequence);
+        drop(sequences);
+        self.changed.notify_all();
+    }
+
+    fn wait_timeout(&self, sequence: u64, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut sequences = self.sequences.lock().expect("poisoned");
+        while sequences.1 < sequence {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, result) = self
+                .changed
+                .wait_timeout(sequences, remaining)
+                .expect("poisoned");
+            sequences = next;
+            if result.timed_out() && sequences.1 < sequence {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+static SURFACE_RELEASED: SurfaceRelease = SurfaceRelease::new();
 
 /// Scale factor of the current surface (`f32` bits), for the platform-view hit test
 /// in [`motion_event`], which runs on the Java UI thread and must not touch the window.
@@ -95,7 +142,9 @@ enum Command {
         window: NativeWindow,
         scale: f32,
     },
-    SurfaceDestroyed,
+    SurfaceDestroyed {
+        sequence: u64,
+    },
     Resumed,
     Paused,
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
@@ -219,13 +268,13 @@ fn render_thread(launch: Launch) {
                 Command::SurfaceCreated { window, scale } => {
                     on_surface_created(&platform, window, scale, &mut app);
                 }
-                Command::SurfaceDestroyed => {
+                Command::SurfaceDestroyed { sequence } => {
                     if let Some(win) = platform.primary_window() {
                         // Keeps the renderer (and its atlas) alive; only the surface goes.
                         win.term_window();
                     }
                     CURRENT_SURFACE.store(std::ptr::null_mut(), Ordering::SeqCst);
-                    SURFACE_RELEASED.store(true, Ordering::SeqCst);
+                    SURFACE_RELEASED.finish(sequence);
                 }
                 Command::Resumed => {
                     platform.did_become_active();
@@ -251,6 +300,7 @@ fn render_thread(launch: Launch) {
             }
         }
 
+        super::jni::drain_host_ime_events();
         platform.tick();
         platform.flush_main_thread_tasks();
         if crate::TEXT_INPUT_DIRTY.load(Ordering::Acquire) {
@@ -288,8 +338,6 @@ fn on_surface_created(
     scale: f32,
     app: &mut HostApp,
 ) {
-    SURFACE_RELEASED.store(false, Ordering::SeqCst);
-
     let incoming = window.ptr().as_ptr();
     if CURRENT_SURFACE.load(Ordering::SeqCst) == incoming {
         // `surfaceChanged` for a surface we are already rendering into: the size may
@@ -347,26 +395,19 @@ pub fn surface_created(window: NativeWindow, scale: f32) {
     post(Command::SurfaceCreated { window, scale });
 }
 
-/// Take the surface back and **block until the render thread has let go of it**.
+/// Take the surface back and wait for the render thread to release it.
 ///
 /// Call this from `SurfaceHolder.Callback.surfaceDestroyed` before returning to the
-/// framework, otherwise the `Surface` is torn down underneath a thread that may be
-/// inside `ANativeWindow_lock`.
-pub fn surface_destroyed() {
-    post(Command::SurfaceDestroyed);
-
-    // Bounded wait: a stuck render thread must not turn into an ANR. 2 s is far below
-    // the 5 s input-dispatch timeout while being far above a worst-case frame.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !SURFACE_RELEASED.load(Ordering::SeqCst) {
-        if std::time::Instant::now() >= deadline {
-            log::error!(
-                "gpui-main: timed out waiting for the render thread to release the surface"
-            );
-            return;
-        }
-        std::thread::sleep(Duration::from_micros(200));
+/// framework. Returns `false` if the render thread did not acknowledge within two
+/// seconds; on `false`, release has **not** been confirmed.
+pub fn surface_destroyed() -> bool {
+    let sequence = SURFACE_RELEASED.request();
+    post(Command::SurfaceDestroyed { sequence });
+    let released = SURFACE_RELEASED.wait_timeout(sequence, std::time::Duration::from_secs(2));
+    if !released {
+        log::error!("gpui-main: timed out waiting for the render thread to release the surface");
     }
+    released
 }
 
 /// Deliver a whole `MotionEvent`.
@@ -445,6 +486,7 @@ pub fn ime_event(session: u64, kind: i32, text: String, start: usize, end: usize
         start,
         end,
     });
+    wake_render_thread();
 }
 
 pub fn resumed() {
@@ -453,4 +495,22 @@ pub fn resumed() {
 
 pub fn paused() {
     post(Command::Paused);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SurfaceRelease;
+
+    #[test]
+    fn stale_surface_release_ack_does_not_complete_a_newer_destroy() {
+        let release = SurfaceRelease::new();
+        let first = release.request();
+        release.finish(first);
+        let second = release.request();
+        assert!(!release.wait_timeout(second, std::time::Duration::ZERO));
+        release.finish(first);
+        assert!(!release.wait_timeout(second, std::time::Duration::ZERO));
+        release.finish(second);
+        assert!(release.wait_timeout(second, std::time::Duration::ZERO));
+    }
 }
