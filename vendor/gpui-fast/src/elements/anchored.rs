@@ -267,20 +267,20 @@ impl Element for Anchored {
 
         // Snap the horizontal edges of the anchored element to the horizontal edges of the window if
         // its horizontal bounds overflow, aligning to the left if it is wider than the limits.
-        if desired.right() > limits.right() {
-            desired.origin.x -= desired.right() - limits.right() + edges.right;
+        if desired.right() > limits.right() - edges.right {
+            desired.origin.x -= desired.right() - (limits.right() - edges.right);
         }
-        if desired.left() < limits.left() {
-            desired.origin.x = limits.origin.x + edges.left;
+        if desired.left() < limits.left() + edges.left {
+            desired.origin.x = limits.left() + edges.left;
         }
 
         // Snap the vertical edges of the anchored element to the vertical edges of the window if
         // its vertical bounds overflow, aligning to the top if it is taller than the limits.
-        if desired.bottom() > limits.bottom() {
-            desired.origin.y -= desired.bottom() - limits.bottom() + edges.bottom;
+        if desired.bottom() > limits.bottom() - edges.bottom {
+            desired.origin.y -= desired.bottom() - (limits.bottom() - edges.bottom);
         }
-        if desired.top() < limits.top() {
-            desired.origin.y = limits.origin.y + edges.top;
+        if desired.top() < limits.top() + edges.top {
+            desired.origin.y = limits.top() + edges.top;
         }
 
         let offset = desired.origin - bounds.origin;
@@ -387,8 +387,8 @@ impl AnchoredPositionMode {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Anchor, Bounds, Context, Pixels, PlatformInput, Point, TestAppContext, Window, deferred,
-        div, point, prelude::*, px, size,
+        Anchor, Bounds, Context, Edges, Pixels, PlatformInput, Point, Size, TestAppContext, Window,
+        deferred, div, point, prelude::*, px, size,
     };
 
     struct AnchoredTestView {
@@ -492,6 +492,120 @@ mod tests {
         assert_eq!(menu_bounds.size, size(px(200.), px(300.)));
     }
 
+    struct MarginTestView {
+        position: Point<Pixels>,
+        extent: Size<Pixels>,
+        margins: Edges<Pixels>,
+        inset: Pixels,
+    }
+
+    impl Render for MarginTestView {
+        fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            window.client_inset = Some(self.inset);
+            div().size_full().child(
+                deferred(
+                    super::anchored()
+                        .position(self.position)
+                        .snap_to_window_with_margin(self.margins)
+                        .child(
+                            div()
+                                .debug_selector(|| "MARGIN_MENU".into())
+                                .w(self.extent.width)
+                                .h(self.extent.height),
+                        ),
+                )
+                .with_priority(1),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn anchored_snaps_to_safe_margins_and_client_inset(cx: &mut TestAppContext) {
+        let margins = Edges {
+            top: px(11.),
+            right: px(17.),
+            bottom: px(23.),
+            left: px(31.),
+        };
+        for (position, extent, inset, expected) in [
+            // Each rectangle fits the window but violates one or more safe edges.
+            (
+                point(px(10.), px(10.)),
+                size(px(200.), px(100.)),
+                px(5.),
+                point(px(36.), px(16.)),
+            ),
+            (
+                point(px(590.), px(490.)),
+                size(px(200.), px(100.)),
+                px(5.),
+                point(px(578.), px(472.)),
+            ),
+            // Exact safe bounds and ordinary interior placement stay put.
+            (
+                point(px(36.), px(16.)),
+                size(px(200.), px(100.)),
+                px(5.),
+                point(px(36.), px(16.)),
+            ),
+            (
+                point(px(100.), px(100.)),
+                size(px(200.), px(100.)),
+                px(5.),
+                point(px(100.), px(100.)),
+            ),
+            // Oversized children are aligned to the safe top-left, without resizing.
+            (
+                point(px(100.), px(100.)),
+                size(px(900.), px(700.)),
+                px(5.),
+                point(px(36.), px(16.)),
+            ),
+            // Client inset also applies when explicit margins are absent.
+        ] {
+            let window = cx.open_window(size(px(800.), px(600.)), |_, _| MarginTestView {
+                position,
+                extent,
+                margins,
+                inset,
+            });
+            cx.run_until_parked();
+            let actual = window
+                .update(cx, |_, window, _| {
+                    window
+                        .rendered_frame
+                        .debug_bounds
+                        .get("MARGIN_MENU")
+                        .copied()
+                })
+                .unwrap()
+                .expect("menu debug bounds");
+            assert_eq!(
+                actual.origin, expected,
+                "position: {position:?}, size: {extent:?}"
+            );
+            assert_eq!(actual.size, extent);
+        }
+        let window = cx.open_window(size(px(800.), px(600.)), |_, _| MarginTestView {
+            position: point(px(2.), px(2.)),
+            extent: size(px(200.), px(100.)),
+            margins: Edges::default(),
+            inset: px(5.),
+        });
+        cx.run_until_parked();
+        let actual = window
+            .update(cx, |_, window, _| {
+                window
+                    .rendered_frame
+                    .debug_bounds
+                    .get("MARGIN_MENU")
+                    .copied()
+            })
+            .unwrap()
+            .expect("menu debug bounds");
+        assert_eq!(actual.origin, point(px(5.), px(5.)));
+    }
+
     struct AttachedTestView {
         target: Bounds<Pixels>,
         corner: Anchor,
@@ -530,9 +644,8 @@ mod tests {
             (trigger(100., 100.), submenu, point(px(198.), px(104.))),
             (trigger(550., 100.), submenu, point(px(352.), px(104.))),
             (trigger(100., 400.), dropdown, point(px(98.), px(96.))),
-            // Ends 4px from the window edge. That's inside the snap margin but still fits,
-            // so it stays.
-            (trigger(498., 100.), submenu, point(px(596.), px(104.))),
+            // Attachment stays on the same side; the final snap respects the margin.
+            (trigger(498., 100.), submenu, point(px(592.), px(104.))),
             // Doesn't fit on either side. The left sticks out less, so it goes left and
             // slides back into the window.
             (
