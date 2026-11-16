@@ -28,7 +28,9 @@
 //!    after the first call).
 //! 2. From `SurfaceHolder.Callback`: [`surface_created`] in both `surfaceCreated` and
 //!    `surfaceChanged`, [`surface_destroyed`] in `surfaceDestroyed`.
-//! 3. From `onResume` / `onPause`: [`resumed`] / [`paused`].
+//! 3. From `onStart` / `onStop` and `onResume` / `onPause`: [`started`] /
+//!    [`stopped`] and [`resumed`] / [`paused`]. Call [`low_memory`] from
+//!    `onLowMemory`. Forward window focus with [`focus_changed`].
 //! 4. From `onTouchEvent`, `dispatchKeyEvent` and the `InputConnection`:
 //!    [`motion_event`], [`key`], [`ime_event`].
 //!
@@ -147,6 +149,13 @@ enum Command {
     },
     Resumed,
     Paused,
+    Started,
+    Stopped,
+    LowMemory,
+    FocusChanged {
+        generation: u64,
+        focused: bool,
+    },
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
     /// render thread, so both go through the queue like everything else.
     Touch(TouchPoint),
@@ -192,7 +201,7 @@ fn post(command: Command) {
     wake_render_thread();
 }
 
-fn wake_render_thread() {
+pub(crate) fn wake_render_thread() {
     if let Some(looper) = LOOPER.lock().expect("poisoned").as_ref() {
         // SAFETY: the pointer stays valid for the lifetime of the render thread,
         // which is the lifetime of the process.
@@ -277,15 +286,37 @@ fn render_thread(launch: Launch) {
                     SURFACE_RELEASED.finish(sequence);
                 }
                 Command::Resumed => {
+                    super::jni::queue_platform_event(Some(gpui::AppLifecyclePhase::Active));
                     platform.did_become_active();
                     if let Some(win) = platform.primary_window() {
                         win.set_active(true);
+                        win.notify_app_lifecycle(true);
                     }
                 }
                 Command::Paused => {
+                    super::jni::queue_platform_event(Some(gpui::AppLifecyclePhase::Inactive));
                     platform.did_enter_background();
                     if let Some(win) = platform.primary_window() {
                         win.set_active(false);
+                        win.notify_app_lifecycle(false);
+                    }
+                }
+                Command::Started => {
+                    super::jni::queue_platform_event(Some(gpui::AppLifecyclePhase::Foreground));
+                }
+                Command::Stopped => {
+                    super::jni::queue_platform_event(Some(gpui::AppLifecyclePhase::Background));
+                }
+                Command::LowMemory => super::jni::queue_platform_event(None),
+                Command::FocusChanged {
+                    generation,
+                    focused,
+                } => {
+                    if generation == super::jni::host_activity_generation() {
+                        super::jni::set_host_window_focused(focused);
+                        if let Some(win) = platform.primary_window() {
+                            win.set_active(focused);
+                        }
                     }
                 }
                 Command::Touch(point) => match platform.primary_window() {
@@ -300,6 +331,14 @@ fn render_thread(launch: Launch) {
             }
         }
 
+        if let Some(win) = platform.primary_window() {
+            if let Some((density, insets)) = super::jni::take_window_insets() {
+                win.update_window_insets(density, insets);
+                crate::render_request::request_force_render();
+                super::frame_source::schedule_frame();
+            }
+        }
+        super::jni::drain_platform_events();
         super::jni::drain_host_ime_events();
         platform.tick();
         platform.flush_main_thread_tasks();
@@ -338,6 +377,7 @@ fn on_surface_created(
     scale: f32,
     app: &mut HostApp,
 ) {
+    platform.update_primary_display_from_scale(&window, scale);
     let incoming = window.ptr().as_ptr();
     if CURRENT_SURFACE.load(Ordering::SeqCst) == incoming {
         // `surfaceChanged` for a surface we are already rendering into: the size may
@@ -495,6 +535,37 @@ pub fn resumed() {
 
 pub fn paused() {
     post(Command::Paused);
+}
+
+pub fn started() {
+    post(Command::Started);
+}
+
+pub fn stopped() {
+    post(Command::Stopped);
+}
+
+pub fn low_memory() {
+    post(Command::LowMemory);
+}
+
+/// Forward `onWindowFocusChanged` for the current host Activity on the UI thread.
+pub fn focus_changed(
+    env: &mut jni::Env<'_>,
+    activity: &jni::objects::JObject<'_>,
+    focused: bool,
+) -> Result<(), String> {
+    let current = super::jni::activity(env)?;
+    if env
+        .is_same_object(activity, &current)
+        .map_err(|e| e.to_string())?
+    {
+        post(Command::FocusChanged {
+            generation: super::jni::host_activity_generation(),
+            focused,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

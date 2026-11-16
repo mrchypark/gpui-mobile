@@ -5,11 +5,28 @@ pub struct Slot(Mutex<bool>);
 struct State {
     claimed: bool,
     dismissing: bool,
+    owns_paths: bool,
     sender: Option<mpsc::Sender<PickerResult>>,
 }
 #[derive(Clone)]
 pub struct Token(Arc<Mutex<State>>);
 impl Token {
+    pub fn finish_incomplete_dismissal(&self, result: PickerResult) {
+        let owns_paths = self.0.lock().map(|state| state.owns_paths).unwrap_or(true);
+        if owns_paths {
+            if let Ok(paths) = &result {
+                discard(paths);
+            }
+            self.finish(Err("Picker dismissal ended without completion".into()));
+        } else {
+            self.finish(result);
+        }
+    }
+    pub fn discard_owned(&self, paths: &[String]) {
+        if self.0.lock().map(|state| state.owns_paths).unwrap_or(false) {
+            discard(paths);
+        }
+    }
     pub fn is_open(&self) -> bool {
         self.0
             .lock()
@@ -51,12 +68,12 @@ impl Token {
             Err(_) => Some(result),
         };
         if let Some(Ok(paths)) = abandoned {
-            discard(&paths);
+            self.discard_owned(&paths);
         }
     }
 }
 
-// Only request-owned private import paths may enter this channel.
+// Only request-owned private import paths may be passed here.
 pub fn discard(paths: &[String]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
@@ -87,6 +104,12 @@ impl Slot {
         Self(Mutex::new(false))
     }
     pub fn begin(&self) -> Result<Request<'_>, String> {
+        self.begin_with_ownership(true)
+    }
+    pub fn begin_export(&self) -> Result<Request<'_>, String> {
+        self.begin_with_ownership(false)
+    }
+    fn begin_with_ownership(&self, owns_paths: bool) -> Result<Request<'_>, String> {
         let mut busy = self.0.lock().map_err(|_| "Picker state poisoned")?;
         if *busy {
             return Err("A picker request is already active".into());
@@ -99,6 +122,7 @@ impl Slot {
             token: Token(Arc::new(Mutex::new(State {
                 claimed: false,
                 dismissing: false,
+                owns_paths,
                 sender: Some(sender),
             }))),
         })
@@ -115,7 +139,7 @@ impl Drop for Request<'_> {
             state.sender.take();
         }
         while let Ok(Ok(paths)) = self.receiver.try_recv() {
-            discard(&paths);
+            self.token.discard_owned(&paths);
         }
         if let Ok(mut busy) = self.slot.0.lock() {
             *busy = false;
@@ -160,6 +184,56 @@ mod tests {
         token.finish(Ok(vec![file.to_string_lossy().into_owned()]));
         assert!(!root.exists());
         assert!(slot.begin().is_ok());
+    }
+    #[test]
+    fn incomplete_dismissal_preserves_export_and_reclaims_import() {
+        let root = std::env::temp_dir().join(format!("gpui-dismissal-test-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("file.txt");
+        std::fs::write(&file, "data").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let slot = Slot::new();
+        let export = slot.begin_export().unwrap();
+        export
+            .token
+            .finish_incomplete_dismissal(Ok(vec![path.clone()]));
+        assert_eq!(export.receiver.recv().unwrap(), Ok(vec![path.clone()]));
+        assert!(file.exists());
+        drop(export);
+        let import = slot.begin().unwrap();
+        import.token.finish_incomplete_dismissal(Ok(vec![path]));
+        assert!(import.receiver.recv().unwrap().is_err());
+        assert!(!root.exists());
+    }
+    #[test]
+    fn abandoned_export_never_deletes_the_destination() {
+        let root =
+            std::env::temp_dir().join(format!("gpui-export-request-test-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("export.txt");
+        std::fs::write(&file, "user data").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let slot = Slot::new();
+
+        let request = slot.begin_export().unwrap();
+        let token = request.token.clone();
+        assert!(token.claim());
+        drop(request);
+        token.finish(Ok(vec![path.clone()]));
+        assert_eq!(std::fs::read(&file).unwrap(), b"user data");
+
+        let request = slot.begin_export().unwrap();
+        assert!(request.token.claim());
+        request.token.finish(Ok(vec![path.clone()]));
+        drop(request);
+        assert_eq!(std::fs::read(&file).unwrap(), b"user data");
+
+        let request = slot.begin_export().unwrap();
+        request.token.discard_owned(&[path]);
+        drop(request);
+        assert_eq!(std::fs::read(&file).unwrap(), b"user data");
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
     #[test]
     fn partial_import_failure_and_duplicate_success_reclaim_files() {

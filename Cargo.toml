@@ -90,6 +90,8 @@ core-text           = "=21.0.0"
 uuid                = { version = "1", features = ["v4", "v5"] }
 block2              = "0.6"
 libc                = "=0.2.191"
+# VoiceOver: bridges GPUI's accesskit 0.24 tree to UIKit accessibility elements.
+accesskit_ios       = "=0.1.2"
 
 # wgpu renderer (Metal backend on iOS/Android)
 gpui_wgpu = { package = "gpui-fast-wgpu", version = "=0.1.14", features = ["font-kit"] }

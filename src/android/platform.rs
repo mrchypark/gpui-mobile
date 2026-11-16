@@ -67,11 +67,8 @@ fn java_main_task<T: Send + 'static>(
     executor: BackgroundExecutor,
     work: impl FnOnce(&mut jni::Env) -> std::result::Result<T, String> + Send + 'static,
 ) -> Task<Result<T>> {
-    let Some(app) = super::jni::android_app() else {
-        return Task::ready(Err(anyhow::anyhow!("Android Activity is unavailable")));
-    };
     let (tx, rx) = oneshot::channel();
-    app.run_on_java_main_thread(Box::new(move || {
+    let callback = Box::new(move || {
         let result = super::jni::with_env(|env| {
             let result = work(env);
             if result.is_err() {
@@ -84,7 +81,14 @@ fn java_main_task<T: Send + 'static>(
             log::warn!("Android UI operation failed: {error}");
         }
         let _ = tx.send(result);
-    }));
+    });
+    if let Some(app) = super::jni::android_app() {
+        app.run_on_java_main_thread(callback);
+    } else if !super::jni::run_on_host_java_main_thread(callback) {
+        return Task::ready(Err(anyhow::anyhow!(
+            "Android Java main thread is unavailable"
+        )));
+    }
     executor.spawn(async move {
         rx.await
             .map_err(|_| anyhow::anyhow!("Android UI operation was cancelled"))?
@@ -862,6 +866,17 @@ impl AndroidPlatform {
         state.displays = DisplayList::single(display);
     }
 
+    /// Update the primary display from the scale supplied by a host `SurfaceView`.
+    pub fn update_primary_display_from_scale(
+        &self,
+        native_window: &ndk::native_window::NativeWindow,
+        scale_factor: f32,
+    ) {
+        let display = AndroidDisplay::from_scale_factor(native_window, scale_factor);
+        let mut state = self.state.lock();
+        state.displays = DisplayList::single(display);
+    }
+
     // ── clipboard ─────────────────────────────────────────────────────────────
 
     /// Write `text` to the clipboard.
@@ -1269,13 +1284,10 @@ impl Platform for AndroidPlatform {
     }
 
     fn prevent_idle_sleep(&self, _reason: &str) -> Task<Result<gpui::ActivityGuard>> {
-        let Some(app) = super::jni::android_app() else {
-            return Task::ready(Err(anyhow::anyhow!("Android Activity is unavailable")));
-        };
         java_main_task(<Self as Platform>::background_executor(self), move |env| {
             idle_sleep(env, true)?;
             Ok(gpui::ActivityGuard::new(move || {
-                app.run_on_java_main_thread(Box::new(|| {
+                let restore = Box::new(|| {
                     if let Err(error) = super::jni::with_env(|env| {
                         let result = idle_sleep(env, false);
                         if result.is_err() {
@@ -1285,7 +1297,12 @@ impl Platform for AndroidPlatform {
                     }) {
                         log::warn!("Could not restore idle sleep: {error}");
                     }
-                }));
+                });
+                if let Some(app) = super::jni::android_app() {
+                    app.run_on_java_main_thread(restore);
+                } else if !super::jni::run_on_host_java_main_thread(restore) {
+                    log::warn!("Could not schedule idle sleep restoration");
+                }
             }))
         })
     }
