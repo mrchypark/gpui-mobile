@@ -67,6 +67,8 @@ pub unsafe fn dismiss(
     picker: *mut AnyObject,
     token: request::Token,
     result: request::PickerResult,
+    animated: bool,
+    after_dismissal: Option<Box<dyn FnOnce()>>,
 ) {
     if !token.begin_dismissal() {
         token.finish(result);
@@ -76,6 +78,7 @@ pub unsafe fn dismiss(
     struct Delivery {
         token: request::Token,
         result: Option<request::PickerResult>,
+        after_dismissal: Option<Box<dyn FnOnce()>>,
     }
     impl Drop for Delivery {
         fn drop(&mut self) {
@@ -86,18 +89,28 @@ pub unsafe fn dismiss(
                 self.token
                     .finish(Err("Picker dismissal ended without completion".into()));
             }
+            if let Some(after_dismissal) = self.after_dismissal.take() {
+                after_dismissal();
+            }
         }
     }
     let delivery = std::sync::Mutex::new(Delivery {
         token,
         result: Some(result),
+        after_dismissal,
     });
     let done = block2::RcBlock::new(move || {
         if let Ok(mut delivery) = delivery.lock() {
             if let Some(result) = delivery.result.take() {
                 delivery.token.finish(result);
             }
+            if let Some(after_dismissal) = delivery.after_dismissal.take() {
+                after_dismissal();
+            }
         }
     });
-    let _: () = msg_send![picker, dismissViewControllerAnimated: true, completion: &*done];
+    let _: () = msg_send![picker,
+        dismissViewControllerAnimated: animated,
+        completion: &*done
+    ];
 }

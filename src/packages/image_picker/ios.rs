@@ -136,7 +136,7 @@ extern "C" fn phpicker_did_finish(
             }
             Ok(imported.take())
         })();
-        delegate::dismiss(picker, token, result);
+        delegate::dismiss(picker, token, result, true, None);
     }
 }
 
@@ -215,7 +215,7 @@ unsafe extern "C" fn uipicker_did_finish(
         }
         Ok(imported.take())
     })();
-    delegate::dismiss(controller, token, result);
+    delegate::dismiss(controller, token, result, true, None);
 }
 
 unsafe extern "C" fn uipicker_did_cancel(this: *mut AnyObject, _: Sel, controller: *mut AnyObject) {
@@ -223,7 +223,7 @@ unsafe extern "C" fn uipicker_did_cancel(this: *mut AnyObject, _: Sel, controlle
         return;
     };
     if token.claim() {
-        delegate::dismiss(controller, token, Ok(vec![]));
+        delegate::dismiss(controller, token, Ok(vec![]), true, None);
     }
 }
 
