@@ -1,5 +1,5 @@
 use super::{OpenFileOptions, SaveFileOptions, SelectedFile, TypeGroup};
-use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
 use std::sync::Once;
 
@@ -70,30 +70,102 @@ unsafe extern "C" fn did_pick_documents(
     if !token.claim() {
         return;
     }
-    let result = (|| -> Result<Vec<String>, String> {
+    let selected = (|| -> Result<Vec<(std::path::PathBuf, ScopedUrl)>, String> {
         let count: usize = msg_send![urls, count];
-        let mut imported = request::Imports::new();
         if count == 0 {
             return Err("Document picker returned no file URL".into());
         }
+        let mut selected = Vec::with_capacity(count);
         for index in 0..count {
             let url: *mut AnyObject = msg_send![urls, objectAtIndex: index];
-            let value: *mut AnyObject = msg_send![url, path];
-            if value.is_null() {
-                return Err("Document picker returned an unreadable file URL".into());
-            }
-            let bytes: *const std::ffi::c_char = msg_send![value, UTF8String];
-            if bytes.is_null() {
-                return Err("Document picker returned an unreadable file path".into());
-            }
-            let path = std::ffi::CStr::from_ptr(bytes).to_string_lossy();
-            imported.push(completion::import_file(std::path::Path::new(
-                path.as_ref(),
-            ))?);
+            selected.push(ScopedUrl::new(url)?);
         }
-        Ok(imported.take())
+        Ok(selected)
     })();
-    delegate::dismiss(controller, token, result);
+    let selected = match selected {
+        Ok(selected) => selected,
+        Err(error) => {
+            delegate::dismiss(controller, token, Err(error));
+            return;
+        }
+    };
+
+    if !token.begin_dismissal() {
+        token.finish(Err(
+            "Document picker closed before the import could start".into()
+        ));
+        return;
+    }
+    let _: () = msg_send![controller,
+        dismissViewControllerAnimated: false,
+        completion: std::ptr::null::<AnyObject>()
+    ];
+
+    let worker_token = token.clone();
+    let worker = std::thread::Builder::new()
+        .name("gpui-document-import".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                objc2::rc::autoreleasepool(|_| {
+                    let mut imported = request::Imports::new();
+                    for (path, scope) in selected {
+                        imported.push(completion::import_file(&path)?);
+                        drop(scope);
+                    }
+                    Ok(imported.take())
+                })
+            }))
+            .unwrap_or_else(|_| Err("Document import worker panicked".into()));
+            worker_token.finish(result);
+        });
+    if let Err(error) = worker {
+        token.finish(Err(format!("Start document import worker: {error}")));
+    }
+}
+
+struct ScopedUrl {
+    url: objc2::rc::Retained<AnyObject>,
+    opened: bool,
+}
+
+// NSURL is immutable and thread-safe. The worker owns this exact URL only to
+// balance startAccessingSecurityScopedResource after the copy finishes.
+unsafe impl Send for ScopedUrl {}
+
+impl ScopedUrl {
+    unsafe fn new(url: *mut AnyObject) -> Result<(std::path::PathBuf, Self), String> {
+        let url = objc2::rc::Retained::retain(url)
+            .ok_or_else(|| "Document picker returned an unreadable file URL".to_string())?;
+        let is_file: Bool = msg_send![&*url, isFileURL];
+        if !is_file.as_bool() {
+            return Err("Document picker returned a non-file URL".into());
+        }
+        let value: *mut AnyObject = msg_send![&*url, path];
+        if value.is_null() {
+            return Err("Document picker returned an unreadable file path".into());
+        }
+        let bytes: *const std::ffi::c_char = msg_send![value, UTF8String];
+        if bytes.is_null() {
+            return Err("Document picker returned an unreadable file path".into());
+        }
+        let path = std::ffi::CStr::from_ptr(bytes).to_string_lossy();
+        let opened: Bool = msg_send![&*url, startAccessingSecurityScopedResource];
+        Ok((
+            std::path::PathBuf::from(path.as_ref()),
+            Self {
+                url,
+                opened: opened.as_bool(),
+            },
+        ))
+    }
+}
+
+impl Drop for ScopedUrl {
+    fn drop(&mut self) {
+        if self.opened {
+            let _: () = unsafe { msg_send![&*self.url, stopAccessingSecurityScopedResource] };
+        }
+    }
 }
 
 unsafe extern "C" fn did_cancel(this: *mut AnyObject, _: Sel, controller: *mut AnyObject) {
@@ -198,6 +270,36 @@ unsafe fn present_picker(picker: *mut AnyObject) -> Result<(), String> {
     Ok(())
 }
 
+struct PendingPresentation {
+    picker: *mut AnyObject,
+    token: request::Token,
+}
+
+unsafe extern "C" fn present_picker_callback(context: *mut std::ffi::c_void) {
+    let pending = Box::from_raw(context.cast::<PendingPresentation>());
+    if !pending.token.is_open() {
+        let _: () = msg_send![pending.picker, release];
+        return;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        objc2::rc::autoreleasepool(|_| present_picker(pending.picker))
+    }))
+    .unwrap_or_else(|_| Err("Document picker presentation panicked".into()));
+    let _: () = msg_send![pending.picker, release];
+    if let Err(error) = result {
+        pending.token.finish(Err(error));
+    }
+}
+
+unsafe fn present_picker_async(picker: *mut AnyObject, token: request::Token) {
+    let pending = Box::into_raw(Box::new(PendingPresentation { picker, token }));
+    crate::ios::dispatch_async_f(
+        crate::ios::dispatch_get_main_queue(),
+        pending.cast(),
+        Some(present_picker_callback),
+    );
+}
+
 fn url_to_selected_file(url_string: &str) -> SelectedFile {
     // Extract filename from URL path
     let name = url_string
@@ -236,7 +338,7 @@ pub fn open_file(options: &OpenFileOptions) -> Result<Option<SelectedFile>, Stri
         //   [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types];
         let picker: *mut AnyObject = msg_send![class!(UIDocumentPickerViewController), alloc];
         let picker: *mut AnyObject =
-            msg_send![picker, initForOpeningContentTypes: content_types, asCopy: true];
+            msg_send![picker, initForOpeningContentTypes: content_types, asCopy: false];
         if picker.is_null() {
             return Err("Failed to create UIDocumentPickerViewController".into());
         }
@@ -250,9 +352,7 @@ pub fn open_file(options: &OpenFileOptions) -> Result<Option<SelectedFile>, Stri
         let delegate: *mut AnyObject = msg_send![delegate, init];
         delegate::bind(picker, delegate, rx.token.clone())?;
 
-        let presented = present_picker(picker);
-        let _: () = msg_send![picker, release];
-        presented?;
+        present_picker_async(picker, rx.token.clone());
     }
 
     // Wait for result (blocks until user picks or cancels)
@@ -288,7 +388,7 @@ pub fn open_files(options: &OpenFileOptions) -> Result<Vec<SelectedFile>, String
 
         let picker: *mut AnyObject = msg_send![class!(UIDocumentPickerViewController), alloc];
         let picker: *mut AnyObject =
-            msg_send![picker, initForOpeningContentTypes: content_types, asCopy: true];
+            msg_send![picker, initForOpeningContentTypes: content_types, asCopy: false];
         if picker.is_null() {
             return Err("Failed to create UIDocumentPickerViewController".into());
         }
@@ -300,9 +400,7 @@ pub fn open_files(options: &OpenFileOptions) -> Result<Vec<SelectedFile>, String
         let delegate: *mut AnyObject = msg_send![delegate, init];
         delegate::bind(picker, delegate, rx.token.clone())?;
 
-        let presented = present_picker(picker);
-        let _: () = msg_send![picker, release];
-        presented?;
+        present_picker_async(picker, rx.token.clone());
     }
 
     match completion::wait(&rx.receiver)? {
