@@ -404,7 +404,7 @@ impl PromptSession {
     }
 
     pub(super) fn wait_cancellable(self, cancelled: impl Fn() -> bool) -> PromptWaitResult {
-        let result = completion::wait_cancellable(&self.request.receiver, &cancelled);
+        let result = completion::wait_cancellable(&self.request.receiver, || !cancelled());
         match result {
             Ok(result) => PromptWaitResult::Complete(
                 result.and_then(|paths| picker_paths(self.multiple, paths)),
