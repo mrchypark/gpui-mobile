@@ -1494,7 +1494,12 @@ pub fn init_platform(app: &AndroidApp) -> PlatformSession {
 /// makes (getWindow, setStatusBarColor, etc.) are View operations that must
 /// run on Java's UI thread. By caching the requested style we post one update
 /// when it changes and skip the JNI calls on unchanged frames.
-type ChromeStyleKey = (Option<u32>, Option<u32>, crate::StatusBarContentStyle);
+type ChromeStyleKey = (
+    Option<u32>,
+    Option<u32>,
+    crate::StatusBarContentStyle,
+    Option<crate::StatusBarContentStyle>,
+);
 
 #[derive(Default)]
 struct ChromeStyleState {
@@ -1519,7 +1524,12 @@ fn reset_chrome_style() {
 }
 
 fn merge_chrome_style(previous: ChromeStyleKey, next: ChromeStyleKey) -> ChromeStyleKey {
-    (next.0.or(previous.0), next.1.or(previous.1), next.2)
+    (
+        next.0.or(previous.0),
+        next.1.or(previous.1),
+        next.2,
+        next.3.or(previous.3),
+    )
 }
 
 fn claim_chrome_style(
@@ -1574,15 +1584,24 @@ fn take_deferred_chrome_style(state: &mut ChromeStyleState) -> Option<ChromeStyl
 
 /// Apply system chrome styling on Android.
 ///
-/// Sets the status bar color, navigation bar color, and light/dark
-/// status bar icons via JNI calls to `Window` and `WindowInsetsController`.
+/// Sets the status bar color, navigation bar color, and light/dark system bar
+/// icons via JNI calls to `Window` and `WindowInsetsController`.
 ///
 pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
+    set_system_chrome_with_navigation_bar_style(style, None);
+}
+
+/// Apply chrome styling with an optional navigation bar content style.
+pub fn set_system_chrome_with_navigation_bar_style(
+    style: &crate::SystemChromeStyle,
+    navigation_bar_style: Option<crate::StatusBarContentStyle>,
+) {
     let style = *style;
     let requested = (
         style.status_bar_color,
         style.navigation_bar_color,
         style.status_bar_style,
+        navigation_bar_style,
     );
 
     // Queue one update for each requested style and skip unchanged frames.
@@ -1616,14 +1635,15 @@ fn post_system_chrome(
         if CHROME_STYLE.lock().unwrap().pending != Some(key) {
             return;
         }
-        match apply_system_chrome(style) {
+        match apply_system_chrome(style, key.3) {
             Ok(()) => {
                 complete_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key);
                 log::info!(
-                    "set_system_chrome: status_bar_color={:?}, nav_bar_color={:?}, style={:?}",
+                    "set_system_chrome: status_bar_color={:?}, nav_bar_color={:?}, status_style={:?}, nav_style={:?}",
                     style.status_bar_color,
                     style.navigation_bar_color,
-                    style.status_bar_style
+                    style.status_bar_style,
+                    key.3
                 );
             }
             Err(error) => {
@@ -1675,7 +1695,10 @@ fn rearm_deferred_system_chrome() {
     post_system_chrome(app, style, key, 0);
 }
 
-fn apply_system_chrome(style: crate::SystemChromeStyle) -> Result<(), String> {
+fn apply_system_chrome(
+    style: crate::SystemChromeStyle,
+    navigation_bar_style: Option<crate::StatusBarContentStyle>,
+) -> Result<(), String> {
     with_env(|env| {
         let activity_obj = activity(env)?;
 
@@ -1729,14 +1752,15 @@ fn apply_system_chrome(style: crate::SystemChromeStyle) -> Result<(), String> {
             })?;
         }
 
-        set_status_bar_appearance(env, &window, style.status_bar_style)
+        set_system_bar_appearance(env, &window, style.status_bar_style, navigation_bar_style)
     })
 }
 
-fn set_status_bar_appearance(
+fn set_system_bar_appearance(
     env: &mut jni::Env<'_>,
     window: &JObject<'_>,
     status_bar_style: crate::StatusBarContentStyle,
+    navigation_bar_style: Option<crate::StatusBarContentStyle>,
 ) -> Result<(), String> {
     // Use WindowInsetsController on API 30+, then the legacy view flag when
     // the controller is unavailable or the window is not ready for it.
@@ -1754,11 +1778,19 @@ fn set_status_bar_appearance(
     };
 
     if let Some(controller) = controller {
-        let mask: i32 = 0x00000008;
-        let appearance = match status_bar_style {
-            crate::StatusBarContentStyle::Dark => mask,
+        let status_mask: i32 = 0x00000008;
+        let navigation_mask: i32 = 0x00000010;
+        let mut mask = status_mask;
+        let mut appearance = match status_bar_style {
+            crate::StatusBarContentStyle::Dark => status_mask,
             crate::StatusBarContentStyle::Light => 0,
         };
+        if let Some(style) = navigation_bar_style {
+            mask |= navigation_mask;
+            if style == crate::StatusBarContentStyle::Dark {
+                appearance |= navigation_mask;
+            }
+        }
         let result = env.call_method(
             &controller,
             jni::jni_str!("setSystemBarsAppearance"),
@@ -1802,10 +1834,16 @@ fn set_status_bar_appearance(
             env.exception_clear();
             format!("getSystemUiVisibility failed: {error}")
         })?;
-    let flags = match status_bar_style {
+    let mut flags = match status_bar_style {
         crate::StatusBarContentStyle::Dark => current | 0x00002000,
         crate::StatusBarContentStyle::Light => current & !0x00002000,
     };
+    if let Some(style) = navigation_bar_style {
+        flags = match style {
+            crate::StatusBarContentStyle::Dark => flags | 0x00000010,
+            crate::StatusBarContentStyle::Light => flags & !0x00000010,
+        };
+    }
     env.call_method(
         &decor,
         jni::jni_str!("setSystemUiVisibility"),
@@ -2553,7 +2591,12 @@ mod tests {
     #[test]
     fn exhausted_chrome_retry_waits_for_resume_without_spinning() {
         let mut state = ChromeStyleState::default();
-        let key = (None, None, crate::StatusBarContentStyle::Dark);
+        let key = (
+            None,
+            None,
+            crate::StatusBarContentStyle::Dark,
+            Some(crate::StatusBarContentStyle::Dark),
+        );
 
         assert_eq!(claim_chrome_style(&mut state, key), Some(key));
         assert_eq!(claim_chrome_style(&mut state, key), None);
@@ -2579,7 +2622,12 @@ mod tests {
     #[test]
     fn retry_scheduling_failure_uses_the_same_resume_rearm() {
         let mut state = ChromeStyleState::default();
-        let key = (Some(0x112233), None, crate::StatusBarContentStyle::Light);
+        let key = (
+            Some(0x112233),
+            None,
+            crate::StatusBarContentStyle::Light,
+            Some(crate::StatusBarContentStyle::Light),
+        );
 
         assert_eq!(claim_chrome_style(&mut state, key), Some(key));
         assert!(defer_chrome_style(&mut state, key));
@@ -2595,11 +2643,13 @@ mod tests {
             Some(0x010203),
             Some(0x040506),
             crate::StatusBarContentStyle::Light,
+            None,
         );
         let deferred = (
             Some(0x112233),
             Some(0x445566),
             crate::StatusBarContentStyle::Dark,
+            Some(crate::StatusBarContentStyle::Dark),
         );
 
         assert_eq!(claim_chrome_style(&mut state, applied), Some(applied));
@@ -2607,14 +2657,19 @@ mod tests {
         assert_eq!(claim_chrome_style(&mut state, deferred), Some(deferred));
         assert!(defer_chrome_style(&mut state, deferred));
 
-        let unchanged_appearance = (None, None, crate::StatusBarContentStyle::Dark);
+        let unchanged_appearance = (None, None, crate::StatusBarContentStyle::Dark, None);
         assert_eq!(claim_chrome_style(&mut state, unchanged_appearance), None);
         assert_eq!(state.pending, None);
         assert_eq!(state.retry_on_resume, Some(deferred));
         assert_eq!(state.applied, Some(applied));
 
-        let changed = (deferred.0, deferred.1, crate::StatusBarContentStyle::Light);
-        let changed_appearance = (None, None, crate::StatusBarContentStyle::Light);
+        let changed = (
+            deferred.0,
+            deferred.1,
+            crate::StatusBarContentStyle::Light,
+            deferred.3,
+        );
+        let changed_appearance = (None, None, crate::StatusBarContentStyle::Light, None);
         assert_eq!(
             claim_chrome_style(&mut state, changed_appearance),
             Some(changed)
@@ -2627,8 +2682,13 @@ mod tests {
     #[test]
     fn stale_chrome_completion_preserves_a_newer_request() {
         let mut state = ChromeStyleState::default();
-        let old = (None, None, crate::StatusBarContentStyle::Dark);
-        let new = (None, None, crate::StatusBarContentStyle::Light);
+        let old = (None, None, crate::StatusBarContentStyle::Dark, None);
+        let new = (
+            None,
+            None,
+            crate::StatusBarContentStyle::Light,
+            Some(crate::StatusBarContentStyle::Light),
+        );
 
         assert_eq!(claim_chrome_style(&mut state, old), Some(old));
         assert_eq!(claim_chrome_style(&mut state, new), Some(new));
@@ -2646,12 +2706,14 @@ mod tests {
             status_bar,
             navigation_bar,
             crate::StatusBarContentStyle::Light,
+            Some(crate::StatusBarContentStyle::Dark),
         );
-        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark);
+        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark, None);
         let merged = (
             status_bar,
             navigation_bar,
             crate::StatusBarContentStyle::Dark,
+            Some(crate::StatusBarContentStyle::Dark),
         );
 
         assert_eq!(claim_chrome_style(&mut state, queued), Some(queued));
@@ -2665,11 +2727,17 @@ mod tests {
             next_status_bar,
             navigation_bar,
             crate::StatusBarContentStyle::Light,
+            Some(crate::StatusBarContentStyle::Dark),
         );
         assert_eq!(
             claim_chrome_style(
                 &mut state,
-                (next_status_bar, None, crate::StatusBarContentStyle::Light),
+                (
+                    next_status_bar,
+                    None,
+                    crate::StatusBarContentStyle::Light,
+                    None,
+                ),
             ),
             Some(overridden)
         );
@@ -2684,12 +2752,14 @@ mod tests {
             status_bar,
             navigation_bar,
             crate::StatusBarContentStyle::Light,
+            Some(crate::StatusBarContentStyle::Dark),
         );
-        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark);
+        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark, None);
         let merged = (
             status_bar,
             navigation_bar,
             crate::StatusBarContentStyle::Dark,
+            Some(crate::StatusBarContentStyle::Dark),
         );
 
         assert_eq!(claim_chrome_style(&mut state, queued), Some(queued));
@@ -2715,8 +2785,9 @@ mod tests {
             Some(0x112233),
             Some(0x445566),
             crate::StatusBarContentStyle::Light,
+            Some(crate::StatusBarContentStyle::Light),
         );
-        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark);
+        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark, None);
 
         assert_eq!(claim_chrome_style(&mut state, colored), Some(colored));
         complete_chrome_style(&mut state, colored);
@@ -2724,6 +2795,31 @@ mod tests {
             claim_chrome_style(&mut state, appearance_only),
             Some(appearance_only)
         );
+    }
+
+    #[test]
+    fn navigation_bar_style_is_coalesced_with_the_chrome_request() {
+        let mut state = ChromeStyleState::default();
+        let status_only = (None, None, crate::StatusBarContentStyle::Light, None);
+        let navigation_dark = (
+            None,
+            None,
+            crate::StatusBarContentStyle::Light,
+            Some(crate::StatusBarContentStyle::Dark),
+        );
+
+        assert_eq!(
+            claim_chrome_style(&mut state, status_only),
+            Some(status_only)
+        );
+        assert_eq!(
+            claim_chrome_style(&mut state, navigation_dark),
+            Some(navigation_dark)
+        );
+        assert_eq!(state.pending, Some(navigation_dark));
+        complete_chrome_style(&mut state, navigation_dark);
+        assert_eq!(state.applied, Some(navigation_dark));
+        assert_eq!(claim_chrome_style(&mut state, navigation_dark), None);
     }
 
     #[test]

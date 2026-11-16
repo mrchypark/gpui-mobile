@@ -129,20 +129,42 @@ impl Default for SystemChromeStyle {
 /// On iOS this updates `preferredStatusBarStyle` on the root view controller.
 /// On Android this calls `Window.setStatusBarColor()`,
 /// `Window.setNavigationBarColor()`, and configures light/dark status bar icons.
+/// Use [`set_system_chrome_with_navigation_bar_style`] to control navigation icons.
 ///
 /// On unsupported platforms this is a no-op.
 pub fn set_system_chrome(style: &SystemChromeStyle) {
+    apply_system_chrome(style, None);
+}
+
+/// Apply system chrome styling and explicitly configure navigation bar content.
+///
+/// `status_bar_style` continues to control only the status bar. Android 15
+/// edge-to-edge windows ignore navigation bar colors, so this controls the
+/// navigation buttons' contrast independently. iOS applies the rest of `style`
+/// and leaves its navigation appearance unchanged.
+pub fn set_system_chrome_with_navigation_bar_style(
+    style: &SystemChromeStyle,
+    navigation_bar_style: StatusBarContentStyle,
+) {
+    apply_system_chrome(style, Some(navigation_bar_style));
+}
+
+fn apply_system_chrome(
+    style: &SystemChromeStyle,
+    navigation_bar_style: Option<StatusBarContentStyle>,
+) {
     #[cfg(target_os = "ios")]
     {
+        let _ = navigation_bar_style;
         ios::set_status_bar_style(style.status_bar_style);
     }
     #[cfg(target_os = "android")]
     {
-        android::jni::set_system_chrome(style);
+        android::jni::set_system_chrome_with_navigation_bar_style(style, navigation_bar_style);
     }
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
-        let _ = style;
+        let _ = (style, navigation_bar_style);
     }
 }
 
