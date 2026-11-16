@@ -1749,10 +1749,18 @@ mod prompt_tests {
 /// calling thread, so schedule the operation on Java's main thread explicitly.
 pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
     explicit_input_state(|state| state.keyboard_type = Some(keyboard_type));
-    show_keyboard_current();
+    show_keyboard_explicit();
 }
 
 pub(crate) fn show_keyboard_current() {
+    show_keyboard_for_current(false);
+}
+
+pub(crate) fn show_keyboard_explicit() {
+    show_keyboard_for_current(true);
+}
+
+fn show_keyboard_for_current(explicit: bool) {
     let (explicit_type, explicit_secure) =
         explicit_input_state(|state| (state.keyboard_type, state.secure));
     let (configured_type, flags, options, secure) = IME_CONFIGURATION.with(|configuration| {
@@ -1773,19 +1781,27 @@ pub(crate) fn show_keyboard_current() {
         options,
         IME_EDITOR.load(Ordering::Acquire),
     );
-    if IME_LOGICAL_OWNER.load(Ordering::Acquire)
-        && IME_ACTIVE.load(Ordering::Acquire)
-        && IME_SHOWN_KEY.get() == Some(key)
-    {
+    let same_key = IME_SHOWN_KEY.get() == Some(key);
+    let Some(reuse_session) = keyboard_show_decision(
+        explicit,
+        IME_LOGICAL_OWNER.load(Ordering::Acquire),
+        IME_ACTIVE.load(Ordering::Acquire),
+        same_key,
+    ) else {
         return;
-    }
+    };
+    let current_session = IME_GENERATION.load(Ordering::Acquire);
+    let session = if reuse_session && current_session > 0 {
+        current_session
+    } else {
+        IME_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+    };
     IME_SHOWN_KEY.set(Some(key));
     IME_ACTIVE.store(true, Ordering::Release);
     IME_LEGACY_ENABLED.store(
         crate::mobile_dispatch::has_text_handler(),
         Ordering::Release,
     );
-    let session = IME_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     IME_LEGACY_GENERATION.set(crate::mobile_dispatch::text_handler_generation());
     if let Some(app) = android_app() {
         app.run_on_java_main_thread(Box::new(move || {
@@ -1803,9 +1819,14 @@ pub(crate) fn show_keyboard_current() {
                 if input_type & 0xf == 1 {
                     input_type |= flags;
                 }
+                let method = if explicit {
+                    jni::jni_str!("showExplicit")
+                } else {
+                    jni::jni_str!("show")
+                };
                 env.call_static_method(
                     &class,
-                    jni::jni_str!("show"),
+                    method,
                     jni::jni_sig!("(Landroid/app/Activity;IIJ)V"),
                     &[
                         JValue::Object(&activity),
@@ -1824,6 +1845,19 @@ pub(crate) fn show_keyboard_current() {
                 log::warn!("show_keyboard_android: {error}");
             }
         }));
+    }
+}
+
+fn keyboard_show_decision(
+    explicit: bool,
+    logical_owner: bool,
+    active: bool,
+    same_key: bool,
+) -> Option<bool> {
+    if !explicit && logical_owner && active && same_key {
+        None
+    } else {
+        Some(explicit && active && same_key)
     }
 }
 
@@ -2387,6 +2421,23 @@ mod tests {
             )
         });
         assert!(!secure);
+    }
+
+    #[test]
+    fn explicit_show_bypasses_a_stale_cached_key_but_focus_does_not() {
+        assert_eq!(keyboard_show_decision(true, true, true, true), Some(true));
+        assert_eq!(keyboard_show_decision(true, false, true, true), Some(true));
+        assert_eq!(keyboard_show_decision(true, true, false, true), Some(false));
+        assert_eq!(keyboard_show_decision(true, true, true, false), Some(false));
+        assert_eq!(keyboard_show_decision(false, true, true, true), None);
+        assert_eq!(
+            keyboard_show_decision(false, true, false, true),
+            Some(false)
+        );
+        assert_eq!(
+            keyboard_show_decision(false, true, true, false),
+            Some(false)
+        );
     }
 
     #[test]

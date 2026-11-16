@@ -55,8 +55,12 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use super::{AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint};
+use super::{
+    AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint,
+    dispatcher::AndroidDispatcher,
+};
 use crate::mobile_events::{self, AppLifecycle, MobileEvent, MobileEventState, SurfaceLifecycle};
 use crate::momentum::{MomentumScroller, VelocityTracker};
 
@@ -126,6 +130,116 @@ struct MomentumState {
     /// The touch phase for the pending scroll event (Started for the first
     /// coalesced batch, Moved for subsequent ones).
     pending_scroll_phase: gpui::TouchPhase,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LegacyTouchState {
+    Idle,
+    Pending {
+        start_x: f32,
+        start_y: f32,
+        last_x: f32,
+        last_y: f32,
+        started_at: std::time::Instant,
+        long_press_offered: bool,
+        long_press_generation: u64,
+    },
+    LongPressing {
+        start_x: f32,
+        start_y: f32,
+    },
+    Scrolling {
+        prev_x: f32,
+        prev_y: f32,
+    },
+    Dragging {
+        start: gpui::Point<gpui::Pixels>,
+    },
+}
+
+type SendInputCallback =
+    Arc<Mutex<Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult + Send>>>;
+
+fn legacy_long_press_event(
+    phase: gpui::TouchPhase,
+    start_x: f32,
+    start_y: f32,
+    x: f32,
+    y: f32,
+) -> gpui::LongPressEvent {
+    gpui::LongPressEvent {
+        phase,
+        start_position: gpui::point(gpui::px(start_x), gpui::px(start_y)),
+        position: gpui::point(gpui::px(x), gpui::px(y)),
+    }
+}
+
+fn schedule_legacy_long_press(
+    dispatcher: Arc<AndroidDispatcher>,
+    state: Arc<Mutex<LegacyTouchState>>,
+    input_cb: SendInputCallback,
+    generation: u64,
+    duration: std::time::Duration,
+) {
+    // The timer runs on the dispatcher worker and then returns to the Android
+    // main thread before it touches input state or dispatches PlatformInput.
+    let main_dispatcher = Arc::clone(&dispatcher);
+    dispatcher.dispatch_after(duration, move || {
+        main_dispatcher.dispatch_on_main_thread(move || {
+            let _ = deliver_pending_long_press(&state, &input_cb, generation);
+        });
+    });
+}
+
+fn deliver_pending_long_press(
+    state: &Arc<Mutex<LegacyTouchState>>,
+    input_cb: &SendInputCallback,
+    generation: u64,
+) -> bool {
+    let pending = match *state.lock() {
+        LegacyTouchState::Pending {
+            start_x,
+            start_y,
+            last_x,
+            last_y,
+            long_press_offered: false,
+            long_press_generation,
+            ..
+        } if long_press_generation == generation => (start_x, start_y, last_x, last_y),
+        _ => return false,
+    };
+    let (start_x, start_y, last_x, last_y) = pending;
+    {
+        let mut state = state.lock();
+        if let LegacyTouchState::Pending {
+            long_press_offered,
+            ..
+        } = &mut *state
+        {
+            *long_press_offered = true;
+        }
+    }
+    let started = input_cb.lock()(gpui::PlatformInput::LongPress(legacy_long_press_event(
+        gpui::TouchPhase::Started,
+        start_x,
+        start_y,
+        last_x,
+        last_y,
+    )))
+    .default_prevented;
+    if started {
+        let mut state = state.lock();
+        if matches!(
+            *state,
+            LegacyTouchState::Pending {
+                long_press_generation,
+                ..
+            } if long_press_generation == generation
+        ) {
+            *state = LegacyTouchState::LongPressing { start_x, start_y };
+        }
+    }
+    started
 }
 
 // Re-export for use with raw-window-handle and the frame-rate helper.
@@ -1469,6 +1583,10 @@ pub struct AndroidPlatformWindow {
     /// replaced when `on_input` is called.
     momentum_input_cb:
         Arc<Mutex<Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult + Send>>>,
+    /// Android's LegacyCompatible touch path must schedule long presses itself;
+    /// the raw-touch recognizer and its window timer are not active in that mode.
+    long_press_dispatcher: Option<Arc<AndroidDispatcher>>,
+    long_press_duration: std::time::Duration,
 }
 
 impl AndroidPlatformWindow {
@@ -1493,7 +1611,20 @@ impl AndroidPlatformWindow {
                 pending_scroll_phase: gpui::TouchPhase::Moved,
             })),
             momentum_input_cb: Arc::new(Mutex::new(noop_input_cb)),
+            long_press_dispatcher: None,
+            long_press_duration: gpui::GestureTuning::default().long_press_duration,
         }
+    }
+
+    pub(crate) fn with_dispatcher(mut self, dispatcher: Arc<AndroidDispatcher>) -> Self {
+        self.long_press_dispatcher = Some(dispatcher);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_long_press_duration(mut self, duration: std::time::Duration) -> Self {
+        self.long_press_duration = duration;
+        self
     }
 
     /// Access the underlying `AndroidWindow`.
@@ -1660,7 +1791,7 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn show_soft_keyboard(&self) {
-        super::jni::show_keyboard_current();
+        super::jni::show_keyboard_explicit();
     }
 
     fn hide_soft_keyboard(&self) {
@@ -2265,25 +2396,15 @@ impl PlatformWindow for AndroidPlatformWindow {
             let cb = Arc::clone(&input_cb);
             let window = Arc::downgrade(&self.window);
             let momentum = Arc::clone(&self.momentum);
+            let long_press_dispatcher = self.long_press_dispatcher.clone();
+            let long_press_duration = self.long_press_duration;
+            let long_press_generation = Arc::new(AtomicU64::new(0));
 
             /// Distance (logical px) the finger must travel before a touch
             /// is promoted from a potential tap to a scroll gesture.
             const SCROLL_SLOP: f32 = 8.0;
 
-            /// Tracks the current touch gesture.
-            #[derive(Clone, Copy, Debug)]
-            enum TouchState {
-                /// No active touch.
-                Idle,
-                /// Finger is down but hasn't moved beyond the slop threshold.
-                Pending { start_x: f32, start_y: f32 },
-                /// Finger has moved beyond the threshold — we are scrolling.
-                Scrolling { prev_x: f32, prev_y: f32 },
-                /// A component claimed the gesture before scroll began.
-                Dragging { start: gpui::Point<gpui::Pixels> },
-            }
-
-            let state = Mutex::new(TouchState::Idle);
+            let state = Arc::new(Mutex::new(LegacyTouchState::Idle));
 
             self.window.on_touch(move |touch| {
                 let Some(window) = window.upgrade() else {
@@ -2322,10 +2443,29 @@ impl PlatformWindow for AndroidPlatformWindow {
                             ms.pending_scroll_dy = 0.0;
                             ms.has_pending_scroll = false;
                         }
-                        *ts = TouchState::Pending {
+                        let generation = long_press_generation
+                            .fetch_add(1, AtomicOrdering::Relaxed)
+                            .wrapping_add(1);
+                        *ts = LegacyTouchState::Pending {
                             start_x: logical_x,
                             start_y: logical_y,
+                            last_x: logical_x,
+                            last_y: logical_y,
+                            started_at: std::time::Instant::now(),
+                            long_press_offered: false,
+                            long_press_generation: generation,
                         };
+                        drop(ts);
+                        if let Some(dispatcher) = long_press_dispatcher.clone() {
+                            schedule_legacy_long_press(
+                                dispatcher,
+                                Arc::clone(&state),
+                                Arc::clone(&cb),
+                                generation,
+                                long_press_duration,
+                            );
+                        }
+                        return;
                         // Do NOT emit MouseDown here — wait until we know
                         // whether this is a tap or a scroll.  Emitting
                         // MouseDown immediately causes accidental navigation
@@ -2339,18 +2479,47 @@ impl PlatformWindow for AndroidPlatformWindow {
 
                     // ── ACTION_MOVE ──────────────────────────────────────
                     2 => {
-                        if matches!(*ts, TouchState::Idle) {
+                        if matches!(*ts, LegacyTouchState::Idle) {
                             return;
                         }
-                        if let TouchState::Dragging { start } = *ts {
+                        if let LegacyTouchState::Dragging { start } = *ts {
                             drag(gpui::TouchPhase::Moved, start);
                             return;
                         }
-                        if let TouchState::Pending { start_x, start_y } = *ts {
+                        let due = match *ts {
+                            LegacyTouchState::Pending {
+                                started_at,
+                                long_press_offered: false,
+                                long_press_generation,
+                                ..
+                            } if started_at.elapsed() >= long_press_duration => {
+                                Some(long_press_generation)
+                            }
+                            _ => None,
+                        };
+                        if let Some(generation) = due {
+                            drop(ts);
+                            let _ = deliver_pending_long_press(&state, &cb, generation);
+                            ts = state.lock();
+                        }
+                        if let LegacyTouchState::LongPressing { start_x, start_y } = *ts {
+                            drop(ts);
+                            let _ = cb.lock()(gpui::PlatformInput::LongPress(
+                                legacy_long_press_event(
+                                    gpui::TouchPhase::Moved,
+                                    start_x,
+                                    start_y,
+                                    logical_x,
+                                    logical_y,
+                                ),
+                            ));
+                            return;
+                        }
+                        if let LegacyTouchState::Pending { start_x, start_y, .. } = *ts {
                             if (logical_x - start_x).hypot(logical_y - start_y) > SCROLL_SLOP {
                                 let start = gpui::point(gpui::px(start_x), gpui::px(start_y));
                                 if drag(gpui::TouchPhase::Started, start) {
-                                    *ts = TouchState::Dragging { start };
+                                    *ts = LegacyTouchState::Dragging { start };
                                     return;
                                 }
                             }
@@ -2370,7 +2539,14 @@ impl PlatformWindow for AndroidPlatformWindow {
                         ms.velocity_tracker.record(logical_x, logical_y);
 
                         match *ts {
-                            TouchState::Pending { start_x, start_y } => {
+                            LegacyTouchState::Pending {
+                                start_x,
+                                start_y,
+                                started_at,
+                                long_press_offered,
+                                long_press_generation,
+                                ..
+                            } => {
                                 let dx = logical_x - start_x;
                                 let dy = logical_y - start_y;
                                 let distance = (dx * dx + dy * dy).sqrt();
@@ -2378,7 +2554,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 if distance > SCROLL_SLOP {
                                     // Promote to scrolling — accumulate the
                                     // first scroll delta from the start pos.
-                                    *ts = TouchState::Scrolling {
+                                    *ts = LegacyTouchState::Scrolling {
                                         prev_x: logical_x,
                                         prev_y: logical_y,
                                     };
@@ -2391,13 +2567,22 @@ impl PlatformWindow for AndroidPlatformWindow {
                                         ms.pending_scroll_phase = gpui::TouchPhase::Started;
                                     }
                                     ms.has_pending_scroll = true;
+                                } else {
+                                    *ts = LegacyTouchState::Pending {
+                                        start_x,
+                                        start_y,
+                                        last_x: logical_x,
+                                        last_y: logical_y,
+                                        started_at,
+                                        long_press_offered,
+                                        long_press_generation,
+                                    };
                                 }
-                                // else: still within slop, stay Pending
                             }
-                            TouchState::Scrolling { prev_x, prev_y } => {
+                            LegacyTouchState::Scrolling { prev_x, prev_y } => {
                                 let dx = logical_x - prev_x;
                                 let dy = logical_y - prev_y;
-                                *ts = TouchState::Scrolling {
+                                *ts = LegacyTouchState::Scrolling {
                                     prev_x: logical_x,
                                     prev_y: logical_y,
                                 };
@@ -2410,7 +2595,9 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 }
                                 ms.has_pending_scroll = true;
                             }
-                            TouchState::Idle | TouchState::Dragging { .. } => return,
+                            LegacyTouchState::Idle
+                            | LegacyTouchState::LongPressing { .. }
+                            | LegacyTouchState::Dragging { .. } => return,
                         }
 
                         let needs_scroll_frame = ms.has_pending_scroll;
@@ -2432,19 +2619,48 @@ impl PlatformWindow for AndroidPlatformWindow {
                     }
 
                     3 => {
-                        if let TouchState::Dragging { start } = *ts {
-                            *ts = TouchState::Idle;
+                        let due = match *ts {
+                            LegacyTouchState::Pending {
+                                started_at,
+                                long_press_offered: false,
+                                long_press_generation,
+                                ..
+                            } if started_at.elapsed() >= long_press_duration => {
+                                Some(long_press_generation)
+                            }
+                            _ => None,
+                        };
+                        if let Some(generation) = due {
+                            drop(ts);
+                            let _ = deliver_pending_long_press(&state, &cb, generation);
+                            ts = state.lock();
+                        }
+                        if let LegacyTouchState::LongPressing { start_x, start_y } = *ts {
+                            *ts = LegacyTouchState::Idle;
+                            let _ = cb.lock()(gpui::PlatformInput::LongPress(
+                                legacy_long_press_event(
+                                    gpui::TouchPhase::Cancelled,
+                                    start_x,
+                                    start_y,
+                                    logical_x,
+                                    logical_y,
+                                ),
+                            ));
+                            return;
+                        }
+                        if let LegacyTouchState::Dragging { start } = *ts {
+                            *ts = LegacyTouchState::Idle;
                             drag(gpui::TouchPhase::Cancelled, start);
                             return;
                         }
-                        let was_scrolling = matches!(*ts, TouchState::Scrolling { .. });
+                        let was_scrolling = matches!(*ts, LegacyTouchState::Scrolling { .. });
                         let position = match *ts {
-                            TouchState::Scrolling { prev_x, prev_y } => {
+                            LegacyTouchState::Scrolling { prev_x, prev_y } => {
                                 gpui::point(gpui::px(prev_x), gpui::px(prev_y))
                             }
                             _ => Default::default(),
                         };
-                        *ts = TouchState::Idle;
+                        *ts = LegacyTouchState::Idle;
                         let mut ms = momentum.lock();
                         ms.scroller.cancel();
                         ms.velocity_tracker.reset();
@@ -2464,8 +2680,37 @@ impl PlatformWindow for AndroidPlatformWindow {
                     }
                     // ── ACTION_UP ────────────────────────────────────────
                     1 => {
+                        let due = match *ts {
+                            LegacyTouchState::Pending {
+                                started_at,
+                                long_press_offered: false,
+                                long_press_generation,
+                                ..
+                            } if started_at.elapsed() >= long_press_duration => {
+                                Some(long_press_generation)
+                            }
+                            _ => None,
+                        };
+                        if let Some(generation) = due {
+                            drop(ts);
+                            let _ = deliver_pending_long_press(&state, &cb, generation);
+                            ts = state.lock();
+                        }
                         match *ts {
-                            TouchState::Pending { start_x, start_y } => {
+                            LegacyTouchState::LongPressing { start_x, start_y } => {
+                                *ts = LegacyTouchState::Idle;
+                                let _ = cb.lock()(gpui::PlatformInput::LongPress(
+                                    legacy_long_press_event(
+                                        gpui::TouchPhase::Ended,
+                                        start_x,
+                                        start_y,
+                                        logical_x,
+                                        logical_y,
+                                    ),
+                                ));
+                                return;
+                            }
+                            LegacyTouchState::Pending { start_x, start_y, .. } => {
                                 // Finger lifted without exceeding slop →
                                 // this is a tap.  Emit MouseDown + MouseUp
                                 // together at the original down position so
@@ -2492,7 +2737,7 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     click_count: 1,
                                 }));
                             }
-                            TouchState::Scrolling { prev_x, prev_y } => {
+                            LegacyTouchState::Scrolling { prev_x, prev_y } => {
                                 // End the active touch-scroll gesture.
                                 // Include the final delta in the coalesced
                                 // accumulator, then flush it immediately
@@ -2543,12 +2788,12 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     click_count: 1,
                                 }));
                             }
-                            TouchState::Dragging { start } => {
+                            LegacyTouchState::Dragging { start } => {
                                 drag(gpui::TouchPhase::Ended, start);
                             }
-                            TouchState::Idle => {}
+                            LegacyTouchState::Idle => {}
                         }
-                        *ts = TouchState::Idle;
+                        *ts = LegacyTouchState::Idle;
                     }
 
                     _ => {} // Unknown action, ignore
@@ -3097,6 +3342,149 @@ mod tests {
         let pts = received.lock();
         assert_eq!(pts.len(), 1);
         assert_eq!(pts[0].id, 1);
+    }
+
+    #[test]
+    fn legacy_stationary_press_delivers_claimable_long_press_before_tap() {
+        use crate::mobile_events::TouchDeliveryPolicy;
+
+        crate::mobile_events::set_touch_delivery_policy(TouchDeliveryPolicy::LegacyCompatible);
+        let dispatcher = AndroidDispatcher::new_headless();
+        let w = AndroidWindow::headless(1080, 1920, 2.0);
+        w.mobile_events
+            .lock()
+            .surface(SurfaceLifecycle::Available, std::time::Duration::ZERO);
+        let long_press_duration = std::time::Duration::from_millis(50);
+        let platform_window = AndroidPlatformWindow::new(w.clone(), None)
+            .with_dispatcher(Arc::clone(&dispatcher))
+            .with_long_press_duration(long_press_duration);
+        let received = Arc::new(Mutex::new(Vec::<gpui::PlatformInput>::new()));
+        let output = Arc::clone(&received);
+        platform_window.on_input(Box::new(move |event| {
+            let claimed = matches!(
+                &event,
+                gpui::PlatformInput::LongPress(long_press)
+                    if long_press.phase == gpui::TouchPhase::Started
+            );
+            output.lock().push(event);
+            DispatchEventResult {
+                propagate: true,
+                default_prevented: claimed,
+            }
+        }));
+
+        let touch = |action| TouchPoint {
+            id: 1,
+            x: 200.0,
+            y: 200.0,
+            action,
+        };
+        w.handle_touch(touch(0));
+        std::thread::sleep(long_press_duration * 2);
+        // Deliberately do not drain the timer's main-queue hop. The release
+        // must notice the elapsed duration itself instead of falling back to
+        // a tap while the callback is still queued.
+        assert!(received.lock().is_empty());
+        w.handle_touch(touch(1));
+        dispatcher.flush_main_thread_tasks();
+        let phases = received
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                gpui::PlatformInput::LongPress(long_press) => Some(long_press.phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            [gpui::TouchPhase::Started, gpui::TouchPhase::Ended]
+        );
+        assert!(!received.lock().iter().any(|event| matches!(
+            event,
+            gpui::PlatformInput::MouseDown(_) | gpui::PlatformInput::MouseUp(_)
+        )));
+
+        crate::mobile_events::set_touch_delivery_policy(TouchDeliveryPolicy::LegacyCompatible);
+    }
+
+    #[test]
+    fn legacy_late_long_press_wins_over_move_after_deadline() {
+        use crate::mobile_events::TouchDeliveryPolicy;
+
+        crate::mobile_events::set_touch_delivery_policy(TouchDeliveryPolicy::LegacyCompatible);
+        let dispatcher = AndroidDispatcher::new_headless();
+        let w = AndroidWindow::headless(1080, 1920, 2.0);
+        w.mobile_events
+            .lock()
+            .surface(SurfaceLifecycle::Available, std::time::Duration::ZERO);
+        let long_press_duration = std::time::Duration::from_millis(50);
+        let platform_window = AndroidPlatformWindow::new(w.clone(), None)
+            .with_dispatcher(Arc::clone(&dispatcher))
+            .with_long_press_duration(long_press_duration);
+        let received = Arc::new(Mutex::new(Vec::<gpui::PlatformInput>::new()));
+        let output = Arc::clone(&received);
+        platform_window.on_input(Box::new(move |event| {
+            let claimed = matches!(
+                &event,
+                gpui::PlatformInput::LongPress(long_press)
+                    if long_press.phase == gpui::TouchPhase::Started
+            );
+            output.lock().push(event);
+            DispatchEventResult {
+                propagate: true,
+                default_prevented: claimed,
+            }
+        }));
+
+        w.handle_touch(TouchPoint {
+            id: 1,
+            x: 200.0,
+            y: 200.0,
+            action: 0,
+        });
+        std::thread::sleep(long_press_duration * 2);
+        assert!(received.lock().is_empty());
+
+        // Ten logical pixels exceed the eight-pixel slop. Without the deadline
+        // check, this move would become a scroll before the queued timer ran.
+        w.handle_touch(TouchPoint {
+            id: 1,
+            x: 220.0,
+            y: 200.0,
+            action: 2,
+        });
+        w.handle_touch(TouchPoint {
+            id: 1,
+            x: 220.0,
+            y: 200.0,
+            action: 1,
+        });
+        dispatcher.flush_main_thread_tasks();
+
+        let phases = received
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                gpui::PlatformInput::LongPress(long_press) => Some(long_press.phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            [
+                gpui::TouchPhase::Started,
+                gpui::TouchPhase::Moved,
+                gpui::TouchPhase::Ended,
+            ]
+        );
+        assert!(!received.lock().iter().any(|event| matches!(
+            event,
+            gpui::PlatformInput::Scroll(_)
+                | gpui::PlatformInput::MouseDown(_)
+                | gpui::PlatformInput::MouseUp(_)
+        )));
+
+        crate::mobile_events::set_touch_delivery_policy(TouchDeliveryPolicy::LegacyCompatible);
     }
 
     #[test]
