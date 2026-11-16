@@ -26,9 +26,8 @@ pub unsafe fn bind(
         return Err("Cannot allocate picker delegate".into());
     }
     *token_pointer(delegate) = Box::into_raw(Box::new(token)).cast();
+    // UIDocumentPickerDelegate owns result delivery; presentation dismissal can precede it.
     completion::set_picker_delegate(picker, delegate)?;
-    let presentation: *mut AnyObject = msg_send![picker, presentationController];
-    let _: () = msg_send![presentation, setDelegate: delegate];
     Ok(())
 }
 pub unsafe fn register(builder: &mut ClassBuilder) {
@@ -37,19 +36,6 @@ pub unsafe fn register(builder: &mut ClassBuilder) {
         sel!(dealloc),
         dealloc as unsafe extern "C" fn(*mut AnyObject, Sel),
     );
-    builder.add_method(
-        sel!(presentationControllerDidDismiss:),
-        did_dismiss as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
-    );
-}
-unsafe extern "C" fn did_dismiss(this: *mut AnyObject, _: Sel, _: *mut AnyObject) {
-    if let Some(token) = token(this) {
-        if token.claim() {
-            token.finish(Ok(vec![]));
-        } else if !token.is_dismissing() {
-            token.finish(Err("Picker dismissed while importing".into()));
-        }
-    }
 }
 unsafe extern "C" fn dealloc(this: *mut AnyObject, _: Sel) {
     let ptr = *token_pointer(this) as *mut request::Token;
