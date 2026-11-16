@@ -2066,6 +2066,17 @@ impl PlatformWindow for AndroidPlatformWindow {
                 if !compose_state.accepts(session, editor) {
                     return;
                 }
+                let dispatch_key = |key: &'static str| {
+                    ime_cb.lock()(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke {
+                            modifiers: Default::default(),
+                            key: key.into(),
+                            key_char: None,
+                        },
+                        is_held: false,
+                        prefer_character_input: false,
+                    }))
+                };
                 if let Some(lease) = crate::mobile_events::active_text_input_lease() {
                     let generation = handler.generation();
                     handler.call(
@@ -2250,18 +2261,8 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 }
                                 ImeInput::Enter | ImeInput::Backspace => {
                                     let enter = matches!(input, ImeInput::Enter);
-                                    let result = ime_cb.lock()(gpui::PlatformInput::KeyDown(
-                                        gpui::KeyDownEvent {
-                                            keystroke: gpui::Keystroke {
-                                                modifiers: Default::default(),
-                                                key: if enter { "enter" } else { "backspace" }
-                                                    .into(),
-                                                key_char: None,
-                                            },
-                                            is_held: false,
-                                            prefer_character_input: false,
-                                        },
-                                    ));
+                                    let result =
+                                        dispatch_key(if enter { "enter" } else { "backspace" });
                                     if enter
                                         && result.propagate
                                         && !result.default_prevented
@@ -2296,13 +2297,17 @@ impl PlatformWindow for AndroidPlatformWindow {
                                     {
                                         return;
                                     }
-                                    if let Some(units) = crate::mobile_events::ime_delete_units(
-                                        &text, count, codepoints,
-                                    ) {
-                                        candidate.replace_text_in_range(
-                                            Some(end.saturating_sub(units)..end),
-                                            "",
-                                        );
+                                    match ime_delete_before_action(&text, count, codepoints) {
+                                        Some(ImeDeleteBeforeAction::Replace(units)) => {
+                                            candidate.replace_text_in_range(
+                                                Some(end.saturating_sub(units)..end),
+                                                "",
+                                            );
+                                        }
+                                        Some(ImeDeleteBeforeAction::Backspace) => {
+                                            dispatch_key("backspace");
+                                        }
+                                        None => {}
                                     }
                                 }
                             }
@@ -2334,15 +2339,23 @@ impl PlatformWindow for AndroidPlatformWindow {
                             if actual.end != end {
                                 return;
                             }
-                            let Some(units) =
-                                crate::mobile_events::ime_delete_units(&text, count, codepoints)
+                            let Some(action) = ime_delete_before_action(&text, count, codepoints)
                             else {
                                 return;
                             };
                             if !super::jni::ime_delivery_current(session, editor) {
                                 return;
                             }
-                            handler.replace_text_in_range(Some(end.saturating_sub(units)..end), "");
+                            match action {
+                                ImeDeleteBeforeAction::Replace(units) => handler
+                                    .replace_text_in_range(
+                                        Some(end.saturating_sub(units)..end),
+                                        "",
+                                    ),
+                                ImeDeleteBeforeAction::Backspace => {
+                                    dispatch_key("backspace");
+                                }
+                            }
                         },
                     );
                     return;
@@ -3142,9 +3155,53 @@ impl WindowList {
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, PartialEq, Eq)]
+enum ImeDeleteBeforeAction {
+    Replace(usize),
+    Backspace,
+}
+
+/// Android reports Gboard's empty-field backspace as a one-unit range deletion.
+fn ime_delete_before_action(
+    text: &str,
+    count: usize,
+    codepoints: bool,
+) -> Option<ImeDeleteBeforeAction> {
+    if text.is_empty() && count == 1 {
+        Some(ImeDeleteBeforeAction::Backspace)
+    } else {
+        crate::mobile_events::ime_delete_units(text, count, codepoints)
+            .map(ImeDeleteBeforeAction::Replace)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_single_delete_becomes_backspace() {
+        for codepoints in [false, true] {
+            assert_eq!(
+                ime_delete_before_action("", 1, codepoints),
+                Some(ImeDeleteBeforeAction::Backspace)
+            );
+        }
+    }
+
+    #[test]
+    fn nonempty_delete_stays_a_range_without_duplicate_backspace() {
+        assert_eq!(
+            ime_delete_before_action("a", 1, false),
+            Some(ImeDeleteBeforeAction::Replace(1))
+        );
+        assert_eq!(
+            ime_delete_before_action("한🦀", 1, true),
+            Some(ImeDeleteBeforeAction::Replace(2))
+        );
+        assert_eq!(ime_delete_before_action("🦀", 1, false), None);
+        assert_eq!(ime_delete_before_action("", 2, false), None);
+    }
 
     #[test]
     fn headless_window_geometry() {
