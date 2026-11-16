@@ -2580,10 +2580,14 @@ pub trait InputHandler: 'static {
 /// input-session attributes (on web, DOM attributes of the hidden editable
 /// element such as `autocorrect` and `enterkeyhint`).
 ///
-/// The default disables all text assistance and requests no particular action
-/// key presentation.
+/// The default requests the standard text keyboard, disables all text
+/// assistance, and requests no particular action-key presentation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextInputConfiguration {
+    /// The software keyboard to present when this text region gains focus.
+    pub keyboard_type: KeyboardType,
+    /// Whether native text services must protect this text as a password.
+    pub secure: bool,
     /// Whether the platform may automatically correct entered text.
     pub autocorrect: bool,
     /// How software keyboards automatically capitalize entered text.
@@ -2592,6 +2596,31 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+}
+
+/// The kind of software keyboard to present for a focused text region.
+///
+/// Platforms treat this as a hint. Text validation remains the caller's
+/// responsibility because an input method may ignore or extend the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardType {
+    /// Standard text keyboard.
+    #[default]
+    Default,
+    /// Keyboard optimized for email addresses.
+    EmailAddress,
+    /// Phone number pad.
+    Phone,
+    /// Numeric keypad without a decimal separator or sign.
+    NumberPad,
+    /// Keyboard optimized for URL entry.
+    URL,
+    /// Numeric keypad with a decimal separator.
+    Decimal,
+    /// Numeric keypad with a sign.
+    SignedNumber,
+    /// Numeric keypad with a decimal separator and a sign.
+    SignedDecimal,
 }
 
 /// Automatic capitalization applied by software keyboards.

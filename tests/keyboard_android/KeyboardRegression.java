@@ -5,6 +5,7 @@ import android.app.Instrumentation;
 import android.content.Intent;
 import android.os.Bundle;
 import android.text.Editable;
+import android.text.InputType;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.inputmethod.BaseInputConnection;
@@ -44,9 +45,21 @@ public final class KeyboardRegression extends Instrumentation {
         };
     }
     private static InputConnection connection(Activity host) throws Exception {
+        return connection(host, 0, 0);
+    }
+    private static InputConnection connection(Activity host, int inputType) throws Exception {
+        return connection(host, inputType, 0);
+    }
+    private static InputConnection connection(Activity host, int inputType, int imeOptions) throws Exception {
         Constructor<GpuiKeyboard> ctor = GpuiKeyboard.class.getDeclaredConstructor(Activity.class);
         ctor.setAccessible(true);
         GpuiKeyboard keyboard = ctor.newInstance(host);
+        Field type = GpuiKeyboard.class.getDeclaredField("inputType");
+        type.setAccessible(true);
+        type.setInt(keyboard, inputType);
+        Field options = GpuiKeyboard.class.getDeclaredField("imeOptions");
+        options.setAccessible(true);
+        options.setInt(keyboard, imeOptions);
         Field session = GpuiKeyboard.class.getDeclaredField("session");
         session.setAccessible(true);
         session.setLong(keyboard, 1);
@@ -54,6 +67,29 @@ public final class KeyboardRegression extends Instrumentation {
         return keyboard.onCreateInputConnection(lastInfo);
     }
     private static void exercise(Activity host) throws Exception {
+        InputConnection secure = connection(host, 0x80081,
+            EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
+        check((lastInfo.inputType & InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT,
+            "secure keyboard keeps the Android text class");
+        check((lastInfo.inputType & InputType.TYPE_MASK_VARIATION)
+            == InputType.TYPE_TEXT_VARIATION_PASSWORD, "secure keyboard requests password variation");
+        check((lastInfo.inputType & InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0,
+            "secure keyboard disables suggestions");
+        check((lastInfo.imeOptions & EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0,
+            "secure keyboard disables personalized learning");
+        secure.closeConnection();
+        InputConnection signedDecimal = connection(host, 0x3002);
+        check((lastInfo.inputType & InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_NUMBER,
+            "numeric keyboard keeps the Android number class");
+        check((lastInfo.inputType & InputType.TYPE_NUMBER_FLAG_SIGNED) != 0,
+            "signed numeric type keeps the Android sign flag");
+        check((lastInfo.inputType & InputType.TYPE_NUMBER_FLAG_DECIMAL) != 0,
+            "decimal numeric type keeps the Android decimal flag");
+        signedDecimal.closeConnection();
+        InputConnection ordinary = connection(host);
+        check((lastInfo.imeOptions & EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) == 0,
+            "ordinary keyboard keeps default personalized-learning options");
+        ordinary.closeConnection();
         InputConnection keys = connection(host);
         check(lastInfo.initialSelStart == 0 && lastInfo.initialSelEnd == 0,
             "connection publishes an initial proxy selection");

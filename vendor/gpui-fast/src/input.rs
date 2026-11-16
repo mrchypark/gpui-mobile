@@ -330,13 +330,15 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Render, Styled as _, TestAppContext, TextInputAction,
+        KeyboardType, ParentElement as _, Render, Styled as _, TestAppContext, TextInputAction,
         TextInputStateChange, canvas, div,
     };
 
     #[gpui::test]
     fn text_input_configuration_and_focus_state_are_forwarded_on_change(cx: &mut TestAppContext) {
         let custom = TextInputConfiguration {
+            keyboard_type: KeyboardType::SignedDecimal,
+            secure: true,
             autocorrect: true,
             input_action: TextInputAction::Send,
             ..Default::default()

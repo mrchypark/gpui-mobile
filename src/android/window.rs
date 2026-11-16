@@ -1659,6 +1659,14 @@ impl PlatformWindow for AndroidPlatformWindow {
         super::jni::configure_text_input(configuration);
     }
 
+    fn show_soft_keyboard(&self) {
+        super::jni::show_keyboard_current();
+    }
+
+    fn hide_soft_keyboard(&self) {
+        super::jni::hide_keyboard_android();
+    }
+
     fn prompt(
         &self,
         _level: PromptLevel,
@@ -2713,7 +2721,7 @@ impl PlatformWindow for AndroidPlatformWindow {
         // focus transitions request IME changes through the existing helpers.
         match change {
             gpui::TextInputStateChange::FocusGained => {
-                super::jni::show_keyboard_android(crate::KeyboardType::Default);
+                super::jni::show_keyboard_current();
             }
             gpui::TextInputStateChange::FocusLost => super::jni::hide_keyboard_android(),
             gpui::TextInputStateChange::SelectionChanged

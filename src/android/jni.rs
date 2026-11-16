@@ -1748,9 +1748,24 @@ mod prompt_tests {
 /// `android-activity` accesses InputMethodManager and Views through JNI on the
 /// calling thread, so schedule the operation on Java's main thread explicitly.
 pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
-    let (flags, options) = IME_CONFIGURATION
-        .with(|configuration| crate::mobile_events::android_input_traits(&configuration.borrow()));
-    let secure = IME_PASSWORD.get();
+    explicit_input_state(|state| state.keyboard_type = Some(keyboard_type));
+    show_keyboard_current();
+}
+
+pub(crate) fn show_keyboard_current() {
+    let (explicit_type, explicit_secure) =
+        explicit_input_state(|state| (state.keyboard_type, state.secure));
+    let (configured_type, flags, options, secure) = IME_CONFIGURATION.with(|configuration| {
+        let configuration = configuration.borrow();
+        let (flags, options) = crate::mobile_events::android_input_traits(&configuration);
+        (
+            configuration.keyboard_type,
+            flags,
+            options,
+            crate::mobile_events::android_secure_input(&configuration, explicit_secure),
+        )
+    });
+    let keyboard_type = explicit_type.unwrap_or(configured_type);
     let (flags, options) = crate::mobile_events::android_password_traits(flags, options, secure);
     let key = (
         keyboard_type,
@@ -1765,7 +1780,6 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
         return;
     }
     IME_SHOWN_KEY.set(Some(key));
-    IME_TYPE.set(keyboard_type);
     IME_ACTIVE.store(true, Ordering::Release);
     IME_LEGACY_ENABLED.store(
         crate::mobile_dispatch::has_text_handler(),
@@ -1784,14 +1798,7 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
                 let mut input_type = if secure {
                     0x81
                 } else {
-                    match keyboard_type {
-                        crate::KeyboardType::Default => 1,
-                        crate::KeyboardType::EmailAddress => 0x21,
-                        crate::KeyboardType::Phone => 3,
-                        crate::KeyboardType::NumberPad => 2,
-                        crate::KeyboardType::URL => 0x11,
-                        crate::KeyboardType::Decimal => 0x2002,
-                    }
+                    crate::mobile_events::android_keyboard_input_type(keyboard_type)
                 };
                 if input_type & 0xf == 1 {
                     input_type |= flags;
@@ -1868,7 +1875,7 @@ pub(crate) fn logical_input_owner_changed(active: bool) {
     IME_LOGICAL_OWNER.store(active, Ordering::Release);
     IME_EDITOR.fetch_add(1, Ordering::AcqRel);
     if active {
-        show_keyboard_android(IME_TYPE.get());
+        show_keyboard_current();
     } else {
         hide_keyboard_android();
     }
@@ -1888,16 +1895,49 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_hasLogicalOwner(
     IME_LOGICAL_OWNER.load(Ordering::Acquire) as u8
 }
 thread_local! {
-    static IME_PASSWORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IME_EXPLICIT: std::cell::RefCell<ExplicitInputState> = Default::default();
     static IME_SHOWN_KEY: std::cell::Cell<Option<(crate::KeyboardType, i32, i32, i64)>> = const { std::cell::Cell::new(None) };
     static IME_CONFIGURATION: std::cell::RefCell<gpui::TextInputConfiguration> = Default::default();
-    static IME_TYPE: std::cell::Cell<crate::KeyboardType> = const { std::cell::Cell::new(crate::KeyboardType::Default) };
     static IME_LEGACY_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+#[derive(Default)]
+struct ExplicitInputState {
+    editor: i64,
+    keyboard_type: Option<gpui::KeyboardType>,
+    secure: bool,
+}
+
+fn explicit_input_state<R>(action: impl FnOnce(&mut ExplicitInputState) -> R) -> R {
+    IME_EXPLICIT.with(|stored| {
+        let mut stored = stored.borrow_mut();
+        let editor = IME_EDITOR.load(Ordering::Acquire);
+        if stored.editor != editor {
+            *stored = ExplicitInputState {
+                editor,
+                ..Default::default()
+            };
+        }
+        action(&mut stored)
+    })
+}
+
+fn explicit_secure_input() -> bool {
+    explicit_input_state(|state| state.secure)
+}
+
 /// Set the current Android editor's password mode on the GPUI event thread.
 pub fn set_password_input(enabled: bool) {
-    if IME_PASSWORD.replace(enabled) != enabled && enabled && IME_ACTIVE.load(Ordering::Acquire) {
-        show_keyboard_android(IME_TYPE.get());
+    let changed = explicit_input_state(|state| {
+        if state.secure == enabled {
+            false
+        } else {
+            state.secure = enabled;
+            true
+        }
+    });
+    if changed && IME_ACTIVE.load(Ordering::Acquire) {
+        show_keyboard_current();
     }
 }
 pub(crate) fn ime_session_current(session: i64) -> bool {
@@ -1965,6 +2005,11 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_editorEpoch(
 ) -> i64 {
     IME_EDITOR.load(Ordering::Acquire)
 }
+pub(crate) fn configured_keyboard_type() -> gpui::KeyboardType {
+    explicit_input_state(|state| state.keyboard_type).unwrap_or_else(|| {
+        IME_CONFIGURATION.with(|configuration| configuration.borrow().keyboard_type)
+    })
+}
 pub(crate) fn configure_text_input(configuration: gpui::TextInputConfiguration) {
     let changed = IME_CONFIGURATION.with(|stored| {
         if *stored.borrow() == configuration {
@@ -1974,7 +2019,7 @@ pub(crate) fn configure_text_input(configuration: gpui::TextInputConfiguration) 
         true
     });
     if changed && IME_ACTIVE.load(Ordering::Acquire) {
-        show_keyboard_android(IME_TYPE.get());
+        show_keyboard_current();
     }
 }
 static OPEN_URLS_PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -2260,6 +2305,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaSeek(
 #[cfg(test)]
 mod tests {
     use super::*;
+    static IME_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn poll_events_returns_false_when_no_platform() {
@@ -2290,6 +2336,57 @@ mod tests {
     #[test]
     fn platform_returns_none_before_init() {
         assert!(platform().is_none());
+    }
+
+    #[test]
+    fn hiding_preserves_configured_keyboard_type_and_secure_state() {
+        let _guard = IME_STATE_LOCK.lock().unwrap();
+        configure_text_input(gpui::TextInputConfiguration {
+            keyboard_type: gpui::KeyboardType::EmailAddress,
+            secure: true,
+            ..Default::default()
+        });
+        hide_keyboard_android();
+
+        assert_eq!(configured_keyboard_type(), gpui::KeyboardType::EmailAddress);
+        let secure = IME_CONFIGURATION.with(|configuration| {
+            crate::mobile_events::android_secure_input(
+                &configuration.borrow(),
+                explicit_secure_input(),
+            )
+        });
+        assert!(secure);
+
+        configure_text_input(gpui::TextInputConfiguration::default());
+    }
+
+    #[test]
+    fn explicit_keyboard_and_password_state_is_editor_scoped() {
+        let _guard = IME_STATE_LOCK.lock().unwrap();
+        configure_text_input(gpui::TextInputConfiguration::default());
+
+        show_keyboard_android(gpui::KeyboardType::Phone);
+        set_password_input(true);
+        hide_keyboard_android();
+
+        assert_eq!(configured_keyboard_type(), gpui::KeyboardType::Phone);
+        let secure = IME_CONFIGURATION.with(|configuration| {
+            crate::mobile_events::android_secure_input(
+                &configuration.borrow(),
+                explicit_secure_input(),
+            )
+        });
+        assert!(secure);
+
+        IME_EDITOR.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(configured_keyboard_type(), gpui::KeyboardType::Default);
+        let secure = IME_CONFIGURATION.with(|configuration| {
+            crate::mobile_events::android_secure_input(
+                &configuration.borrow(),
+                explicit_secure_input(),
+            )
+        });
+        assert!(!secure);
     }
 
     #[test]

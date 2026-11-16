@@ -195,25 +195,7 @@ pub fn dispatch_text_input(text: &str) -> bool {
 
 // ── Software keyboard control ────────────────────────────────────────────────
 
-/// The type of software keyboard to present.
-///
-/// Maps to `UIKeyboardType` on iOS and `InputType` on Android.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KeyboardType {
-    /// Standard text keyboard.
-    #[default]
-    Default,
-    /// Keyboard optimized for email addresses (includes @ and .).
-    EmailAddress,
-    /// Phone number pad.
-    Phone,
-    /// Numeric keypad (digits only).
-    NumberPad,
-    /// Keyboard optimized for URL entry.
-    URL,
-    /// Decimal number pad (digits and decimal point).
-    Decimal,
-}
+pub use gpui::KeyboardType;
 
 /// Show the software keyboard with the default keyboard type.
 ///

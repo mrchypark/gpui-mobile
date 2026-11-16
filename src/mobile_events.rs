@@ -695,6 +695,42 @@ pub(crate) fn android_password_traits(flags: i32, options: i32, secure: bool) ->
     }
 }
 
+pub(crate) fn android_secure_input(
+    configuration: &gpui::TextInputConfiguration,
+    explicit: bool,
+) -> bool {
+    explicit || configuration.secure
+}
+
+pub(crate) fn android_keyboard_input_type(keyboard_type: gpui::KeyboardType) -> i32 {
+    use gpui::KeyboardType as K;
+    match keyboard_type {
+        K::Default => 0x1,
+        K::EmailAddress => 0x21,
+        K::Phone => 0x3,
+        K::NumberPad => 0x2,
+        K::URL => 0x11,
+        K::Decimal => 0x2002,
+        K::SignedNumber => 0x1002,
+        K::SignedDecimal => 0x3002,
+    }
+}
+
+pub(crate) fn ios_keyboard_type(keyboard_type: gpui::KeyboardType) -> isize {
+    use gpui::KeyboardType as K;
+    match keyboard_type {
+        K::Default => 0,      // UIKeyboardTypeDefault
+        K::EmailAddress => 7, // UIKeyboardTypeEmailAddress
+        K::Phone => 5,        // UIKeyboardTypePhonePad
+        K::NumberPad => 4,    // UIKeyboardTypeNumberPad
+        K::URL => 3,          // UIKeyboardTypeURL
+        K::Decimal => 8,      // UIKeyboardTypeDecimalPad
+        // UIKit has no signed numeric pad. NumbersAndPunctuation provides both
+        // decimal and minus keys without forcing a text-optimized keyboard.
+        K::SignedNumber | K::SignedDecimal => 2,
+    }
+}
+
 pub(crate) fn android_input_traits(configuration: &gpui::TextInputConfiguration) -> (i32, i32) {
     use gpui::{Autocapitalize as C, TextInputAction as A};
     let mut flags = match configuration.autocapitalize {
@@ -751,6 +787,61 @@ pub(crate) fn ios_input_traits(
 
 #[cfg(test)]
 mod tests {
+    use gpui::KeyboardType;
+
+    #[test]
+    fn keyboard_types_keep_android_default_and_numeric_flags() {
+        use super::android_keyboard_input_type as input_type;
+        assert_eq!(
+            gpui::TextInputConfiguration::default().keyboard_type,
+            KeyboardType::Default
+        );
+        assert_eq!(input_type(KeyboardType::Default), 0x1);
+        assert_eq!(input_type(KeyboardType::EmailAddress), 0x21);
+        assert_eq!(input_type(KeyboardType::Phone), 0x3);
+        assert_eq!(input_type(KeyboardType::NumberPad), 0x2);
+        assert_eq!(input_type(KeyboardType::URL), 0x11);
+        assert_eq!(input_type(KeyboardType::Decimal), 0x2002);
+        assert_eq!(input_type(KeyboardType::SignedNumber), 0x1002);
+        assert_eq!(input_type(KeyboardType::SignedDecimal), 0x3002);
+    }
+
+    #[test]
+    fn keyboard_types_keep_ios_mappings() {
+        use super::ios_keyboard_type as keyboard_type;
+        assert_eq!(keyboard_type(KeyboardType::Default), 0);
+        assert_eq!(keyboard_type(KeyboardType::EmailAddress), 7);
+        assert_eq!(keyboard_type(KeyboardType::Phone), 5);
+        assert_eq!(keyboard_type(KeyboardType::NumberPad), 4);
+        assert_eq!(keyboard_type(KeyboardType::URL), 3);
+        assert_eq!(keyboard_type(KeyboardType::Decimal), 8);
+        assert_eq!(keyboard_type(KeyboardType::SignedNumber), 2);
+        assert_eq!(keyboard_type(KeyboardType::SignedDecimal), 2);
+    }
+
+    #[test]
+    fn secure_configuration_requests_password_traits() {
+        let configuration = gpui::TextInputConfiguration {
+            secure: true,
+            ..Default::default()
+        };
+        assert!(super::android_secure_input(&configuration, false));
+        assert!(super::android_secure_input(
+            &gpui::TextInputConfiguration::default(),
+            true
+        ));
+        assert!(!super::android_secure_input(
+            &gpui::TextInputConfiguration::default(),
+            false
+        ));
+
+        let secure = super::android_secure_input(&configuration, false);
+        assert_eq!(
+            super::android_password_traits(0, 0, secure),
+            (0x80000, 0x1000000)
+        );
+    }
+
     #[test]
     fn password_mode_disables_suggestions_and_personalized_learning() {
         let (flags, options) = super::android_password_traits(0x8000, 6, true);
