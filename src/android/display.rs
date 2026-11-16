@@ -28,6 +28,15 @@ use ndk::configuration::Configuration;
 // Well-known Android density buckets (dp/inch).
 const DENSITY_DEFAULT: i32 = 160;
 
+fn density_from_scale_factor(scale_factor: f32) -> i32 {
+    let density = (scale_factor * DENSITY_DEFAULT as f32).round();
+    if density.is_finite() && density >= 1.0 {
+        density as i32
+    } else {
+        DENSITY_DEFAULT
+    }
+}
+
 // ── AndroidDisplay ────────────────────────────────────────────────────────────
 
 /// A single logical display on Android.
@@ -87,6 +96,14 @@ impl AndroidDisplay {
         let config = Configuration::from_asset_manager(asset_manager);
         let density_dpi = config.density().unwrap_or(DENSITY_DEFAULT as u32) as i32;
         Self::from_window(window, density_dpi)
+    }
+
+    /// Create an `AndroidDisplay` from a density-independent scale factor.
+    ///
+    /// The host-driven entry point receives the scale from Java instead of an
+    /// `AssetManager`, so derive the density bucket from it.
+    pub fn from_scale_factor(window: &NativeWindow, scale_factor: f32) -> Self {
+        Self::from_window(window, density_from_scale_factor(scale_factor))
     }
 
     /// Create a synthetic `AndroidDisplay` for headless / testing use.
@@ -373,6 +390,15 @@ mod tests {
         let s = format!("{:?}", d);
         assert!(s.contains("1080"));
         assert!(s.contains("1920"));
+    }
+
+    #[test]
+    fn host_scale_factor_maps_to_density_bucket() {
+        assert_eq!(density_from_scale_factor(1.0), 160);
+        assert_eq!(density_from_scale_factor(2.75), 440);
+        for invalid in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(density_from_scale_factor(invalid), DENSITY_DEFAULT);
+        }
     }
 
     #[test]

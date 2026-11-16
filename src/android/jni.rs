@@ -121,7 +121,7 @@ thread_local! {
     static PLATFORM_EVENTS: std::cell::RefCell<Vec<Option<gpui::AppLifecyclePhase>>> = Default::default();
 }
 
-fn queue_platform_event(phase: Option<gpui::AppLifecyclePhase>) {
+pub(crate) fn queue_platform_event(phase: Option<gpui::AppLifecyclePhase>) {
     PLATFORM_EVENTS.with(|events| events.borrow_mut().push(phase));
 }
 
@@ -156,9 +156,7 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeStatusChanged(
         return;
     }
     THERMAL_EVENTS.lock().unwrap().push((generation, status));
-    if let Some(app) = android_app() {
-        app.create_waker().wake();
-    }
+    wake_event_loop();
 }
 
 #[unsafe(no_mangle)]
@@ -173,13 +171,25 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiThermal_nativeListenerStopped(
             .is_ok()
     {
         THERMAL_STOP_PENDING.store(true, Ordering::Release);
-        if let Some(app) = android_app() {
-            app.create_waker().wake();
-        }
+        wake_event_loop();
     }
 }
 
-fn drain_platform_events() {
+/// Wake whichever event loop owns GPUI: `android-activity` or the host render thread.
+pub(crate) fn wake_event_loop() {
+    if let Some(app) = android_app() {
+        app.create_waker().wake();
+    } else {
+        super::host::wake_render_thread();
+    }
+}
+
+/// Take the latest insets observation, if the Java UI thread published one.
+pub(crate) fn take_window_insets() -> Option<(f32, crate::mobile_events::WindowInsets)> {
+    WINDOW_INSETS_PENDING.lock().take()
+}
+
+pub(crate) fn drain_platform_events() {
     // Outside drawing/App borrows; resolve actual installed identity before draining IME.
     if let Some(window) = platform().and_then(|platform| platform.primary_window()) {
         window.refresh_ime_owner();
@@ -292,6 +302,44 @@ pub unsafe extern "system" fn Java_dev_gpui_mobile_GpuiInsets_nativeInsets(
     width: i32,
     height: i32,
 ) {
+    let Some((density, insets)) = parse_window_insets(
+        density,
+        top,
+        bottom,
+        left,
+        right,
+        ime_top,
+        ime_bottom,
+        ime_left,
+        ime_right,
+        ime_visible,
+        x,
+        y,
+        width,
+        height,
+    ) else {
+        return;
+    };
+    *WINDOW_INSETS_PENDING.lock() = Some((density, insets));
+    wake_event_loop();
+}
+
+fn parse_window_insets(
+    density: f32,
+    top: i32,
+    bottom: i32,
+    left: i32,
+    right: i32,
+    ime_top: i32,
+    ime_bottom: i32,
+    ime_left: i32,
+    ime_right: i32,
+    ime_visible: jni::sys::jboolean,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<(f32, crate::mobile_events::WindowInsets)> {
     if !density.is_finite()
         || density <= 0.0
         || [
@@ -300,7 +348,7 @@ pub unsafe extern "system" fn Java_dev_gpui_mobile_GpuiInsets_nativeInsets(
         .iter()
         .any(|value| *value < 0)
     {
-        return;
+        return None;
     }
     let logical = |value: i32| gpui::px(value as f32 / density);
     let insets = crate::mobile_events::WindowInsets {
@@ -322,10 +370,7 @@ pub unsafe extern "system" fn Java_dev_gpui_mobile_GpuiInsets_nativeInsets(
             right: logical(ime_right),
         }),
     };
-    *WINDOW_INSETS_PENDING.lock() = Some((density, insets));
-    if let Some(app) = android_app() {
-        app.create_waker().wake();
-    }
+    Some((density, insets))
 }
 
 use android_activity::{AndroidApp, MainEvent, PollEvent};
@@ -575,6 +620,8 @@ pub fn unicode_char_for_key_event(key_code: i32, action: i32, meta_state: i32) -
 /// JVM for the **host-driven** entry point ([`super::host`]), which has no
 /// `AndroidApp` to read it from.
 static HOST_VM: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static HOST_ACTIVITY_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Current Activity for the host-driven entry point, as a JNI global reference we
 /// own. Replaced on every Activity creation so [`activity_as_ptr`] always names the
@@ -593,6 +640,113 @@ struct HostActivity {
     previous: Option<jni::refs::Global<JObject<'static>>>,
 }
 
+/// Closures posted to the Java main looper by the host-driven entry point.
+///
+/// `android-activity` normally provides this queue. Without it, platform calls
+/// that need the Java UI thread (thermal listeners, window flags) had no way to
+/// run there.
+struct HostCallbacks {
+    event_fd: libc::c_int,
+    queue: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+}
+
+static HOST_CALLBACKS: OnceLock<&'static HostCallbacks> = OnceLock::new();
+static HOST_CALLBACK_INIT: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" fn run_host_callback(
+    fd: libc::c_int,
+    events: libc::c_int,
+    data: *mut c_void,
+) -> libc::c_int {
+    if events & ndk_sys::ALOOPER_EVENT_INPUT as libc::c_int != 0 {
+        let mut value = 0u64;
+        // SAFETY: the Java main looper calls this for our eventfd only.
+        let _ = unsafe { libc::read(fd, &mut value as *mut u64 as *mut c_void, 8) };
+    }
+    // SAFETY: `data` points at the leaked `HostCallbacks` installed below.
+    let callbacks = unsafe { &*(data as *const HostCallbacks) };
+    run_host_tasks(callbacks);
+    1 // Keep the eventfd registered.
+}
+
+fn run_host_tasks(callbacks: &HostCallbacks) {
+    let tasks = std::mem::take(&mut *callbacks.queue.lock().expect("poisoned"));
+    for task in tasks {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+            log::error!("host Java main callback panicked");
+        }
+    }
+}
+
+fn install_host_main_callbacks() {
+    let _init = HOST_CALLBACK_INIT.lock().expect("poisoned");
+    if HOST_CALLBACKS.get().is_some() {
+        return;
+    }
+    // SAFETY: `set_host_activity` is called from the Java UI thread.
+    let looper = unsafe { ndk_sys::ALooper_forThread() };
+    if looper.is_null() {
+        log::warn!("host main-thread dispatch unavailable: no Java looper on this thread");
+        return;
+    }
+    // SAFETY: eventfd is thread-safe and closed only at process exit.
+    let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if event_fd < 0 {
+        log::warn!("host main-thread dispatch unavailable: eventfd failed");
+        return;
+    }
+    let callbacks: &'static HostCallbacks = Box::leak(Box::new(HostCallbacks {
+        event_fd,
+        queue: Mutex::new(Vec::new()),
+    }));
+    // SAFETY: the callback, fd and leaked pointer live for the process.
+    let added = unsafe {
+        ndk_sys::ALooper_addFd(
+            looper,
+            event_fd,
+            ndk_sys::ALOOPER_POLL_CALLBACK,
+            ndk_sys::ALOOPER_EVENT_INPUT as libc::c_int,
+            Some(run_host_callback),
+            callbacks as *const _ as *mut c_void,
+        )
+    };
+    if added < 0 {
+        log::warn!("host main-thread dispatch unavailable: ALooper_addFd failed");
+        unsafe {
+            libc::close(event_fd);
+            drop(Box::from_raw(callbacks as *const _ as *mut HostCallbacks));
+        }
+        return;
+    }
+    let _ = HOST_CALLBACKS.set(callbacks);
+}
+
+/// Run `work` on the Java main thread when `android-activity` is absent.
+///
+/// Returns `false` before [`set_host_activity`] has installed the looper bridge.
+pub(crate) fn run_on_host_java_main_thread(work: Box<dyn FnOnce() + Send>) -> bool {
+    let Some(callbacks) = HOST_CALLBACKS.get() else {
+        return false;
+    };
+    let mut queue = callbacks.queue.lock().expect("poisoned");
+    queue.push(work);
+    let one: u64 = 1;
+    // SAFETY: eventfd write is thread-safe.
+    let written =
+        unsafe { libc::write(callbacks.event_fd, &one as *const u64 as *const c_void, 8) };
+    if written == 8 {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        // The counter is already nonzero, so a wake is pending.
+        return true;
+    }
+    queue.pop();
+    log::error!("host Java main wake failed: {error}");
+    false
+}
+
 /// Register the current Activity when running without `android-activity`.
 ///
 /// Call from a JNI entry point in `Activity.onCreate`, every time — a recreated
@@ -604,6 +758,7 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     if ANDROID_APP.lock().is_some() {
         return Ok(());
     }
+    install_host_main_callbacks();
     let global = env.new_global_ref(activity).e()?;
     let vm = env.get_java_vm().e()?;
     HOST_VM.store(
@@ -613,7 +768,38 @@ pub fn set_host_activity(env: &mut jni::Env<'_>, activity: &JObject<'_>) -> Resu
     let mut slot = HOST_ACTIVITY.lock().expect("poisoned");
     slot.previous = slot.current.take();
     slot.current = Some(global);
+    HOST_ACTIVITY_GENERATION.fetch_add(1, Ordering::AcqRel);
+    drop(slot);
+    if let Err(error) = install_host_insets_observer(env, activity) {
+        log::warn!("host insets observer installation failed: {error}");
+    }
     Ok(())
+}
+
+pub(crate) fn host_activity_generation() -> u64 {
+    HOST_ACTIVITY_GENERATION.load(Ordering::Acquire)
+}
+
+pub(crate) fn set_host_window_focused(focused: bool) {
+    NATIVE_WINDOW_FOCUSED.store(focused, Ordering::Release);
+}
+
+fn install_host_insets_observer(
+    env: &mut jni::Env<'_>,
+    activity: &JObject<'_>,
+) -> Result<(), String> {
+    let class = find_app_class(env, "dev.gpui.mobile.GpuiInsets")?;
+    env.call_static_method(
+        &class,
+        jni::jni_str!("install"),
+        jni::jni_sig!("(Landroid/app/Activity;)V"),
+        &[JValue::Object(activity)],
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        env.exception_clear();
+        error.to_string()
+    })
 }
 
 /// Public accessor for the JavaVM pointer.
@@ -2395,9 +2581,7 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiActivity_nativeOnDeepLink(
         }
         log::info!("nativeOnDeepLink: {}", url_string);
         OPEN_URLS_PENDING.lock().unwrap().push(url_string.clone());
-        if let Some(app) = android_app() {
-            app.create_waker().wake();
-        }
+        wake_event_loop();
 
         #[cfg(feature = "deeplink")]
         {
@@ -2498,6 +2682,57 @@ mod tests {
             android_input_type(crate::KeyboardType::Phone, 0x80000, false),
             3
         );
+    }
+
+    #[test]
+    fn host_insets_reject_invalid_values_and_scale_valid_ones() {
+        assert!(parse_window_insets(0.0, 0, 0, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0).is_none());
+        assert!(parse_window_insets(f32::NAN, 0, 0, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0).is_none());
+        assert!(parse_window_insets(2.0, -1, 0, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0).is_none());
+
+        let (density, insets) =
+            parse_window_insets(2.0, 48, 24, 0, 0, 0, 300, 0, 0, true, 0, 1000, 1080, 300)
+                .expect("valid insets");
+        assert_eq!(density, 2.0);
+        assert_eq!(insets.safe_area.top, gpui::px(24.0));
+        assert_eq!(
+            insets.keyboard_insets.expect("keyboard edges").bottom,
+            gpui::px(150.0)
+        );
+        let keyboard = insets.keyboard.expect("keyboard bounds");
+        assert_eq!(keyboard.origin.y, gpui::px(500.0));
+        assert_eq!(keyboard.size.width, gpui::px(540.0));
+        assert_eq!(keyboard.size.height, gpui::px(150.0));
+
+        let (_, empty) = parse_window_insets(2.0, 0, 0, 0, 0, 0, 300, 0, 0, true, 0, 1000, 0, 300)
+            .expect("valid empty keyboard");
+        assert!(empty.keyboard.is_none());
+        assert_eq!(empty.keyboard_visible, Some(true));
+    }
+
+    #[test]
+    fn host_main_queue_drains_in_order_and_keeps_registration() {
+        let callbacks = HostCallbacks {
+            event_fd: -1,
+            queue: Mutex::new(Vec::new()),
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        for value in 0..3 {
+            let seen = Arc::clone(&seen);
+            callbacks
+                .queue
+                .lock()
+                .expect("poisoned")
+                .push(Box::new(move || seen.lock().expect("poisoned").push(value)));
+        }
+
+        // SAFETY: `callbacks` outlives this synchronous callback invocation.
+        let keep_registered =
+            unsafe { run_host_callback(-1, 0, &callbacks as *const _ as *mut c_void) };
+
+        assert_eq!(keep_registered, 1);
+        assert_eq!(*seen.lock().expect("poisoned"), vec![0, 1, 2]);
+        assert!(callbacks.queue.lock().expect("poisoned").is_empty());
     }
 
     #[test]

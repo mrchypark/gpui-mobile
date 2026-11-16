@@ -31,7 +31,7 @@ use objc2::encode::{Encode, Encoding, RefEncode};
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
 
-use super::cg_types::ObjcCGRect;
+use super::cg_types::{ObjcCGPoint, ObjcCGRect};
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 use std::{
@@ -45,6 +45,7 @@ use std::{
 
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
 const IME_NATIVE_EDIT_IVAR: &str = "gpui_ime_native_edit";
+const A11Y_ADAPTER_IVAR: &str = "gpui_a11y_adapter_ptr";
 
 // UIKit may call another overridden input method while updating its document.
 // Only the outer native operation delivers to the GPUI document.
@@ -375,6 +376,9 @@ fn register_metal_view_class() -> &'static AnyClass {
 
         // Add ivar to store window pointer for touch handling
         decl.add_ivar::<*mut std::ffi::c_void>(c"gpui_window_ptr");
+        // Pointer to the window's accesskit_ios adapter. Objective-C methods
+        // below forward to it; null until PlatformWindow::a11y_init.
+        decl.add_ivar::<*mut std::ffi::c_void>(c"gpui_a11y_adapter_ptr");
 
         // Override layerClass to return CAMetalLayer
         extern "C" fn layer_class(_self: *const AnyClass, _sel: Sel) -> *const AnyClass {
@@ -542,11 +546,63 @@ fn register_metal_view_class() -> &'static AnyClass {
                 let window: *mut c_void = *(*this).get_ivar(GPUI_WINDOW_IVAR);
                 if let Some(window) = super::ffi::window_for_handle(window as usize) {
                     window.sync_surface_availability();
+                    window.a11y_view_did_appear();
                 }
             }
             decl.add_method(
                 sel!(didMoveToWindow),
                 did_move_to_window as unsafe extern "C" fn(*mut AnyObject, Sel),
+            );
+
+            unsafe fn a11y_adapter(
+                this: *mut AnyObject,
+            ) -> Option<&'static super::accessibility::Accessibility> {
+                #[allow(deprecated)]
+                let adapter: *mut c_void = *(*this).get_ivar(A11Y_ADAPTER_IVAR);
+                unsafe { (adapter as *const super::accessibility::Accessibility).as_ref() }
+            }
+
+            extern "C" fn is_accessibility_element(this: *mut AnyObject, _sel: Sel) -> Bool {
+                unsafe {
+                    Bool::new(
+                        a11y_adapter(this)
+                            .is_some_and(|adapter| adapter.is_accessibility_element()),
+                    )
+                }
+            }
+            extern "C" fn accessibility_elements(
+                this: *mut AnyObject,
+                _sel: Sel,
+            ) -> *mut AnyObject {
+                unsafe {
+                    a11y_adapter(this)
+                        .map(|adapter| adapter.accessibility_elements())
+                        .unwrap_or_else(|| msg_send![class!(NSArray), array])
+                }
+            }
+            extern "C" fn accessibility_hit_test(
+                this: *mut AnyObject,
+                _sel: Sel,
+                point: ObjcCGPoint,
+            ) -> *mut AnyObject {
+                unsafe {
+                    a11y_adapter(this)
+                        .map(|adapter| adapter.hit_test(point.x, point.y))
+                        .unwrap_or(ptr::null_mut())
+                }
+            }
+            decl.add_method(
+                sel!(isAccessibilityElement),
+                is_accessibility_element as extern "C" fn(*mut AnyObject, Sel) -> Bool,
+            );
+            decl.add_method(
+                sel!(accessibilityElements),
+                accessibility_elements as extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+            );
+            decl.add_method(
+                sel!(accessibilityHitTest:),
+                accessibility_hit_test
+                    as extern "C" fn(*mut AnyObject, Sel, ObjcCGPoint) -> *mut AnyObject,
             );
         }
 
@@ -954,6 +1010,8 @@ pub(crate) struct IosWindowInner {
     proxy_mapping_valid: Cell<bool>,
     proxy_text: RefCell<String>,
     input_configuration: RefCell<gpui::TextInputConfiguration>,
+    /// VoiceOver adapter; dropped before the root view is released.
+    accessibility: RefCell<Option<Box<super::accessibility::Accessibility>>>,
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: Callback<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -1034,6 +1092,45 @@ impl IosWindowInner {
             let _: () = msg_send![self.text_input_view, setSpellCheckingType: spellcheck];
             let _: () = msg_send![self.text_input_view, setReturnKeyType: action];
             let _: () = msg_send![self.text_input_view, reloadInputViews];
+        }
+    }
+
+    fn install_accessibility(&self, callbacks: gpui::A11yCallbacks) {
+        if self.closed.get() || self.view.is_null() {
+            return;
+        }
+        if !super::accessibility::is_main_thread() {
+            log::warn!("accessibility: a11y_init must run on the main thread");
+            return;
+        }
+        let mut accessibility = self.accessibility.borrow_mut();
+        if let Some(previous) = accessibility.take() {
+            unsafe {
+                *(*self.view).get_mut_ivar::<*mut c_void>(A11Y_ADAPTER_IVAR) = ptr::null_mut();
+            }
+            drop(previous);
+        }
+        let adapter = Box::new(unsafe {
+            super::accessibility::Accessibility::new(self.view as *mut c_void, callbacks)
+        });
+        unsafe {
+            *(*self.view).get_mut_ivar::<*mut c_void>(A11Y_ADAPTER_IVAR) =
+                Box::as_ref(&adapter) as *const _ as *mut c_void;
+        }
+        *accessibility = Some(adapter);
+        drop(accessibility);
+        // The view may already be on screen when GPUI installs the adapter.
+        self.a11y_view_did_appear();
+    }
+
+    fn a11y_view_did_appear(&self) {
+        if self.closed.get() || !super::accessibility::is_main_thread() {
+            return;
+        }
+        if let Some(accessibility) = self.accessibility.borrow().as_ref() {
+            if let Some(events) = accessibility.view_did_appear() {
+                events.raise();
+            }
         }
     }
     pub(crate) fn native_handle(&self) -> usize {
@@ -1324,6 +1421,10 @@ impl IosWindowInner {
             let _: () = msg_send![text_input_view, setBackgroundColor: clear];
             let _: () = msg_send![text_input_view, setScrollEnabled: Bool::NO];
             let _: () = msg_send![text_input_view, setUserInteractionEnabled: true];
+            // GPUI exposes its controls through the AccessKit tree. Keep the
+            // invisible IME proxy out of VoiceOver's element order.
+            let _: () = msg_send![text_input_view, setIsAccessibilityElement: false];
+            let _: () = msg_send![text_input_view, setAccessibilityElementsHidden: true];
             let _: () = msg_send![view, addSubview: text_input_view];
 
             // --- Initialise the wgpu renderer (Metal backend) ---------------
@@ -1347,6 +1448,7 @@ impl IosWindowInner {
                 proxy_mapping_valid: Cell::new(false),
                 proxy_text: RefCell::new(String::new()),
                 input_configuration: RefCell::new(gpui::TextInputConfiguration::default()),
+                accessibility: RefCell::new(None),
                 request_frame_callback: Callback::default(),
                 frame_demand: Rc::new(crate::frame_demand::FrameDemand::default()),
                 input_callback: Callback::default(),
@@ -2024,6 +2126,9 @@ impl IosWindowInner {
     /// GPUI's event dispatch while an entity lease is active (UIKit's keyboard
     /// presentation can synchronously trigger layout callbacks).
     pub fn show_keyboard_with_type(&self, keyboard_type: crate::KeyboardType) {
+        if self.closed.get() || self.text_input_view.is_null() {
+            return;
+        }
         log::info!("GPUI iOS: Showing keyboard (type={:?})", keyboard_type);
         unsafe {
             use crate::KeyboardType;
@@ -2063,6 +2168,9 @@ impl IosWindowInner {
     /// Deferred to the next run-loop iteration (like `show_keyboard_with_type`)
     /// to avoid re-entering GPUI event dispatch.
     pub fn hide_keyboard(&self) {
+        if self.closed.get() || self.text_input_view.is_null() {
+            return;
+        }
         log::info!("GPUI iOS: Hiding keyboard");
         unsafe {
             let _: () = msg_send![self.text_input_view,
@@ -2372,6 +2480,13 @@ impl Drop for IosWindow {
 
 impl Drop for IosWindowInner {
     fn drop(&mut self) {
+        // Drop the adapter before releasing the view it quotes.
+        if let Some(accessibility) = self.accessibility.get_mut().take() {
+            unsafe {
+                *(*self.view).get_mut_ivar::<*mut c_void>(A11Y_ADAPTER_IVAR) = ptr::null_mut();
+            }
+            drop(accessibility);
+        }
         if let Some(mut renderer) = self.renderer.get_mut().take() {
             renderer.destroy();
         }
@@ -2782,6 +2897,27 @@ impl PlatformWindow for IosWindow {
             | gpui::TextInputStateChange::ContentChanged => {}
         }
     }
+
+    fn show_soft_keyboard(&self) {
+        self.show_keyboard_with_type(crate::KeyboardType::Default);
+    }
+
+    fn hide_soft_keyboard(&self) {
+        self.hide_keyboard();
+    }
+
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        self.install_accessibility(callbacks);
+    }
+
+    fn a11y_tree_update(&self, tree: gpui::accesskit::TreeUpdate) {
+        if self.closed.get() || !super::accessibility::is_main_thread() {
+            return;
+        }
+        if let Some(accessibility) = self.accessibility.borrow().as_ref() {
+            accessibility.update(tree);
+        }
+    }
 }
 
 // ── Fallback atlas ────────────────────────────────────────────────────────────
@@ -2876,7 +3012,11 @@ fn step_pinch_delta(last: &Cell<Option<f32>>, phase: gpui::TouchPhase, scale: f3
 
 #[cfg(test)]
 mod tests {
-    use super::{appearance_style_changed, edge_attached_keyboard_insets, ProxyInputSession};
+    use super::{
+        appearance_style_changed, edge_attached_keyboard_insets, step_pinch_delta,
+        ProxyInputSession,
+    };
+    use std::cell::Cell;
 
     #[test]
     fn appearance_callback_requires_a_real_style_transition() {

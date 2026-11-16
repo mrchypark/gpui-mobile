@@ -2808,6 +2808,14 @@ impl PlatformWindow for AndroidPlatformWindow {
         }
     }
 
+    fn show_soft_keyboard(&self) {
+        super::jni::show_keyboard_android(crate::KeyboardType::Default);
+    }
+
+    fn hide_soft_keyboard(&self) {
+        super::jni::hide_keyboard_android();
+    }
+
     fn update_ime_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
         use crate::android::jni as jni_helpers;
         use jni::objects::JValue;

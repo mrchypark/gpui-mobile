@@ -20,10 +20,22 @@ Implements the `gpui::Platform` trait for mobile targets, following the same arc
 Custom Android hosts should extend `dev.gpui.mobile.GpuiInputActivity` instead of
 `android.app.NativeActivity` to receive multistage IME composition through a
 native `InputConnection`. Include `GpuiInputActivity.java` and retain the usual
-`android.app.lib_name` metadata. For GPUI file prompts, also package
-`GpuiPathPicker.java` and register its non-exported Activity as shown in the
-example manifest. The picker imports documents into app cache before returning
-filesystem paths; it does not require broad storage permissions.
+`android.app.lib_name` metadata. GPUI file prompts use the `file_selector`
+package. Include `GpuiFilePicker.java` and its supporting picker helpers, and
+register `GpuiPickerActivity` as shown in the example manifest. Opened files
+are imported into app cache without broad storage permissions. Android save
+and directory selections are content URIs, not filesystem paths. Use
+Android's `ContentResolver` to access them.
+
+For a `SurfaceView` host using `android::host`, call `set_host_activity` on
+the Java UI thread for every Activity creation, include `GpuiInsets.java`, and
+forward start, stop, resume, pause, and low-memory events to the matching host
+functions. Forward `onWindowFocusChanged` with the current Activity to
+`host::focus_changed`. The host's native library must also export `android_main` because
+the linked `android-activity` native glue requires it even when the host does
+not call it. Use the incoming JNI environment to register the first Activity;
+`with_env` cannot attach until the Java VM is registered. See the module
+documentation for surface and input callbacks.
 
 ## Quick Start
 

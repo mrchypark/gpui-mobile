@@ -230,11 +230,14 @@ impl AiChat {
 }
 
 impl Render for AiChat {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let insets = window.insets().effective();
         div()
             .size_full()
             .flex()
             .flex_col()
+            .pt(insets.top)
+            .pb(insets.bottom)
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
