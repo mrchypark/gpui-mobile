@@ -2210,36 +2210,29 @@ impl PlatformWindow for AndroidPlatformWindow {
                     );
                     return;
                 }
-                if let crate::mobile_events::ImeInput::Compose {
-                    text,
-                    selection,
-                    region: None,
-                } = &input
-                {
+                if matches!(
+                    &input,
+                    crate::mobile_events::ImeInput::Compose { region: None, .. }
+                        | crate::mobile_events::ImeInput::FinishComposition
+                ) {
                     handler.call(
                         || super::jni::ime_delivery_current(session, editor),
                         |handler| {
-                            if handler.query_accepts_text_input()
-                                && super::jni::ime_delivery_current(session, editor)
-                            {
-                                handler.replace_and_mark_text_in_range(
-                                    None,
-                                    text,
-                                    Some(selection.clone()),
-                                );
-                            }
-                        },
-                    );
-                    return;
-                }
-                if matches!(&input, crate::mobile_events::ImeInput::FinishComposition) {
-                    handler.call(
-                        || super::jni::ime_delivery_current(session, editor),
-                        |handler| {
-                            if handler.query_accepts_text_input()
-                                && super::jni::ime_delivery_current(session, editor)
-                            {
-                                handler.unmark_text();
+                            use crate::mobile_dispatch::OwnerlessComposition;
+                            match crate::mobile_dispatch::ownerless_composition(
+                                &input,
+                                || super::jni::ime_delivery_current(session, editor),
+                                || handler.query_accepts_text_input(),
+                            ) {
+                                Some(OwnerlessComposition::Mark(text, selection)) => {
+                                    handler.replace_and_mark_text_in_range(
+                                        None,
+                                        text,
+                                        Some(selection),
+                                    );
+                                }
+                                Some(OwnerlessComposition::Finish) => handler.unmark_text(),
+                                None => {}
                             }
                         },
                     );
