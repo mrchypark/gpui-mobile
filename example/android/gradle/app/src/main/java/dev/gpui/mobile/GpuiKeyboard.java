@@ -35,20 +35,36 @@ public final class GpuiKeyboard extends View {
     }
 
     public static void show(Activity activity, int inputType, int imeOptions, long session) {
+        show(activity, inputType, imeOptions, session, false);
+    }
+
+    /** Reopen an unchanged connection without replacing its live IME session. */
+    public static void showExplicit(Activity activity, int inputType, int imeOptions, long session) {
+        show(activity, inputType, imeOptions, session, true);
+    }
+
+    private static void show(Activity activity, int inputType, int imeOptions,
+            long session, boolean preserveConnection) {
         ViewGroup content = activity.findViewById(android.R.id.content);
         if (content == null || activity.isDestroyed() || activity.isFinishing()) return;
         GpuiKeyboard editor = content.findViewWithTag(TAG);
+        boolean created = false;
         if (editor == null) {
             editor = new GpuiKeyboard(activity);
             content.addView(editor, new ViewGroup.LayoutParams(1, 1));
+            created = true;
         }
+        boolean sessionChanged = editor.session != session;
+        boolean traitsChanged = editor.inputType != inputType || editor.imeOptions != imeOptions;
+        boolean focusLost = !editor.hasFocus();
         editor.inputType = inputType;
         editor.imeOptions = imeOptions;
         editor.session = session;
         editor.requestFocus();
         InputMethodManager manager = activity.getSystemService(InputMethodManager.class);
         if (manager != null) {
-            manager.restartInput(editor);
+            if (!preserveConnection || created || sessionChanged || traitsChanged || focusLost)
+                manager.restartInput(editor);
             manager.showSoftInput(editor, InputMethodManager.SHOW_IMPLICIT);
         }
     }

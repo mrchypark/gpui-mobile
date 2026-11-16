@@ -957,6 +957,40 @@ enum TouchState {
     Dragging { start: Point<Pixels> },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardOperation {
+    Show(gpui::KeyboardType),
+    Hide,
+}
+
+struct DeferredKeyboardRequest {
+    window: usize,
+    generation: u64,
+    operation: KeyboardOperation,
+}
+
+struct KeyboardBarrierClear {
+    window: usize,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct KeyboardState {
+    generation: u64,
+    pending: Option<KeyboardOperation>,
+    requested_visible: bool,
+    show_barrier: bool,
+}
+
+fn replace_pending_show(state: &mut KeyboardState, keyboard_type: gpui::KeyboardType) -> bool {
+    if matches!(state.pending, Some(KeyboardOperation::Show(_))) {
+        state.pending = Some(KeyboardOperation::Show(keyboard_type));
+        true
+    } else {
+        false
+    }
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) struct IosWindow {
     inner: Rc<IosWindowInner>,
@@ -1012,6 +1046,8 @@ pub(crate) struct IosWindowInner {
     input_configuration: RefCell<gpui::TextInputConfiguration>,
     /// VoiceOver adapter; dropped before the root view is released.
     accessibility: RefCell<Option<Box<super::accessibility::Accessibility>>>,
+    keyboard_type: Cell<gpui::KeyboardType>,
+    keyboard_state: Mutex<KeyboardState>,
     /// Callback for frame requests
     /// Note: pub(super) to allow ffi.rs to access this for the display link callback
     pub(super) request_frame_callback: Callback<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -1087,6 +1123,10 @@ impl IosWindowInner {
         let (correct, capitalize, spellcheck, action) =
             mobile_events::ios_input_traits(&configuration);
         unsafe {
+            let _: () = msg_send![
+                self.text_input_view,
+                setSecureTextEntry: Bool::new(configuration.secure)
+            ];
             let _: () = msg_send![self.text_input_view, setAutocorrectionType: correct];
             let _: () = msg_send![self.text_input_view, setAutocapitalizationType: capitalize];
             let _: () = msg_send![self.text_input_view, setSpellCheckingType: spellcheck];
@@ -1449,6 +1489,8 @@ impl IosWindowInner {
                 proxy_text: RefCell::new(String::new()),
                 input_configuration: RefCell::new(gpui::TextInputConfiguration::default()),
                 accessibility: RefCell::new(None),
+                keyboard_type: Cell::new(gpui::KeyboardType::Default),
+                keyboard_state: Mutex::new(KeyboardState::default()),
                 request_frame_callback: Callback::default(),
                 frame_demand: Rc::new(crate::frame_demand::FrameDemand::default()),
                 input_callback: Callback::default(),
@@ -1620,6 +1662,22 @@ impl IosWindowInner {
                     size(px(width as f32), px(height as f32)),
                 )
             });
+            let applies = {
+                let state = self.keyboard_state.lock();
+                keyboard_notification_applies(
+                    keyboard.is_some(),
+                    state.requested_visible,
+                    state.pending,
+                    state.show_barrier,
+                )
+            };
+            if !applies {
+                return;
+            }
+            let mut state = self.keyboard_state.lock();
+            state.pending = None;
+            state.show_barrier = false;
+            drop(state);
             self.keyboard_bounds.set(keyboard);
             crate::set_keyboard_height(
                 keyboard.map_or(0.0, |bounds| f32::from(bounds.size.height)),
@@ -1710,6 +1768,18 @@ impl IosWindowInner {
                 let Some(window) = super::ffi::window_for_handle(window_address) else {
                     return;
                 };
+                let applies = {
+                    let state = window.keyboard_state.lock();
+                    keyboard_notification_applies(
+                        true,
+                        state.requested_visible,
+                        state.pending,
+                        state.show_barrier,
+                    )
+                };
+                if !applies {
+                    return;
+                }
                 let screen: *mut AnyObject = msg_send![window.window, screen];
                 let coordinate_space: *mut AnyObject = msg_send![screen, coordinateSpace];
                 let local: ObjcCGRect = msg_send![window.view, convertRect: frame, fromCoordinateSpace: coordinate_space];
@@ -1724,16 +1794,38 @@ impl IosWindowInner {
                         origin: point(px(x as f32), px(y as f32)),
                         size: size(px(width as f32), px(height as f32)),
                     }));
+                let mut state = window.keyboard_state.lock();
+                state.pending = None;
+                state.show_barrier = false;
+                drop(state);
                 crate::set_keyboard_height(height.max(0.0) as f32);
                 window.emit_insets();
             });
 
             let hide_block = block2::RcBlock::new(move |_notification: *mut AnyObject| {
                 log::info!("GPUI iOS: Keyboard will hide");
-                crate::set_keyboard_height(0.0);
                 let Some(window) = super::ffi::window_for_handle(window_address) else {
                     return;
                 };
+                let applies = {
+                    let state = window.keyboard_state.lock();
+                    keyboard_notification_applies(
+                        false,
+                        state.requested_visible,
+                        state.pending,
+                        state.show_barrier,
+                    )
+                };
+                if !applies {
+                    return;
+                }
+                crate::set_keyboard_height(0.0);
+                {
+                    let mut state = window.keyboard_state.lock();
+                    state.requested_visible = false;
+                    state.pending = None;
+                    state.show_barrier = false;
+                }
                 window.keyboard_bounds.set(None);
                 window.emit_insets();
             });
@@ -2121,63 +2213,56 @@ impl IosWindowInner {
 
     /// Show the software keyboard with the specified keyboard type.
     ///
-    /// The actual `becomeFirstResponder` call is deferred to the next run-loop
-    /// iteration via `performSelector:withObject:afterDelay:` to avoid re-entering
-    /// GPUI's event dispatch while an entity lease is active (UIKit's keyboard
-    /// presentation can synchronously trigger layout callbacks).
+    /// Presentation is deferred to the main queue so no UIKit state is touched
+    /// from a caller thread or during GPUI event dispatch.
     pub fn show_keyboard_with_type(&self, keyboard_type: crate::KeyboardType) {
         if self.closed.get() || self.text_input_view.is_null() {
             return;
         }
         log::info!("GPUI iOS: Showing keyboard (type={:?})", keyboard_type);
-        unsafe {
-            use crate::KeyboardType;
-            let kb_type: isize = match keyboard_type {
-                KeyboardType::Default => 0,      // UIKeyboardTypeDefault
-                KeyboardType::EmailAddress => 7, // UIKeyboardTypeEmailAddress
-                KeyboardType::Phone => 5,        // UIKeyboardTypePhonePad
-                KeyboardType::NumberPad => 4,    // UIKeyboardTypeNumberPad
-                KeyboardType::URL => 3,          // UIKeyboardTypeURL
-                KeyboardType::Decimal => 8,      // UIKeyboardTypeDecimalPad
-            };
-            log::info!(
-                "GPUI iOS: text_input_view={:p}, setKeyboardType: {}",
-                self.text_input_view,
-                kb_type
-            );
-            if self.text_input_view.is_null() {
-                log::error!("GPUI iOS: text_input_view is NULL!");
-                return;
-            }
-            let _: () = msg_send![self.text_input_view, setKeyboardType: kb_type];
-            self.apply_input_configuration();
-            log::info!("GPUI iOS: scheduling becomeFirstResponder");
-
-            // Defer becomeFirstResponder to the next run-loop iteration.
-            let _: () = msg_send![self.text_input_view,
-                performSelector: sel!(becomeFirstResponder),
-                withObject: ptr::null::<AnyObject>(),
-                afterDelay: 0.0_f64
-            ];
-            log::info!("GPUI iOS: show_keyboard_with_type done");
+        let operation = KeyboardOperation::Show(keyboard_type);
+        if self.keyboard_state.lock().pending != Some(operation) {
+            self.schedule_keyboard_operation(operation);
         }
     }
 
     /// Hide the software keyboard.
     ///
-    /// Deferred to the next run-loop iteration (like `show_keyboard_with_type`)
-    /// to avoid re-entering GPUI event dispatch.
+    /// Dispatch is deferred to the main queue.
     pub fn hide_keyboard(&self) {
         if self.closed.get() || self.text_input_view.is_null() {
             return;
         }
         log::info!("GPUI iOS: Hiding keyboard");
+        if self.keyboard_state.lock().pending != Some(KeyboardOperation::Hide) {
+            self.schedule_keyboard_operation(KeyboardOperation::Hide);
+        }
+    }
+
+    fn schedule_keyboard_operation(&self, operation: KeyboardOperation) {
+        let generation = {
+            let mut state = self.keyboard_state.lock();
+            state.generation = state.generation.wrapping_add(1);
+            state.pending = Some(operation);
+            state.requested_visible = matches!(operation, KeyboardOperation::Show(_));
+            state.show_barrier = false;
+            state.generation
+        };
+        if self.handle_id.get() == 0 {
+            self.keyboard_state.lock().pending = None;
+            return;
+        }
+        let request = Box::into_raw(Box::new(DeferredKeyboardRequest {
+            window: self.handle_id.get(),
+            generation,
+            operation,
+        }));
         unsafe {
-            let _: () = msg_send![self.text_input_view,
-                performSelector: sel!(resignFirstResponder),
-                withObject: ptr::null::<AnyObject>(),
-                afterDelay: 0.0_f64
-            ];
+            super::dispatcher::dispatch_async_f(
+                super::dispatcher::dispatch_get_main_queue(),
+                request.cast(),
+                Some(run_deferred_keyboard_request),
+            );
         }
     }
 
@@ -2442,6 +2527,138 @@ impl IosWindowInner {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardShowPlan {
+    Idle,
+    ApplyOnly,
+    Present,
+}
+
+fn keyboard_show_plan(
+    first_responder: bool,
+    visible: bool,
+    type_changed: bool,
+) -> KeyboardShowPlan {
+    if first_responder && visible {
+        if type_changed {
+            KeyboardShowPlan::ApplyOnly
+        } else {
+            KeyboardShowPlan::Idle
+        }
+    } else {
+        KeyboardShowPlan::Present
+    }
+}
+
+fn keyboard_notification_applies(
+    show: bool,
+    requested_visible: bool,
+    pending: Option<KeyboardOperation>,
+    show_barrier: bool,
+) -> bool {
+    if show {
+        requested_visible
+    } else {
+        !(requested_visible
+            && (show_barrier || matches!(pending, Some(KeyboardOperation::Show(_)))))
+    }
+}
+
+unsafe extern "C" fn clear_show_barrier(context: *mut c_void) {
+    let request = unsafe { Box::from_raw(context.cast::<KeyboardBarrierClear>()) };
+    let Some(window) = super::ffi::window_for_handle(request.window) else {
+        return;
+    };
+    let mut state = window.keyboard_state.lock();
+    if state.generation == request.generation
+        && matches!(state.pending, Some(KeyboardOperation::Show(_)))
+    {
+        state.pending = None;
+        state.show_barrier = false;
+    }
+}
+
+unsafe extern "C" fn run_deferred_keyboard_request(context: *mut c_void) {
+    let request = unsafe { Box::from_raw(context.cast::<DeferredKeyboardRequest>()) };
+    let Some(window) = super::ffi::window_for_handle(request.window) else {
+        return;
+    };
+    let current = {
+        let state = window.keyboard_state.lock();
+        !window.closed.get()
+            && state.generation == request.generation
+            && state.pending == Some(request.operation)
+    };
+    if !current {
+        return;
+    }
+    unsafe {
+        if window.text_input_view.is_null() {
+            window.keyboard_state.lock().pending = None;
+            return;
+        }
+        match request.operation {
+            KeyboardOperation::Show(keyboard_type) => {
+                let first_responder: Bool = msg_send![window.text_input_view, isFirstResponder];
+                let type_changed = window.keyboard_type.get() != keyboard_type;
+                let plan = keyboard_show_plan(
+                    first_responder.as_bool(),
+                    window.keyboard_bounds.get().is_some(),
+                    type_changed,
+                );
+                if plan != KeyboardShowPlan::Idle {
+                    if type_changed {
+                        window.keyboard_type.set(keyboard_type);
+                        let _: () = msg_send![window.text_input_view,
+                            setKeyboardType: mobile_events::ios_keyboard_type(keyboard_type)];
+                        window.apply_input_configuration();
+                    } else if !first_responder.as_bool() {
+                        window.apply_input_configuration();
+                    }
+                }
+                if plan == KeyboardShowPlan::Present {
+                    if first_responder.as_bool() && !type_changed {
+                        let _: () = msg_send![window.text_input_view, reloadInputViews];
+                    }
+                    let _: Bool = msg_send![window.text_input_view, becomeFirstResponder];
+                }
+            }
+            KeyboardOperation::Hide => {
+                let _: Bool = msg_send![window.text_input_view, resignFirstResponder];
+            }
+        }
+    }
+    if matches!(request.operation, KeyboardOperation::Show(_)) {
+        let current = {
+            let mut state = window.keyboard_state.lock();
+            if state.generation != request.generation || state.pending != Some(request.operation) {
+                false
+            } else {
+                state.show_barrier = true;
+                true
+            }
+        };
+        if !current {
+            return;
+        }
+        let clear = Box::into_raw(Box::new(KeyboardBarrierClear {
+            window: request.window,
+            generation: request.generation,
+        }));
+        super::dispatcher::dispatch_async_f(
+            super::dispatcher::dispatch_get_main_queue(),
+            clear.cast(),
+            Some(clear_show_barrier),
+        );
+    } else {
+        let mut state = window.keyboard_state.lock();
+        if state.generation == request.generation {
+            state.pending = None;
+            state.show_barrier = false;
+        }
+    }
+}
+
 impl Drop for IosWindow {
     fn drop(&mut self) {
         self.inner.closed.set(true);
@@ -2611,9 +2828,22 @@ impl PlatformWindow for IosWindow {
         if *self.input_configuration.borrow() == configuration {
             return;
         }
+        let keyboard_type = configuration.keyboard_type;
+        self.keyboard_type.set(keyboard_type);
         *self.input_configuration.borrow_mut() = configuration;
         if !self.closed.get() {
+            let native_type = mobile_events::ios_keyboard_type(keyboard_type);
+            unsafe {
+                let _: () = msg_send![self.text_input_view, setKeyboardType: native_type];
+            }
             self.apply_input_configuration();
+            let replace = {
+                let mut state = self.keyboard_state.lock();
+                replace_pending_show(&mut state, keyboard_type)
+            };
+            if replace {
+                self.schedule_keyboard_operation(KeyboardOperation::Show(keyboard_type));
+            }
         }
     }
 
@@ -2877,6 +3107,18 @@ impl PlatformWindow for IosWindow {
         }
     }
 
+    fn show_soft_keyboard(&self) {
+        if !self.closed.get() {
+            self.show_keyboard_with_type(self.keyboard_type.get());
+        }
+    }
+
+    fn hide_soft_keyboard(&self) {
+        if !self.closed.get() {
+            self.hide_keyboard();
+        }
+    }
+
     fn text_input_state_changed(&self, change: gpui::TextInputStateChange) {
         if self.closed.get() {
             return;
@@ -2885,7 +3127,7 @@ impl PlatformWindow for IosWindow {
         // transitions should change UIKit's first responder.
         match change {
             gpui::TextInputStateChange::FocusGained => {
-                self.show_keyboard_with_type(crate::KeyboardType::Default);
+                self.show_keyboard_with_type(self.keyboard_type.get());
             }
             gpui::TextInputStateChange::FocusLost => {
                 if self.proxy_input_session.borrow_mut().set_focus(None) {
@@ -2896,14 +3138,6 @@ impl PlatformWindow for IosWindow {
             gpui::TextInputStateChange::SelectionChanged
             | gpui::TextInputStateChange::ContentChanged => {}
         }
-    }
-
-    fn show_soft_keyboard(&self) {
-        self.show_keyboard_with_type(crate::KeyboardType::Default);
-    }
-
-    fn hide_soft_keyboard(&self) {
-        self.hide_keyboard();
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
@@ -3012,17 +3246,98 @@ fn step_pinch_delta(last: &Cell<Option<f32>>, phase: gpui::TouchPhase, scale: f3
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        appearance_style_changed, edge_attached_keyboard_insets, step_pinch_delta,
-        ProxyInputSession,
-    };
     use std::cell::Cell;
+
+    use super::{
+        appearance_style_changed, edge_attached_keyboard_insets, keyboard_notification_applies,
+        keyboard_show_plan, replace_pending_show, step_pinch_delta, KeyboardOperation,
+        KeyboardShowPlan, KeyboardState, ProxyInputSession,
+    };
 
     #[test]
     fn appearance_callback_requires_a_real_style_transition() {
         assert!(!appearance_style_changed(None, Some(1)));
         assert!(!appearance_style_changed(Some(1), Some(1)));
         assert!(appearance_style_changed(Some(1), Some(2)));
+    }
+
+    #[test]
+    fn repeated_keyboard_requests_preserve_the_active_responder() {
+        assert_eq!(
+            keyboard_show_plan(true, true, false),
+            KeyboardShowPlan::Idle
+        );
+        assert_eq!(
+            keyboard_show_plan(true, true, true),
+            KeyboardShowPlan::ApplyOnly
+        );
+        assert_eq!(
+            keyboard_show_plan(true, false, false),
+            KeyboardShowPlan::Present
+        );
+        assert_eq!(
+            keyboard_show_plan(false, true, false),
+            KeyboardShowPlan::Present
+        );
+    }
+
+    #[test]
+    fn stale_keyboard_notifications_do_not_replace_newer_intent() {
+        assert!(keyboard_notification_applies(
+            true,
+            true,
+            Some(KeyboardOperation::Show(gpui::KeyboardType::Phone)),
+            true
+        ));
+        assert!(!keyboard_notification_applies(
+            false,
+            true,
+            Some(KeyboardOperation::Show(gpui::KeyboardType::Phone)),
+            true
+        ));
+        assert!(!keyboard_notification_applies(
+            true,
+            false,
+            Some(KeyboardOperation::Hide),
+            false
+        ));
+        assert!(!keyboard_notification_applies(false, true, None, true));
+        assert!(keyboard_notification_applies(false, false, None, false));
+    }
+
+    #[test]
+    fn rejected_stale_hide_keeps_the_last_keyboard_height() {
+        let mut keyboard_height = 280.0;
+        let applies = keyboard_notification_applies(
+            false,
+            true,
+            Some(KeyboardOperation::Show(gpui::KeyboardType::EmailAddress)),
+            false,
+        );
+        if applies {
+            keyboard_height = 0.0;
+        }
+        assert_eq!(keyboard_height, 280.0);
+    }
+
+    #[test]
+    fn newer_configuration_replaces_a_pending_show_type() {
+        let mut state = KeyboardState {
+            pending: Some(KeyboardOperation::Show(gpui::KeyboardType::Phone)),
+            ..Default::default()
+        };
+        assert!(replace_pending_show(
+            &mut state,
+            gpui::KeyboardType::EmailAddress
+        ));
+        assert_eq!(
+            state.pending,
+            Some(KeyboardOperation::Show(gpui::KeyboardType::EmailAddress))
+        );
+
+        state.pending = Some(KeyboardOperation::Hide);
+        assert!(!replace_pending_show(&mut state, gpui::KeyboardType::Phone));
+        assert_eq!(state.pending, Some(KeyboardOperation::Hide));
     }
 
     #[test]

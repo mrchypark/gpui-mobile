@@ -10,8 +10,10 @@ use crate::platform_view::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(all(target_os = "ios", any(feature = "video_player", feature = "camera")))]
+use objc2::runtime::AnyClass;
 #[cfg(target_os = "ios")]
-use objc2::runtime::{AnyClass, AnyObject};
+use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 
 #[cfg(target_os = "ios")]
@@ -197,11 +199,17 @@ impl IosPlatformView {
             );
 
             let view: *mut AnyObject = match view_type {
+                #[cfg(feature = "video_player")]
                 "video_player" => Self::create_video_player_view(frame, params)?,
+                #[cfg(not(feature = "video_player"))]
+                "video_player" => return Err("video_player feature is not enabled".into()),
                 "webview" => Self::create_webview_view(frame, params)?,
                 #[cfg(feature = "maps")]
                 "map" => crate::packages::maps::ios::create(frame, params)?,
+                #[cfg(feature = "camera")]
                 "camera_preview" => Self::create_camera_preview_view(frame, params)?,
+                #[cfg(not(feature = "camera"))]
+                "camera_preview" => return Err("camera feature is not enabled".into()),
                 _ => Self::create_generic_view(frame)?,
             };
 
@@ -240,7 +248,7 @@ impl IosPlatformView {
     }
 
     /// Create a UIView with an AVPlayerLayer for video playback.
-    #[cfg(target_os = "ios")]
+    #[cfg(all(target_os = "ios", feature = "video_player"))]
     unsafe fn create_video_player_view(
         frame: ObjcCGRect,
         params: &PlatformViewParams,
@@ -262,6 +270,7 @@ impl IosPlatformView {
         Self::create_video_layer_container(frame, player_layer)
     }
 
+    #[cfg(feature = "video_player")]
     unsafe fn create_video_layer_container(
         frame: ObjcCGRect,
         player_layer: *mut AnyObject,
@@ -287,14 +296,17 @@ impl IosPlatformView {
         Ok(objc2::rc::Retained::into_raw(view))
     }
 
+    #[cfg(all(target_os = "ios", feature = "video_player"))]
     unsafe fn resize_video_layers(view: *mut AnyObject) {
         Self::resize_sublayers_of_class(view, class!(AVPlayerLayer));
     }
 
+    #[cfg(all(target_os = "ios", feature = "camera"))]
     unsafe fn resize_camera_preview_layers(view: *mut AnyObject) {
         Self::resize_sublayers_of_class(view, class!(AVCaptureVideoPreviewLayer));
     }
 
+    #[cfg(any(feature = "video_player", feature = "camera"))]
     unsafe fn resize_sublayers_of_class(view: *mut AnyObject, class: &AnyClass) {
         let bounds: ObjcCGRect = msg_send![view, bounds];
         let local = ObjcCGRect::new(0.0, 0.0, bounds.width, bounds.height);
@@ -399,7 +411,7 @@ impl IosPlatformView {
     }
 
     /// Create a UIView with AVCaptureVideoPreviewLayer for camera preview.
-    #[cfg(target_os = "ios")]
+    #[cfg(all(target_os = "ios", feature = "camera"))]
     unsafe fn create_camera_preview_view(
         frame: ObjcCGRect,
         params: &PlatformViewParams,
@@ -504,9 +516,12 @@ impl IosPlatformView {
                     bounds.height as f64,
                 );
                 let _: () = msg_send![view, setFrame: frame];
+                #[cfg(feature = "video_player")]
                 if self.view_type == "video_player" {
                     Self::resize_video_layers(view);
-                } else if self.view_type == "camera_preview" {
+                }
+                #[cfg(feature = "camera")]
+                if self.view_type == "camera_preview" {
                     Self::resize_camera_preview_layers(view);
                 }
             }
@@ -645,6 +660,7 @@ impl PlatformViewFactory for IosPlatformViewFactory {
 mod attachment_tests {
     use super::*;
 
+    #[cfg(feature = "video_player")]
     #[test]
     fn video_creation_rejects_missing_invalid_and_absent_players_and_nil_layer() {
         on_main(|| unsafe {
@@ -674,6 +690,7 @@ mod attachment_tests {
         });
     }
 
+    #[cfg(feature = "video_player")]
     #[test]
     fn video_layer_retains_player_and_tracks_local_bounds() {
         on_main(|| {
@@ -749,6 +766,7 @@ mod attachment_tests {
         });
     }
 
+    #[cfg(feature = "camera")]
     #[test]
     fn camera_preview_layer_is_owned_by_container_and_tracks_local_bounds() {
         on_main(|| {
@@ -778,6 +796,7 @@ mod attachment_tests {
         });
     }
 
+    #[cfg(feature = "camera")]
     #[test]
     fn camera_preview_rejects_missing_invalid_and_disposed_sessions() {
         on_main(|| unsafe {

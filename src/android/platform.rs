@@ -38,7 +38,7 @@ use gpui_wgpu::CosmicTextSystem;
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -426,6 +426,166 @@ fn font_has_cbdt_tables(data: &[u8]) -> bool {
     false
 }
 
+/// Script families needed by ISO 639-1 autonyms that Roboto and CJK do not cover.
+/// Alternative names cover Android releases that ship a different Noto family.
+const ANDROID_SCRIPT_FONT_GROUPS: &[&[&str]] = &[
+    &["NotoSansArabic", "NotoNaskhArabic"],
+    &["NotoSansArmenian"],
+    &["NotoSansBengali"],
+    &["NotoSansCanadianAboriginal"],
+    &["NotoSansDevanagari"],
+    &["NotoSansEthiopic"],
+    &["NotoSansGeorgian"],
+    &["NotoSansGujarati"],
+    &["NotoSansGurmukhi"],
+    &["NotoSansKannada"],
+    &["NotoSansKhmer", "NotoSansKhmerUI"],
+    &["NotoSansLao"],
+    &["NotoSansMalayalam"],
+    &["NotoSansMyanmar", "NotoSansMyanmarUI"],
+    &["NotoSansOriya"],
+    &["NotoSansSinhala"],
+    &["NotoSansTamil"],
+    &["NotoSansTelugu"],
+    &["NotoSansThaana"],
+    &["NotoSansTibetan", "NotoSerifTibetan"],
+    &["NotoSansYi"],
+];
+/// Earlier directories break otherwise equal ties. Face quality comes first.
+const ANDROID_FONT_DIRECTORIES: &[&str] = &["/product/fonts", "/system/fonts"];
+
+/// Rank a candidate by script group, face preference, and family fallback.
+fn script_font_rank(file_name: &str) -> Option<(usize, usize, u8)> {
+    let (stem, extension) = file_name.rsplit_once('.')?;
+    if !matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "ttf" | "otf" | "ttc"
+    ) {
+        return None;
+    }
+
+    for (group_index, families) in ANDROID_SCRIPT_FONT_GROUPS.iter().enumerate() {
+        for (family_index, family) in families.iter().enumerate() {
+            let Some(suffix) = stem.strip_prefix(family) else {
+                continue;
+            };
+            if let Some(face_rank) = script_face_rank(suffix) {
+                return Some((group_index, family_index, face_rank));
+            }
+        }
+    }
+    None
+}
+
+fn script_face_rank(suffix: &str) -> Option<u8> {
+    if suffix.is_empty() {
+        return Some(0);
+    }
+    if suffix.starts_with('[') {
+        let axes = suffix.strip_prefix('[')?.strip_suffix(']')?;
+        let valid = !axes.is_empty()
+            && axes.split(',').all(|axis| {
+                axis.len() == 4 && axis.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            });
+        return valid.then_some(1);
+    }
+
+    let descriptor = suffix
+        .strip_prefix('-')
+        .or_else(|| suffix.strip_prefix('_'))?;
+    match descriptor {
+        "Regular" => Some(0),
+        "VF" => Some(1),
+        "Medium" => Some(2),
+        _ if descriptor
+            .split(|character| character == '-' || character == '_')
+            .all(is_static_face_word) =>
+        {
+            Some(3)
+        }
+        _ => None,
+    }
+}
+
+fn is_static_face_word(word: &str) -> bool {
+    matches!(
+        word,
+        "Bold"
+            | "Italic"
+            | "BoldItalic"
+            | "Light"
+            | "ExtraLight"
+            | "SemiBold"
+            | "ExtraBold"
+            | "Black"
+            | "Thin"
+            | "Oblique"
+            | "Condensed"
+            | "SemiCondensed"
+            | "ExtraCondensed"
+            | "SemiExpanded"
+            | "Expanded"
+            | "ExtraExpanded"
+    )
+}
+
+/// Pick one font face for each script family. Android uses several file naming
+/// conventions across releases, and some devices omit individual families.
+fn select_script_fallback_fonts(
+    entries: impl IntoIterator<Item = (String, u8, PathBuf)>,
+) -> Vec<PathBuf> {
+    let mut selected: Vec<Option<(u8, usize, u8, String, PathBuf)>> =
+        vec![None; ANDROID_SCRIPT_FONT_GROUPS.len()];
+
+    for (name, directory_priority, path) in entries {
+        let Some((group, family, face_rank)) = script_font_rank(&name) else {
+            continue;
+        };
+        let replace = match &selected[group] {
+            None => true,
+            Some((best_priority, best_family, best_face, best_name, _)) => {
+                (face_rank, family, directory_priority, name.as_str())
+                    < (*best_face, *best_family, *best_priority, best_name.as_str())
+            }
+        };
+        if replace {
+            selected[group] = Some((directory_priority, family, face_rank, name, path));
+        }
+    }
+
+    selected
+        .into_iter()
+        .flatten()
+        .map(|(_, _, _, _, path)| path)
+        .collect()
+}
+
+fn script_font_entries(directory: &Path, directory_priority: u8) -> Vec<(String, u8, PathBuf)> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::debug!(
+                "could not scan {} for script fonts: {error}",
+                directory.display()
+            );
+            return Vec::new();
+        }
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            Some((name, directory_priority, entry.path()))
+        })
+        .collect()
+}
+
+fn android_script_font_paths() -> Vec<PathBuf> {
+    select_script_fallback_fonts(ANDROID_FONT_DIRECTORIES.iter().enumerate().flat_map(
+        |(priority, directory)| script_font_entries(Path::new(directory), priority as u8),
+    ))
+}
+
 /// Load a file from the Android APK assets directory via the NDK
 /// `AAssetManager`.
 ///
@@ -483,7 +643,7 @@ impl AndroidPlatform {
         // Android ships Roboto and DroidSans in /system/fonts/.  We load them
         // explicitly because cosmic-text's fontdb may not scan Android paths.
         {
-            let font_paths: &[&str] = &[
+            let mut font_paths: Vec<PathBuf> = [
                 // Core UI fonts
                 "/system/fonts/Roboto-Regular.ttf",
                 "/system/fonts/Roboto-Bold.ttf",
@@ -504,8 +664,6 @@ impl AndroidPlatform {
                 "/system/fonts/NotoSans-Italic.ttf",
                 "/system/fonts/NotoSans-BoldItalic.ttf",
                 "/system/fonts/NotoSansCJK-Regular.ttc",
-                "/system/fonts/NotoSansDevanagari-Regular.otf",
-                "/system/fonts/NotoSansArabic-Regular.ttf",
                 "/system/fonts/NotoSansHebrew-Regular.ttf",
                 "/system/fonts/NotoSansThai-Regular.ttf",
                 // Emoji fonts — loaded so glyphs like 🦀 ✅ ❤️ render.
@@ -517,16 +675,29 @@ impl AndroidPlatform {
                 // Serif (fallback)
                 "/system/fonts/NotoSerif-Regular.ttf",
                 "/system/fonts/NotoSerif-Bold.ttf",
-            ];
+            ]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+            font_paths.extend(android_script_font_paths());
+
             let mut font_data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
+            let mut seen = HashSet::new();
             for path in font_paths {
-                match std::fs::read(path) {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                match std::fs::read(&path) {
                     Ok(bytes) => {
-                        log::info!("loaded system font: {path} ({} bytes)", bytes.len());
+                        log::info!(
+                            "loaded system font: {} ({} bytes)",
+                            path.display(),
+                            bytes.len()
+                        );
                         font_data.push(std::borrow::Cow::Owned(bytes));
                     }
                     Err(e) => {
-                        log::debug!("skipping system font {path}: {e}");
+                        log::debug!("skipping system font {}: {e}", path.display());
                     }
                 }
             }
@@ -1484,7 +1655,8 @@ impl Platform for AndroidPlatform {
         window.set_gpui_handle(handle);
         Ok(Box::new(super::window::AndroidPlatformWindow::new(
             window, display,
-        )))
+        )
+        .with_dispatcher(self.background_executor())))
     }
 
     fn window_appearance(&self) -> WindowAppearance {
@@ -2176,6 +2348,159 @@ mod tests {
         assert!(!font_has_cbdt_tables(&font[..27]));
         font[12..16].copy_from_slice(b"COLR");
         assert!(!font_has_cbdt_tables(&font));
+    }
+
+    #[test]
+    fn script_fallback_fonts_tolerate_variants_and_choose_one_face_per_script() {
+        let system = |name: &str| {
+            (
+                name.to_owned(),
+                1,
+                PathBuf::from("/system/fonts").join(name),
+            )
+        };
+        let product = |name: &str| {
+            (
+                name.to_owned(),
+                0,
+                PathBuf::from("/product/fonts").join(name),
+            )
+        };
+        let selected = select_script_fallback_fonts([
+            system("NotoSansArabic-Bold.ttf"),
+            system("NotoNaskhArabic-Regular.ttf"),
+            system("NotoSansEthiopic-VF.ttf"),
+            system("NotoSansEthiopic-Regular.otf"),
+            system("NotoSansGeorgian-VF.ttf"),
+            system("NotoSansKhmer-Bold.ttf"),
+            system("NotoSansKhmerUI-Regular.ttf"),
+            system("NotoSansKhmerUI-VF.ttf"),
+            system("NotoSansKhmerSupplement-Regular.ttf"),
+            system("NotoSansKhmerSupplement[wdth,wght].ttf"),
+            product("NotoSansKhmer-Supplement-Regular.ttf"),
+            product("NotoSansKhmer-Supplement[wdth,wght].ttf"),
+            system("NotoSansKhmer_Supplement-VF.ttf"),
+            system("NotoSansKhmer-Regular.ttf"),
+            system("Roboto-Regular.ttf"),
+        ]);
+
+        let names: Vec<_> = selected
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "NotoNaskhArabic-Regular.ttf",
+                "NotoSansEthiopic-Regular.otf",
+                "NotoSansGeorgian-VF.ttf",
+                "NotoSansKhmer-Regular.ttf",
+            ]
+        );
+    }
+
+    #[test]
+    fn aosp_ui_only_script_fonts_are_selected() {
+        let system = |name: &str| {
+            (
+                name.to_owned(),
+                1,
+                PathBuf::from("/system/fonts").join(name),
+            )
+        };
+        let selected = select_script_fallback_fonts([
+            system("NotoSansKhmerUI-Bold.ttf"),
+            system("NotoSansKhmerUI-Regular.ttf"),
+            system("NotoSansMyanmarUI-Bold.otf"),
+            system("NotoSansMyanmarUI-Regular.otf"),
+        ]);
+        let names: Vec<_> = selected
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "NotoSansKhmerUI-Regular.ttf",
+                "NotoSansMyanmarUI-Regular.otf",
+            ]
+        );
+    }
+
+    #[test]
+    fn face_quality_precedes_directory_and_directory_breaks_equal_ties() {
+        let product_bold = (
+            "NotoSansKhmer-Bold.ttf".to_owned(),
+            0,
+            PathBuf::from("/product/fonts/NotoSansKhmer-Bold.ttf"),
+        );
+        let system_regular = (
+            "NotoSansKhmer-Regular.ttf".to_owned(),
+            1,
+            PathBuf::from("/system/fonts/NotoSansKhmer-Regular.ttf"),
+        );
+        for entries in [
+            vec![system_regular.clone(), product_bold.clone()],
+            vec![product_bold, system_regular.clone()],
+        ] {
+            assert_eq!(
+                select_script_fallback_fonts(entries),
+                [system_regular.2.clone()]
+            );
+        }
+
+        let product_regular = (
+            "NotoSansKhmer-Regular.ttf".to_owned(),
+            0,
+            PathBuf::from("/product/fonts/NotoSansKhmer-Regular.ttf"),
+        );
+        for entries in [
+            vec![system_regular.clone(), product_regular.clone()],
+            vec![product_regular.clone(), system_regular],
+        ] {
+            assert_eq!(
+                select_script_fallback_fonts(entries),
+                [product_regular.2.clone()]
+            );
+        }
+
+        let combined_axes = (
+            "NotoSansEthiopic[wdth,wght].ttf".to_owned(),
+            1,
+            PathBuf::from("/system/fonts/NotoSansEthiopic[wdth,wght].ttf"),
+        );
+        let selected = select_script_fallback_fonts([
+            (
+                "NotoSansEthiopic-Bold.ttf".to_owned(),
+                1,
+                PathBuf::from("/system/fonts/NotoSansEthiopic-Bold.ttf"),
+            ),
+            combined_axes.clone(),
+            (
+                "NotoSansEthiopic[bad].ttf".to_owned(),
+                1,
+                PathBuf::from("/system/fonts/NotoSansEthiopic[bad].ttf"),
+            ),
+        ]);
+        assert_eq!(selected, [combined_axes.2]);
+    }
+
+    #[test]
+    fn every_language_script_accepts_regular_and_variable_font_names() {
+        for families in ANDROID_SCRIPT_FONT_GROUPS {
+            for family in *families {
+                for suffix in ["-Regular.ttf", "-VF.otf"] {
+                    let name = format!("{family}{suffix}");
+                    let path = PathBuf::from("/system/fonts").join(&name);
+                    assert_eq!(
+                        select_script_fallback_fonts([(name.clone(), 1, path.clone())]),
+                        [path],
+                        "{name}"
+                    );
+                }
+            }
+        }
+        assert!(script_font_entries(Path::new("/ely-fonts-do-not-exist"), 1).is_empty());
     }
 
     #[test]

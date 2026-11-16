@@ -2233,6 +2233,29 @@ impl PlatformInputHandler {
         })
     }
 
+    /// Returns the selected endpoint in window coordinates, including during composition.
+    pub(crate) fn caret_bounds_in_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        let selection = self.handler.selected_text_range(true, window, cx)?;
+        let offset = if selection.reversed {
+            selection.range.start
+        } else {
+            selection.range.end
+        };
+        self.handler.bounds_for_range(offset..offset, window, cx)
+    }
+
+    pub(crate) fn element_bounds_in_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.handler.element_bounds(window, cx)
+    }
+
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
         let marked_range = self.marked_text_range();
         let selection = self.selected_text_range(true)?;
@@ -2557,10 +2580,14 @@ pub trait InputHandler: 'static {
 /// input-session attributes (on web, DOM attributes of the hidden editable
 /// element such as `autocorrect` and `enterkeyhint`).
 ///
-/// The default disables all text assistance and requests no particular action
-/// key presentation.
+/// The default requests the standard text keyboard, disables all text
+/// assistance, and requests no particular action-key presentation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TextInputConfiguration {
+    /// The software keyboard to present when this text region gains focus.
+    pub keyboard_type: KeyboardType,
+    /// Whether native text services must protect this text as a password.
+    pub secure: bool,
     /// Whether the platform may automatically correct entered text.
     pub autocorrect: bool,
     /// How software keyboards automatically capitalize entered text.
@@ -2569,6 +2596,31 @@ pub struct TextInputConfiguration {
     pub suggestions: bool,
     /// The action advertised on a software keyboard's confirm ("enter") key.
     pub input_action: TextInputAction,
+}
+
+/// The kind of software keyboard to present for a focused text region.
+///
+/// Platforms treat this as a hint. Text validation remains the caller's
+/// responsibility because an input method may ignore or extend the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardType {
+    /// Standard text keyboard.
+    #[default]
+    Default,
+    /// Keyboard optimized for email addresses.
+    EmailAddress,
+    /// Phone number pad.
+    Phone,
+    /// Numeric keypad without a decimal separator or sign.
+    NumberPad,
+    /// Keyboard optimized for URL entry.
+    URL,
+    /// Numeric keypad with a decimal separator.
+    Decimal,
+    /// Numeric keypad with a sign.
+    SignedNumber,
+    /// Numeric keypad with a decimal separator and a sign.
+    SignedDecimal,
 }
 
 /// Automatic capitalization applied by software keyboards.

@@ -337,14 +337,7 @@ impl Platform for IosPlatform {
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
         #[cfg(feature = "file_selector")]
-        self.foreground_executor()
-            .spawn(async move {
-                let _ = tx.send(
-                    crate::packages::file_selector::prompt_paths(options)
-                        .map_err(anyhow::Error::msg),
-                );
-            })
-            .detach();
+        crate::packages::file_selector::prompt_paths_nonblocking(options, tx);
         #[cfg(not(feature = "file_selector"))]
         {
             let _ = options;

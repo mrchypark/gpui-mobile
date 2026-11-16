@@ -8,9 +8,11 @@
 //!
 //! Feature-gated behind `file_selector`.
 //!
-//! iOS picker calls must run on the main thread and service its run loop until
-//! completion; overlapping presentations return an error. Android calls must
-//! run off the UI thread. iOS file selections are imported copies.
+//! Synchronous iOS picker calls must run on the main thread and service its run
+//! loop until completion. The internal GPUI bridge starts the picker on a main
+//! queue turn and completes asynchronously. Overlapping presentations return an
+//! error. Android calls must run off the UI thread. iOS file selections are
+//! imported copies.
 
 #[cfg(target_os = "android")]
 mod android;
@@ -331,6 +333,160 @@ pub(crate) fn prompt_paths(
     Ok(Some(paths))
 }
 
+#[cfg(any(target_os = "ios", test))]
+fn discard_import_paths(paths: &[std::path::PathBuf]) {
+    #[cfg(target_os = "ios")]
+    ios::discard_paths(paths);
+    #[cfg(not(target_os = "ios"))]
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+type PromptSender =
+    futures::channel::oneshot::Sender<gpui::Result<Option<Vec<std::path::PathBuf>>>>;
+
+#[cfg(target_os = "ios")]
+struct QueuedPathPrompt {
+    multiple: bool,
+    sender: PromptSender,
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn finish_async_prompt(
+    sender: &std::sync::Arc<std::sync::Mutex<Option<PromptSender>>>,
+    result: Result<Option<Vec<std::path::PathBuf>>, String>,
+) {
+    let sender = sender.lock().ok().and_then(|mut sender| sender.take());
+    if let Some(sender) = sender {
+        let result = result.map_err(anyhow::Error::msg);
+        if let Err(result) = sender.send(result) {
+            if let Ok(Some(paths)) = result {
+                discard_import_paths(&paths);
+            }
+        }
+    } else {
+        if let Ok(Some(paths)) = result {
+            discard_import_paths(&paths);
+        }
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn prompt_receiver_closed<T>(
+    sender: &std::sync::Arc<std::sync::Mutex<Option<futures::channel::oneshot::Sender<T>>>>,
+) -> bool {
+    sender
+        .lock()
+        .ok()
+        .and_then(|sender| sender.as_ref().map(|sender| sender.is_canceled()))
+        .unwrap_or(true)
+}
+
+#[cfg(target_os = "ios")]
+unsafe extern "C" fn start_async_prompt(context: *mut std::ffi::c_void) {
+    let queued = Box::from_raw(context.cast::<QueuedPathPrompt>());
+    let QueuedPathPrompt { multiple, sender } = *queued;
+    if sender.is_canceled() {
+        return;
+    }
+    let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+    let callback_sender = sender.clone();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let session = match ios::begin_prompt(&OpenFileOptions::default(), multiple) {
+            Ok(session) => session,
+            Err(error) => {
+                finish_async_prompt(&callback_sender, Err(error));
+                return;
+            }
+        };
+        if prompt_receiver_closed(&callback_sender) {
+            session.cancel("Document picker request was dropped".into());
+            return;
+        }
+        let session_owner = std::sync::Arc::new(std::sync::Mutex::new(Some(session)));
+        let worker_session = session_owner.clone();
+        let worker_sender = callback_sender.clone();
+        let worker = std::thread::Builder::new()
+            .name("gpui-document-picker".into())
+            .spawn(move || {
+                let session = worker_session
+                    .lock()
+                    .ok()
+                    .and_then(|mut session| session.take());
+                let Some(session) = session else {
+                    finish_async_prompt(
+                        &worker_sender,
+                        Err("Document picker session ownership was lost".into()),
+                    );
+                    return;
+                };
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match session.wait_cancellable(|| prompt_receiver_closed(&worker_sender)) {
+                            ios::PromptWaitResult::Complete(result) => {
+                                Some(result.map(|paths| (!paths.is_empty()).then_some(paths)))
+                            }
+                            ios::PromptWaitResult::Cancelled => None,
+                        }
+                    }))
+                    .unwrap_or_else(|_| Some(Err("Document picker worker panicked".into())));
+                if let Some(result) = result {
+                    finish_async_prompt(&worker_sender, result);
+                }
+            });
+        if let Err(error) = worker {
+            if let Some(session) = session_owner
+                .lock()
+                .ok()
+                .and_then(|mut session| session.take())
+            {
+                session.cancel(format!("Start document picker worker: {error}"));
+            }
+            finish_async_prompt(
+                &callback_sender,
+                Err(format!("Start document picker worker: {error}")),
+            );
+        }
+    }));
+    if outcome.is_err() {
+        finish_async_prompt(&sender, Err("Document picker startup panicked".into()));
+    }
+}
+
+/// Start an iOS picker from a normal main-run-loop turn and complete the GPUI
+/// receiver directly. The synchronous public API remains available for callers
+/// that require it.
+#[cfg(target_os = "ios")]
+pub(crate) fn prompt_paths_nonblocking(options: gpui::PathPromptOptions, sender: PromptSender) {
+    if !options.files || options.directories {
+        let _ = sender.send(Err(anyhow::Error::msg(
+            "Mobile GPUI path prompts support files only; directory grants are not filesystem paths",
+        )));
+        return;
+    }
+    let queued = Box::new(QueuedPathPrompt {
+        multiple: options.multiple,
+        sender,
+    });
+    unsafe {
+        crate::ios::dispatch_async_f(
+            crate::ios::dispatch_get_main_queue(),
+            Box::into_raw(queued).cast(),
+            Some(start_async_prompt),
+        );
+    }
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) fn discard_paths(paths: &[std::path::PathBuf]) {
+    discard_import_paths(paths);
+}
+
 pub(crate) fn prompt_new_path(
     _directory: &std::path::Path,
     _suggested_name: Option<&str>,
@@ -393,5 +549,62 @@ mod tests {
         assert!(validate_directory_path(&root.join("missing")).is_err());
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dropping_unconsumed_prompt_result_removes_imports() {
+        let root = std::env::temp_dir().join(format!(
+            "gpui-async-prompt-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("import.txt");
+        std::fs::write(&file, "owned").unwrap();
+
+        let (sender, receiver) =
+            futures::channel::oneshot::channel::<gpui::Result<Option<Vec<std::path::PathBuf>>>>();
+        drop(receiver);
+        let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+        finish_async_prompt(&sender, Ok(Some(vec![file])));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn receiver_drop_is_visible_before_picker_start() {
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+        assert!(!prompt_receiver_closed(&sender));
+        drop(receiver);
+        assert!(prompt_receiver_closed(&sender));
+    }
+
+    #[test]
+    fn live_prompt_receiver_receives_the_import() {
+        let root = std::env::temp_dir().join(format!(
+            "gpui-direct-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("import.txt");
+        std::fs::write(&file, "owned").unwrap();
+
+        let (sender, mut receiver) =
+            futures::channel::oneshot::channel::<gpui::Result<Option<Vec<std::path::PathBuf>>>>();
+        let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+        finish_async_prompt(&sender, Ok(Some(vec![file.clone()])));
+
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap().unwrap(),
+            Some(vec![file])
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1291,6 +1291,7 @@ pub struct Window {
     /// input session can restart the IME connection).
     last_text_input_configuration: Option<TextInputConfiguration>,
     focused_text_input: Option<FocusId>,
+    focused_input_geometry: Option<(FocusId, u64, Option<Bounds<Pixels>>, Option<Bounds<Pixels>>, Bounds<Pixels>)>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
@@ -1298,6 +1299,7 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    after_paint_callbacks: Vec<FrameCallback>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SingleSubscriberSet<AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SingleSubscriberSet<AnyObserver>,
@@ -2421,9 +2423,11 @@ impl Window {
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input: None,
+            focused_input_geometry: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            after_paint_callbacks: Vec::new(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2970,6 +2974,18 @@ impl Window {
         self.invalidator.wake_platform();
     }
 
+    /// Run once after the next draw has completed and its window update has ended.
+    /// Forces a draw even if the window was idle. If the window closes first,
+    /// the callback is dropped. This does not guarantee presentation on screen.
+    /// Runs after the current chain of application effects has drained. Geometry
+    /// can still be unavailable if another invalidation is pending.
+    pub fn after_next_paint(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
+        self.on_next_frame(move |window, _| {
+            window.after_paint_callbacks.push(Box::new(callback));
+            window.refresh();
+        });
+    }
+
     /// Schedule a frame to be drawn on the next animation frame.
     ///
     /// This is useful for elements that need to animate continuously, such as a video player or an animated GIF.
@@ -3202,6 +3218,28 @@ impl Window {
     /// Returns the size of the drawable area within the window.
     pub fn viewport_size(&self) -> Size<Pixels> {
         self.viewport_size
+    }
+
+    /// Snapshot of the focused input and caret bounds in window coordinates from
+    /// the most recently completed paint. Returns None if the current focus has
+    /// not been painted, including when focus leaves and returns before a paint.
+    /// Either bound can be unavailable for a platform input handler.
+    ///
+    /// Returns None while a processed invalidation awaits paint, during drawing,
+    /// or when the current visible bounds differ from those of the painted frame.
+    /// This is not a live layout query: callers must let GPUI process pending
+    /// application notifications before relying on the result. `on_next_frame`
+    /// callbacks run before the next draw and may therefore observe None.
+    pub fn focused_text_input_geometry(
+        &self,
+    ) -> Option<(Option<Bounds<Pixels>>, Option<Bounds<Pixels>>)> {
+        let (focus, generation, element, caret, visible) = self.focused_input_geometry?;
+        (self.invalidator.not_drawing()
+            && !self.invalidator.is_dirty()
+            && self.focus == Some(focus)
+            && self.focus_generation == generation
+            && self.fully_visible_bounds() == visible)
+            .then_some((element, caret))
     }
 
     /// Returns the platform's visible viewport in window-local logical pixels.
@@ -3764,6 +3802,7 @@ impl Window {
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
+        let mut next_focused_input_geometry = None;
         let focused_text_input = if let Some(mut input_handler) = self
             .next_frame
             .input_handlers
@@ -3772,6 +3811,16 @@ impl Window {
             .find_map(|h| h.take())
         {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
+            if accepts_text_input && input_handler.focus_id() == self.focus {
+                if let Some(focus) = self.focus {
+                    let generation = self.focus_generation;
+                    let element = input_handler.element_bounds_in_window(self, cx);
+                    let caret = input_handler.caret_bounds_in_window(self, cx);
+                    if self.focus == Some(focus) && self.focus_generation == generation {
+                        next_focused_input_geometry = Some((focus, generation, element, caret));
+                    }
+                }
+            }
             crate::fast::retained::note_installed_input_handler(self, &input_handler);
             self.platform_window.set_input_handler(input_handler);
             self.focus.filter(|_| accepts_text_input)
@@ -3800,6 +3849,9 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.focused_input_geometry = next_focused_input_geometry.map(|(focus, generation, element, caret)| {
+            (focus, generation, element, caret, self.fully_visible_bounds())
+        });
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -3862,6 +3914,15 @@ impl Window {
                 .window_profiler
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
             self.debug_frame_overlay.record_frame(draw_duration);
+        }
+
+        for callback in mem::take(&mut self.after_paint_callbacks) {
+            let handle = self.handle;
+            cx.after_effects(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    callback(window, cx);
+                });
+            });
         }
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
@@ -5828,6 +5889,24 @@ impl Window {
                 listener(event, window, cx)
             },
         ));
+    }
+
+    /// Observe changes of the focused leaf between painted frames.
+    /// Focus changes that return to the same leaf before a frame are coalesced.
+    pub fn on_focus_changed(
+        &mut self,
+        cx: &mut App,
+        mut listener: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) =
+            self.new_focus_listener(Box::new(move |event, window, cx| {
+                if event.previous_focus_path.last() != event.current_focus_path.last() {
+                    listener(window, cx);
+                }
+                true
+            }));
+        cx.defer(move |_| activate());
+        subscription
     }
 
     /// Register a listener to be called when the given focus handle or one of its descendants receives focus.

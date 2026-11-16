@@ -907,6 +907,7 @@ pub struct App {
     pub(crate) global_action_listeners:
         TypeIdHashMap<Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
     pending_effects: VecDeque<Effect>,
+    after_effects_callbacks: VecDeque<Box<dyn FnOnce(&mut App)>>,
 
     pub(crate) observers: SubscriberSet<EntityId, Handler>,
     pub(crate) event_listeners: SubscriberSet<EntityId, (TypeId, Listener)>,
@@ -1053,6 +1054,7 @@ impl App {
                 keyboard_mapper,
                 global_action_listeners: Default::default(),
                 pending_effects: VecDeque::new(),
+                after_effects_callbacks: VecDeque::new(),
                 pending_notifications: FxHashSet::default(),
                 pending_global_notifications: Default::default(),
                 dependencies: crate::fast::dependencies::AppDependencies::default(),
@@ -2195,6 +2197,10 @@ impl App {
                 }
 
                 if self.pending_effects.is_empty() {
+                    if let Some(callback) = self.after_effects_callbacks.pop_front() {
+                        callback(self);
+                        continue;
+                    }
                     for window in self.windows.values().filter_map(|window| window.as_deref()) {
                         if window.invalidator.is_dirty()
                             || window.needs_present.get()
@@ -2488,6 +2494,10 @@ impl App {
         self.push_effect(Effect::Defer {
             callback: Box::new(f),
         });
+    }
+
+    pub(crate) fn after_effects(&mut self, f: impl FnOnce(&mut App) + 'static) {
+        self.after_effects_callbacks.push_back(Box::new(f));
     }
 
     /// Accessor for the application's asset source, which is provided when constructing the `App`.

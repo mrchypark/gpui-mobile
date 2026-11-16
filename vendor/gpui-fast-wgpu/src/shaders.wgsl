@@ -1064,8 +1064,7 @@ struct PathRasterizationVarying {
     @location(3) clip_distances: vec4<f32>,
 }
 
-@vertex
-fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasterizationVarying {
+fn path_rasterization_vertex(vertex_id: u32) -> PathRasterizationVarying {
     let v = load_path_vertex(vertex_id);
 
     var out = PathRasterizationVarying();
@@ -1074,6 +1073,20 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     out.vertex_id = vertex_id;
     out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
     return out;
+}
+
+@vertex
+fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasterizationVarying {
+    return path_rasterization_vertex(vertex_id);
+}
+
+// Android GL can fail to rasterize draws with a nonzero first vertex.
+@vertex
+fn vs_path_rasterization_rebased(
+    @builtin(vertex_index) local_vertex: u32,
+    @builtin(instance_index) vertex_base: u32,
+) -> PathRasterizationVarying {
+    return path_rasterization_vertex(vertex_base + local_vertex);
 }
 
 @fragment

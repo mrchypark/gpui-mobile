@@ -201,6 +201,7 @@ struct InstanceBinding {
 pub(crate) struct PathUpload {
     vertices: InstanceBinding,
     sprites: InstanceBinding,
+    rebased_vertex_count: Option<u32>,
 }
 
 /// A scene the frame draws, with its paths planned.
@@ -428,6 +429,26 @@ fn close_group(group: &mut [PathBatch]) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_REBASED_PATHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn rebased_path_draw(vertices: Range<u32>, vertex_count: u32) -> Result<(Range<u32>, Range<u32>)> {
+    anyhow::ensure!(
+        vertices.start < vertices.end && vertices.end <= vertex_count,
+        "invalid path rasterization vertex range"
+    );
+    let instance_end = vertices
+        .start
+        .checked_add(1)
+        .context("path vertex base overflow")?;
+    Ok((
+        0..(vertices.end - vertices.start),
+        vertices.start..instance_end,
+    ))
+}
+
 /// Writes every scene's instance data. Storage arrays share one staging
 /// buffer; WebGL arrays start on both a texel boundary and a whole record,
 /// so its shaders can index them absolutely through the instance texture.
@@ -460,6 +481,38 @@ fn upload(
     let alignment = host.instance_data_alignment();
     let texture_transport = matches!(host.target()?.instance_data, InstanceSource::Texture(_));
     let requires_path_vertex_decoder = host.requires_path_vertex_decoder() && !texture_transport;
+    let use_rebased = {
+        let available = host
+            .target()?
+            .pipelines
+            .path_rasterization_rebased
+            .is_some();
+        #[cfg(target_os = "android")]
+        let enabled = available;
+        #[cfg(not(target_os = "android"))]
+        let enabled = false;
+        #[cfg(test)]
+        let enabled = enabled || (available && TEST_REBASED_PATHS.with(|flag| flag.get()));
+        enabled && !texture_transport
+    };
+    let rebased_vertex_count = if use_rebased {
+        let count =
+            u32::try_from(vertices.len()).context("too many path rasterization vertices")?;
+        for group in scenes
+            .iter()
+            .flat_map(|scene| scene.path_batches.iter())
+            .filter_map(|batch| batch.group.clone())
+        {
+            if group.start != group.end {
+                rebased_path_draw(group, count)?;
+            } else {
+                anyhow::ensure!(group.end <= count, "invalid empty path rasterization range");
+            }
+        }
+        Some(count)
+    } else {
+        None
+    };
     let mut strides = [
         size_of::<gpui::Quad>(),
         size_of::<gpui::Shadow>(),
@@ -568,6 +621,7 @@ fn upload(
     let paths = PathUpload {
         vertices: bind(paths, "path_rasterization_bind_group"),
         sprites: bind(paths + 1, "path_sprites_bind_group"),
+        rebased_vertex_count,
     };
     Ok((uploads, paths))
 }
@@ -1107,7 +1161,27 @@ fn rasterize_group(
         depth_stencil_attachment: None,
         ..Default::default()
     });
-    pass.set_pipeline(&target.pipelines.path_rasterization);
+    let (pipeline, draw_vertices, draw_instances) = if let Some(count) = paths.rebased_vertex_count
+    {
+        let (draw_vertices, draw_instances) =
+            rebased_path_draw(vertices, count).expect("path group was validated before upload");
+        (
+            target
+                .pipelines
+                .path_rasterization_rebased
+                .as_ref()
+                .expect("rebased pipeline exists"),
+            draw_vertices,
+            draw_instances,
+        )
+    } else {
+        (
+            &target.pipelines.path_rasterization,
+            (paths.vertices.first + vertices.start)..(paths.vertices.first + vertices.end),
+            0..1,
+        )
+    };
+    pass.set_pipeline(pipeline);
     pass.set_bind_group(0, targets.globals, &[]);
     pass.set_bind_group(1, &paths.vertices.group, &[]);
     pass.set_bind_group(
@@ -1115,16 +1189,28 @@ fn rasterize_group(
         &target.bind_group_layouts.fast_rounded_clip.unmasked,
         &[0],
     );
-    pass.draw(
-        (paths.vertices.first + vertices.start)..(paths.vertices.first + vertices.end),
-        0..1,
-    );
+    pass.draw(draw_vertices, draw_instances);
     true
 }
 
 #[cfg(test)]
-mod tests {
-    use super::binding_size;
+mod binding_tests {
+    use super::{binding_size, rebased_path_draw};
+
+    #[test]
+    fn rebased_path_draw_checks_and_preserves_absolute_vertex_base() {
+        assert_eq!(
+            rebased_path_draw(1086..1392, 1398).unwrap(),
+            (0..306, 1086..1087)
+        );
+        assert_eq!(
+            rebased_path_draw(1392..1398, 1398).unwrap(),
+            (0..6, 1392..1393)
+        );
+        assert!(rebased_path_draw(1392..1399, 1398).is_err());
+        assert!(rebased_path_draw(8..7, 10).is_err());
+        assert!(rebased_path_draw(u32::MAX..u32::MAX, u32::MAX).is_err());
+    }
 
     #[test]
     fn unaligned_path_binding_size_rounds_up_to_vec4() {
