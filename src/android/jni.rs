@@ -884,7 +884,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             log::info!("deferred: TerminateWindow (iter={})", iteration);
             INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
             SURFACE_INIT.lock().unwrap().begin();
-            *LAST_CHROME_STYLE.lock().unwrap() = None;
+            reset_chrome_style();
             if let Some(platform) = platform() {
                 if let Some(win) = platform.primary_window() {
                     win.term_window();
@@ -1476,7 +1476,7 @@ pub fn init_platform(app: &AndroidApp) -> PlatformSession {
         flag.store(false, Ordering::Release);
     }
     *SURFACE_INIT.lock().unwrap() = SurfaceInit::new();
-    *LAST_CHROME_STYLE.lock().unwrap() = None;
+    reset_chrome_style();
     let platform = Arc::new(AndroidPlatform::new(false));
     *PLATFORM.lock() = Some(platform.clone());
     PlatformSession {
@@ -1487,40 +1487,149 @@ pub fn init_platform(app: &AndroidApp) -> PlatformSession {
 
 // ── system chrome (status bar / navigation bar) ───────────────────────────────
 
-/// Cached last-applied system chrome style.
+/// Pending or last-applied system chrome style.
 ///
 /// `set_system_chrome` is called on every frame render.  The JNI calls it
-/// makes (getWindow, setStatusBarColor, etc.) are View operations that can
-/// contend with the Android UI thread and intermittently deadlock.
-/// By caching the last applied style we skip the JNI calls entirely when
-/// nothing changed — which is the common case.
-#[allow(clippy::type_complexity)]
-static LAST_CHROME_STYLE: std::sync::Mutex<
-    Option<(Option<u32>, Option<u32>, crate::StatusBarContentStyle)>,
-> = std::sync::Mutex::new(None);
+/// makes (getWindow, setStatusBarColor, etc.) are View operations that must
+/// run on Java's UI thread. By caching the requested style we post one update
+/// when it changes and skip the JNI calls on unchanged frames.
+type ChromeStyleKey = (Option<u32>, Option<u32>, crate::StatusBarContentStyle);
+
+#[derive(Default)]
+struct ChromeStyleState {
+    applied: Option<ChromeStyleKey>,
+    pending: Option<ChromeStyleKey>,
+}
+
+static CHROME_STYLE: std::sync::Mutex<ChromeStyleState> = std::sync::Mutex::new(ChromeStyleState {
+    applied: None,
+    pending: None,
+});
+
+// One initial UI-thread attempt and two delayed retries.
+const MAX_CHROME_ATTEMPTS: u8 = 3;
+const CHROME_RETRY_DELAY_MS: u64 = 16;
+
+fn reset_chrome_style() {
+    *CHROME_STYLE.lock().unwrap() = ChromeStyleState::default();
+}
+
+fn merge_chrome_style(previous: ChromeStyleKey, next: ChromeStyleKey) -> ChromeStyleKey {
+    (next.0.or(previous.0), next.1.or(previous.1), next.2)
+}
+
+fn claim_chrome_style(
+    state: &mut ChromeStyleState,
+    next: ChromeStyleKey,
+) -> Option<ChromeStyleKey> {
+    let merged = state
+        .pending
+        .map_or(next, |previous| merge_chrome_style(previous, next));
+    if state.pending == Some(merged) || (state.pending.is_none() && state.applied == Some(merged)) {
+        return None;
+    }
+    state.pending = Some(merged);
+    Some(merged)
+}
+
+fn cancel_chrome_style(state: &mut ChromeStyleState, key: ChromeStyleKey) {
+    if state.pending == Some(key) {
+        state.pending = None;
+    }
+}
+
+fn complete_chrome_style(state: &mut ChromeStyleState, key: ChromeStyleKey) {
+    if state.pending == Some(key) {
+        state.pending = None;
+        state.applied = Some(key);
+    }
+}
+
+fn should_retry_chrome(state: &ChromeStyleState, key: ChromeStyleKey, attempt: u8) -> bool {
+    state.pending == Some(key) && attempt.saturating_add(1) < MAX_CHROME_ATTEMPTS
+}
 
 /// Apply system chrome styling on Android.
 ///
 /// Sets the status bar color, navigation bar color, and light/dark
 /// status bar icons via JNI calls to `Window` and `WindowInsetsController`.
 ///
-/// Must be called from the main (native) thread that has JNI access.
 pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
-    let status_bar_color = style.status_bar_color;
-    let navigation_bar_color = style.navigation_bar_color;
-    let status_bar_style = style.status_bar_style;
+    let style = *style;
+    let requested = (
+        style.status_bar_color,
+        style.navigation_bar_color,
+        style.status_bar_style,
+    );
 
-    // Skip the (expensive, potentially deadlocking) JNI calls when nothing changed.
-    {
-        let key = (status_bar_color, navigation_bar_color, status_bar_style);
-        let mut last = LAST_CHROME_STYLE.lock().unwrap();
-        if *last == Some(key) {
+    // Queue one update for each requested style and skip unchanged frames.
+    let Some(key) = claim_chrome_style(&mut CHROME_STYLE.lock().unwrap(), requested) else {
+        return;
+    };
+    let style = crate::SystemChromeStyle {
+        status_bar_color: key.0,
+        navigation_bar_color: key.1,
+        status_bar_style: key.2,
+    };
+
+    let Some(app) = android_app() else {
+        cancel_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key);
+        log::warn!("set_system_chrome: Activity not available");
+        return;
+    };
+
+    post_system_chrome(app, style, key, 0);
+}
+
+fn post_system_chrome(
+    app: AndroidApp,
+    style: crate::SystemChromeStyle,
+    key: ChromeStyleKey,
+    attempt: u8,
+) {
+    let retry_app = app.clone();
+    app.run_on_java_main_thread(Box::new(move || {
+        if CHROME_STYLE.lock().unwrap().pending != Some(key) {
             return;
         }
-        *last = Some(key);
-    }
+        match apply_system_chrome(style) {
+            Ok(()) => {
+                complete_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key);
+                log::info!(
+                    "set_system_chrome: status_bar_color={:?}, nav_bar_color={:?}, style={:?}",
+                    style.status_bar_color,
+                    style.navigation_bar_color,
+                    style.status_bar_style
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "set_system_chrome attempt {}/{}: {error}",
+                    attempt + 1,
+                    MAX_CHROME_ATTEMPTS
+                );
+                if should_retry_chrome(&CHROME_STYLE.lock().unwrap(), key, attempt) {
+                    let delay =
+                        Duration::from_millis(CHROME_RETRY_DELAY_MS * u64::from(attempt + 1));
+                    if let Err(error) = std::thread::Builder::new()
+                        .name("gpui-android-chrome-retry".into())
+                        .spawn(move || {
+                            std::thread::sleep(delay);
+                            if CHROME_STYLE.lock().unwrap().pending == Some(key) {
+                                post_system_chrome(retry_app, style, key, attempt + 1);
+                            }
+                        })
+                    {
+                        log::warn!("set_system_chrome retry scheduling failed: {error}");
+                    }
+                }
+            }
+        }
+    }));
+}
 
-    let result = with_env(|env| {
+fn apply_system_chrome(style: crate::SystemChromeStyle) -> Result<(), String> {
+    with_env(|env| {
         let activity_obj = activity(env)?;
 
         // 1. Get the Window: activity.getWindow()
@@ -1533,113 +1642,135 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
             )
             .and_then(|v: jni::objects::JValueOwned| v.l())
             .map_err(|e| {
+                env.exception_describe();
                 env.exception_clear();
-                e.to_string()
+                format!("getWindow failed: {e}")
             })?;
         if window.is_null() {
             return Err("getWindow returned null".into());
         }
 
         // 2. Set status bar color if provided
-        if let Some(color) = status_bar_color {
+        if let Some(color) = style.status_bar_color {
             let argb = (0xFF000000_u32 | color) as i32;
-            let _ = env.call_method(
+            env.call_method(
                 &window,
                 jni::jni_str!("setStatusBarColor"),
                 jni::jni_sig!("(I)V"),
                 &[JValue::Int(argb)],
-            );
-            env.exception_clear();
+            )
+            .map_err(|error| {
+                env.exception_describe();
+                env.exception_clear();
+                format!("setStatusBarColor failed: {error}")
+            })?;
         }
 
         // 3. Set navigation bar color if provided
-        if let Some(color) = navigation_bar_color {
+        if let Some(color) = style.navigation_bar_color {
             let argb = (0xFF000000_u32 | color) as i32;
-            let _ = env.call_method(
+            env.call_method(
                 &window,
                 jni::jni_str!("setNavigationBarColor"),
                 jni::jni_sig!("(I)V"),
                 &[JValue::Int(argb)],
-            );
-            env.exception_clear();
+            )
+            .map_err(|error| {
+                env.exception_describe();
+                env.exception_clear();
+                format!("setNavigationBarColor failed: {error}")
+            })?;
         }
 
-        // 4. Set light/dark status bar icons via WindowInsetsController (API 30+)
-        let insetsctl = env.call_method(
-            &window,
-            jni::jni_str!("getInsetsController"),
-            jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
-            &[],
+        set_status_bar_appearance(env, &window, style.status_bar_style)
+    })
+}
+
+fn set_status_bar_appearance(
+    env: &mut jni::Env<'_>,
+    window: &JObject<'_>,
+    status_bar_style: crate::StatusBarContentStyle,
+) -> Result<(), String> {
+    // Use WindowInsetsController on API 30+, then the legacy view flag when
+    // the controller is unavailable or the window is not ready for it.
+    let controller = match env.call_method(
+        window,
+        jni::jni_str!("getInsetsController"),
+        jni::jni_sig!("()Landroid/view/WindowInsetsController;"),
+        &[],
+    ) {
+        Ok(value) => value.l().ok().filter(|controller| !controller.is_null()),
+        Err(_) => {
+            env.exception_clear();
+            None
+        }
+    };
+
+    if let Some(controller) = controller {
+        let mask: i32 = 0x00000008;
+        let appearance = match status_bar_style {
+            crate::StatusBarContentStyle::Dark => mask,
+            crate::StatusBarContentStyle::Light => 0,
+        };
+        let result = env.call_method(
+            &controller,
+            jni::jni_str!("setSystemBarsAppearance"),
+            jni::jni_sig!("(II)V"),
+            &[JValue::Int(appearance), JValue::Int(mask)],
         );
-
-        if let Ok(v) = insetsctl {
-            if let Ok(ctl) = v.l() {
-                if !ctl.is_null() {
-                    let mask: i32 = 0x00000008;
-                    let appearance: i32 = match status_bar_style {
-                        crate::StatusBarContentStyle::Dark => 0x00000008,
-                        crate::StatusBarContentStyle::Light => 0,
-                    };
-                    let _ = env.call_method(
-                        &ctl,
-                        jni::jni_str!("setSystemBarsAppearance"),
-                        jni::jni_sig!("(II)V"),
-                        &[JValue::Int(appearance), JValue::Int(mask)],
-                    );
-                    env.exception_clear();
-                }
-            }
-        } else {
-            env.exception_clear();
-
-            if let Ok(decor) = env
-                .call_method(
-                    &window,
-                    jni::jni_str!("getDecorView"),
-                    jni::jni_sig!("()Landroid/view/View;"),
-                    &[],
-                )
-                .and_then(|v: jni::objects::JValueOwned| v.l())
-            {
-                if !decor.is_null() {
-                    if let Ok(current) = env
-                        .call_method(
-                            &decor,
-                            jni::jni_str!("getSystemUiVisibility"),
-                            jni::jni_sig!("()I"),
-                            &[],
-                        )
-                        .and_then(|v: jni::objects::JValueOwned| v.i())
-                    {
-                        let new_flags = match status_bar_style {
-                            crate::StatusBarContentStyle::Dark => current | 0x00002000,
-                            crate::StatusBarContentStyle::Light => current & !0x00002000,
-                        };
-                        let _ = env.call_method(
-                            &decor,
-                            jni::jni_str!("setSystemUiVisibility"),
-                            jni::jni_sig!("(I)V"),
-                            &[JValue::Int(new_flags)],
-                        );
-                        env.exception_clear();
-                    }
-                }
-            }
+        if result.is_ok() {
+            return Ok(());
         }
-
-        Ok(())
-    });
-
-    if let Err(e) = result {
-        log::warn!("set_system_chrome: {e}");
+        env.exception_describe();
+        env.exception_clear();
     }
 
-    log::info!(
-        "set_system_chrome: status_bar_color={:?}, nav_bar_color={:?}, style={:?}",
-        style.status_bar_color,
-        style.navigation_bar_color,
-        style.status_bar_style
-    );
+    let decor = env
+        .call_method(
+            window,
+            jni::jni_str!("getDecorView"),
+            jni::jni_sig!("()Landroid/view/View;"),
+            &[],
+        )
+        .and_then(|v: jni::objects::JValueOwned| v.l())
+        .map_err(|error| {
+            env.exception_describe();
+            env.exception_clear();
+            format!("getDecorView failed: {error}")
+        })?;
+    if decor.is_null() {
+        return Err("getDecorView returned null".into());
+    }
+
+    let current = env
+        .call_method(
+            &decor,
+            jni::jni_str!("getSystemUiVisibility"),
+            jni::jni_sig!("()I"),
+            &[],
+        )
+        .and_then(|v: jni::objects::JValueOwned| v.i())
+        .map_err(|error| {
+            env.exception_describe();
+            env.exception_clear();
+            format!("getSystemUiVisibility failed: {error}")
+        })?;
+    let flags = match status_bar_style {
+        crate::StatusBarContentStyle::Dark => current | 0x00002000,
+        crate::StatusBarContentStyle::Light => current & !0x00002000,
+    };
+    env.call_method(
+        &decor,
+        jni::jni_str!("setSystemUiVisibility"),
+        jni::jni_sig!("(I)V"),
+        &[JValue::Int(flags)],
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        env.exception_describe();
+        env.exception_clear();
+        format!("setSystemUiVisibility failed: {error}")
+    })
 }
 
 // ── software keyboard (IME) control ───────────────────────────────────────────
@@ -2370,6 +2501,118 @@ mod tests {
     #[test]
     fn platform_returns_none_before_init() {
         assert!(platform().is_none());
+    }
+
+    #[test]
+    fn failed_chrome_style_remains_pending_for_bounded_retry() {
+        let mut state = ChromeStyleState::default();
+        let key = (None, None, crate::StatusBarContentStyle::Dark);
+
+        assert_eq!(claim_chrome_style(&mut state, key), Some(key));
+        assert_eq!(claim_chrome_style(&mut state, key), None);
+        assert_eq!(state.pending, Some(key));
+        assert!(should_retry_chrome(&state, key, 0));
+        assert!(should_retry_chrome(&state, key, 1));
+        assert!(!should_retry_chrome(&state, key, 2));
+    }
+
+    #[test]
+    fn stale_chrome_completion_preserves_a_newer_request() {
+        let mut state = ChromeStyleState::default();
+        let old = (None, None, crate::StatusBarContentStyle::Dark);
+        let new = (None, None, crate::StatusBarContentStyle::Light);
+
+        assert_eq!(claim_chrome_style(&mut state, old), Some(old));
+        assert_eq!(claim_chrome_style(&mut state, new), Some(new));
+        complete_chrome_style(&mut state, old);
+        assert_eq!(state.pending, Some(new));
+        assert_eq!(claim_chrome_style(&mut state, new), None);
+    }
+
+    #[test]
+    fn queued_chrome_updates_preserve_explicit_colors() {
+        let mut state = ChromeStyleState::default();
+        let status_bar = Some(0x112233);
+        let navigation_bar = Some(0x445566);
+        let queued = (
+            status_bar,
+            navigation_bar,
+            crate::StatusBarContentStyle::Light,
+        );
+        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark);
+        let merged = (
+            status_bar,
+            navigation_bar,
+            crate::StatusBarContentStyle::Dark,
+        );
+
+        assert_eq!(claim_chrome_style(&mut state, queued), Some(queued));
+        assert_eq!(
+            claim_chrome_style(&mut state, appearance_only),
+            Some(merged)
+        );
+
+        let next_status_bar = Some(0x778899);
+        let overridden = (
+            next_status_bar,
+            navigation_bar,
+            crate::StatusBarContentStyle::Light,
+        );
+        assert_eq!(
+            claim_chrome_style(
+                &mut state,
+                (next_status_bar, None, crate::StatusBarContentStyle::Light),
+            ),
+            Some(overridden)
+        );
+    }
+
+    #[test]
+    fn failed_merged_chrome_update_preserves_colors_for_bounded_retry() {
+        let mut state = ChromeStyleState::default();
+        let status_bar = Some(0x112233);
+        let navigation_bar = Some(0x445566);
+        let queued = (
+            status_bar,
+            navigation_bar,
+            crate::StatusBarContentStyle::Light,
+        );
+        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark);
+        let merged = (
+            status_bar,
+            navigation_bar,
+            crate::StatusBarContentStyle::Dark,
+        );
+
+        assert_eq!(claim_chrome_style(&mut state, queued), Some(queued));
+        assert_eq!(
+            claim_chrome_style(&mut state, appearance_only),
+            Some(merged)
+        );
+
+        assert_eq!(state.pending, Some(merged));
+        assert!(should_retry_chrome(&state, merged, 0));
+        assert!(should_retry_chrome(&state, merged, 1));
+        assert!(!should_retry_chrome(&state, merged, 2));
+        assert_eq!(claim_chrome_style(&mut state, appearance_only), None);
+    }
+
+    #[test]
+    fn applied_colors_are_not_replayed_by_a_later_preserve_request() {
+        let mut state = ChromeStyleState::default();
+        let colored = (
+            Some(0x112233),
+            Some(0x445566),
+            crate::StatusBarContentStyle::Light,
+        );
+        let appearance_only = (None, None, crate::StatusBarContentStyle::Dark);
+
+        assert_eq!(claim_chrome_style(&mut state, colored), Some(colored));
+        complete_chrome_style(&mut state, colored);
+        assert_eq!(
+            claim_chrome_style(&mut state, appearance_only),
+            Some(appearance_only)
+        );
     }
 
     #[test]
