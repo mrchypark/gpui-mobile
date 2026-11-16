@@ -171,30 +171,6 @@ pub(crate) fn prompt_paths(
     Ok(Some(paths))
 }
 
-#[cfg(target_os = "ios")]
-pub(crate) type AsyncPromptResult = Result<Option<AsyncPromptPaths>, String>;
-
-#[cfg(any(target_os = "ios", test))]
-pub(crate) struct AsyncPromptPaths(Vec<std::path::PathBuf>);
-
-#[cfg(any(target_os = "ios", test))]
-impl AsyncPromptPaths {
-    fn new(paths: Vec<std::path::PathBuf>) -> Self {
-        Self(paths)
-    }
-
-    pub(crate) fn take(mut self) -> Vec<std::path::PathBuf> {
-        std::mem::take(&mut self.0)
-    }
-}
-
-#[cfg(any(target_os = "ios", test))]
-impl Drop for AsyncPromptPaths {
-    fn drop(&mut self) {
-        discard_import_paths(&self.0);
-    }
-}
-
 #[cfg(any(target_os = "ios", test))]
 fn discard_import_paths(paths: &[std::path::PathBuf]) {
     #[cfg(target_os = "ios")]
@@ -208,24 +184,34 @@ fn discard_import_paths(paths: &[std::path::PathBuf]) {
     }
 }
 
+#[cfg(any(target_os = "ios", test))]
+type PromptSender =
+    futures::channel::oneshot::Sender<gpui::Result<Option<Vec<std::path::PathBuf>>>>;
+
 #[cfg(target_os = "ios")]
 struct QueuedPathPrompt {
     multiple: bool,
-    sender: futures::channel::oneshot::Sender<AsyncPromptResult>,
+    sender: PromptSender,
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", test))]
 fn finish_async_prompt(
-    sender: &std::sync::Arc<
-        std::sync::Mutex<Option<futures::channel::oneshot::Sender<AsyncPromptResult>>>,
-    >,
-    result: AsyncPromptResult,
+    sender: &std::sync::Arc<std::sync::Mutex<Option<PromptSender>>>,
+    result: Result<Option<Vec<std::path::PathBuf>>, String>,
 ) {
     let sender = sender.lock().ok().and_then(|mut sender| sender.take());
-    let Some(sender) = sender else {
-        return;
-    };
-    let _ = sender.send(result);
+    if let Some(sender) = sender {
+        let result = result.map_err(anyhow::Error::msg);
+        if let Err(result) = sender.send(result) {
+            if let Ok(Some(paths)) = result {
+                discard_import_paths(&paths);
+            }
+        }
+    } else {
+        if let Ok(Some(paths)) = result {
+            discard_import_paths(&paths);
+        }
+    }
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -280,9 +266,9 @@ unsafe extern "C" fn start_async_prompt(context: *mut std::ffi::c_void) {
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         match session.wait_cancellable(|| prompt_receiver_closed(&worker_sender)) {
-                            ios::PromptWaitResult::Complete(result) => Some(result.map(|paths| {
-                                (!paths.is_empty()).then(|| AsyncPromptPaths::new(paths))
-                            })),
+                            ios::PromptWaitResult::Complete(result) => {
+                                Some(result.map(|paths| (!paths.is_empty()).then_some(paths)))
+                            }
                             ios::PromptWaitResult::Cancelled => None,
                         }
                     }))
@@ -310,16 +296,19 @@ unsafe extern "C" fn start_async_prompt(context: *mut std::ffi::c_void) {
     }
 }
 
-/// Start an iOS picker from a normal main-run-loop turn and return immediately.
-/// The synchronous public API remains available for callers that require it.
+/// Start an iOS picker from a normal main-run-loop turn and complete the GPUI
+/// receiver directly. The synchronous public API remains available for callers
+/// that require it.
 #[cfg(target_os = "ios")]
 pub(crate) fn prompt_paths_nonblocking(
     options: gpui::PathPromptOptions,
-) -> futures::channel::oneshot::Receiver<AsyncPromptResult> {
-    let (sender, receiver) = futures::channel::oneshot::channel();
+    sender: PromptSender,
+) {
     if !options.files || options.directories {
-        let _ = sender.send(Err("Mobile GPUI path prompts support files only; directory grants are not filesystem paths".into()));
-        return receiver;
+        let _ = sender.send(Err(anyhow::Error::msg(
+            "Mobile GPUI path prompts support files only; directory grants are not filesystem paths",
+        )));
+        return;
     }
     let queued = Box::new(QueuedPathPrompt {
         multiple: options.multiple,
@@ -332,7 +321,6 @@ pub(crate) fn prompt_paths_nonblocking(
             Some(start_async_prompt),
         );
     }
-    receiver
 }
 
 #[cfg(target_os = "ios")]
@@ -366,12 +354,10 @@ mod tests {
         std::fs::write(&file, "owned").unwrap();
 
         let (sender, receiver) =
-            futures::channel::oneshot::channel::<Result<Option<AsyncPromptPaths>, String>>();
-        assert!(sender
-            .send(Ok(Some(AsyncPromptPaths::new(vec![file]))))
-            .is_ok());
-        assert!(root.exists());
+            futures::channel::oneshot::channel::<gpui::Result<Option<Vec<std::path::PathBuf>>>>();
         drop(receiver);
+        let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+        finish_async_prompt(&sender, Ok(Some(vec![file])));
         assert!(!root.exists());
     }
 
@@ -382,5 +368,31 @@ mod tests {
         assert!(!prompt_receiver_closed(&sender));
         drop(receiver);
         assert!(prompt_receiver_closed(&sender));
+    }
+
+    #[test]
+    fn live_prompt_receiver_receives_the_import() {
+        let root = std::env::temp_dir().join(format!(
+            "gpui-direct-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("import.txt");
+        std::fs::write(&file, "owned").unwrap();
+
+        let (sender, mut receiver) =
+            futures::channel::oneshot::channel::<gpui::Result<Option<Vec<std::path::PathBuf>>>>();
+        let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
+        finish_async_prompt(&sender, Ok(Some(vec![file.clone()])));
+
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap().unwrap(),
+            Some(vec![file])
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

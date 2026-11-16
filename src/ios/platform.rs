@@ -335,39 +335,9 @@ impl Platform for IosPlatform {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (mut tx, rx) = oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         #[cfg(feature = "file_selector")]
-        let picker = crate::packages::file_selector::prompt_paths_nonblocking(options);
-        #[cfg(feature = "file_selector")]
-        // Keep the bridge alive independently of the main run loop while UIKit
-        // owns the modal picker; delivery still wakes the foreground task.
-        self.background_executor()
-            .spawn(async move {
-                let picker = match futures::future::select(picker, tx.cancellation()).await {
-                    futures::future::Either::Left((result, cancellation)) => {
-                        drop(cancellation);
-                        result
-                    }
-                    futures::future::Either::Right((_, picker)) => {
-                        drop(picker);
-                        return;
-                    }
-                };
-                let result = match picker {
-                    Ok(Ok(Some(paths))) => Ok(Some(paths.take())),
-                    Ok(Ok(None)) => Ok(None),
-                    Ok(Err(error)) => Err(anyhow::Error::msg(error)),
-                    Err(_) => Err(anyhow!("Document picker result disconnected")),
-                };
-                if let Err(result) = tx.send(result) {
-                    if let Ok(Some(paths)) = result {
-                        crate::packages::file_selector::discard_paths(&paths);
-                    }
-                }
-                // shortcut: GPUI fixes this result as Vec<PathBuf>, which cannot
-                // clean up after a successful send if the receiver later drops.
-            })
-            .detach();
+        crate::packages::file_selector::prompt_paths_nonblocking(options, tx);
         #[cfg(not(feature = "file_selector"))]
         {
             let _ = options;
