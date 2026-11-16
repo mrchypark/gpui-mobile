@@ -52,6 +52,29 @@ pub(super) fn register(decl: &mut ClassBuilder) {
         returnKeyType,
         setReturnKeyType
     );
+
+    // UITextView does not implement the UITextField secure-text property. Own
+    // both selectors so keyboard configuration updates and live proxy checks
+    // use the same BOOL storage.
+    decl.add_ivar::<Bool>(c"gpui_secure_text_entry");
+    #[allow(deprecated)]
+    unsafe extern "C" fn secure_text_entry(this: *mut AnyObject, _: Sel) -> Bool {
+        unsafe { *(*this).get_ivar::<Bool>("gpui_secure_text_entry") }
+    }
+    #[allow(deprecated)]
+    unsafe extern "C" fn set_secure_text_entry(this: *mut AnyObject, _: Sel, value: Bool) {
+        unsafe { *(*this).get_mut_ivar::<Bool>("gpui_secure_text_entry") = value };
+    }
+    unsafe {
+        decl.add_method(
+            sel!(isSecureTextEntry),
+            secure_text_entry as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+        );
+        decl.add_method(
+            sel!(setSecureTextEntry:),
+            set_secure_text_entry as unsafe extern "C" fn(*mut AnyObject, Sel, Bool),
+        );
+    }
 }
 
 /// Initialize after UITextView init; the text traits use integer ABI and secure entry uses BOOL.
@@ -82,6 +105,18 @@ pub(super) unsafe fn verify_live_proxy(view: *mut AnyObject) {
         }};
     }
     check!(keyboardType, setKeyboardType, 0_isize, 7_isize);
+    let has_secure_getter: Bool =
+        unsafe { msg_send![view, respondsToSelector: sel!(isSecureTextEntry)] };
+    assert!(
+        has_secure_getter.as_bool(),
+        "GPUITextInputView is missing isSecureTextEntry"
+    );
+    let has_secure_setter: Bool =
+        unsafe { msg_send![view, respondsToSelector: sel!(setSecureTextEntry:)] };
+    assert!(
+        has_secure_setter.as_bool(),
+        "GPUITextInputView is missing setSecureTextEntry:"
+    );
     let secure: Bool = unsafe { msg_send![view, isSecureTextEntry] };
     assert!(!secure.as_bool(), "isSecureTextEntry");
     let _: () = unsafe { msg_send![view, setSecureTextEntry: Bool::YES] };
