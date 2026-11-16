@@ -59,6 +59,35 @@ pub(crate) fn deliver_ime_key(
     }
 }
 
+pub(crate) enum OwnerlessComposition<'a> {
+    Mark(&'a str, std::ops::Range<usize>),
+    Finish,
+}
+
+/// Android may keep the IME connection after focus ownership is unavailable.
+/// Keep its marked text and finish, even though no owner lease was published.
+pub(crate) fn ownerless_composition<'a>(
+    input: &'a crate::mobile_events::ImeInput,
+    current: impl Fn() -> bool,
+    mut accepts: impl FnMut() -> bool,
+) -> Option<OwnerlessComposition<'a>> {
+    use crate::mobile_events::ImeInput;
+    if !current() {
+        return None;
+    }
+    match input {
+        ImeInput::Compose {
+            text,
+            selection,
+            region: None,
+        } if accepts() && current() => {
+            Some(OwnerlessComposition::Mark(text.as_str(), selection.clone()))
+        }
+        ImeInput::FinishComposition if accepts() && current() => Some(OwnerlessComposition::Finish),
+        _ => None,
+    }
+}
+
 pub(crate) struct Registry<T> {
     next: Cell<usize>,
     entries: RefCell<BTreeMap<usize, Weak<T>>>,
@@ -381,6 +410,86 @@ mod tests {
             |_| panic!("duplicate dispatch"),
             |_| panic!("duplicate insertion"),
         );
+    }
+
+    #[test]
+    fn ownerless_marked_composition_and_finish_reach_selected_handler() {
+        let compose = crate::mobile_events::ImeInput::Compose {
+            text: "한".into(),
+            selection: 1..1,
+            region: None,
+        };
+        match ownerless_composition(&compose, || true, || true) {
+            Some(OwnerlessComposition::Mark(text, selection)) => {
+                assert_eq!(text, "한");
+                assert_eq!(selection, 1..1);
+            }
+            _ => panic!("ownerless marked text must reach the handler"),
+        }
+        assert!(matches!(
+            ownerless_composition(
+                &crate::mobile_events::ImeInput::FinishComposition,
+                || true,
+                || true
+            ),
+            Some(OwnerlessComposition::Finish)
+        ));
+    }
+
+    #[test]
+    fn ownerless_commit_is_not_marked_and_still_replaces_text() {
+        let input = crate::mobile_events::ImeInput::Commit("한".into());
+        assert!(ownerless_composition(&input, || true, || true).is_none());
+        let replaced = RefCell::new(Vec::new());
+        deliver_ime_key(
+            input,
+            || true,
+            |_| false,
+            |_| panic!("native commit must not enter key dispatch"),
+            |text| replaced.borrow_mut().push(text.to_owned()),
+        );
+        assert_eq!(*replaced.borrow(), ["한"]);
+    }
+
+    #[test]
+    fn ownerless_composition_is_dropped_when_the_session_is_stale() {
+        let compose = crate::mobile_events::ImeInput::Compose {
+            text: "한".into(),
+            selection: 1..1,
+            region: None,
+        };
+        let live = Cell::new((7, 11));
+        let queried = Cell::new(false);
+        live.set((8, 11));
+        assert!(ownerless_composition(
+            &compose,
+            || live.get() == (7, 11),
+            || {
+                queried.set(true);
+                true
+            },
+        )
+        .is_none());
+        assert!(!queried.get());
+
+        live.set((7, 11));
+        assert!(ownerless_composition(
+            &compose,
+            || live.get() == (7, 11),
+            || {
+                live.set((7, 12));
+                true
+            },
+        )
+        .is_none());
+
+        live.set((7, 12));
+        assert!(ownerless_composition(
+            &crate::mobile_events::ImeInput::FinishComposition,
+            || live.get() == (7, 11),
+            || false,
+        )
+        .is_none());
     }
 
     #[test]
