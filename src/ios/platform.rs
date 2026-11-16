@@ -339,7 +339,9 @@ impl Platform for IosPlatform {
         #[cfg(feature = "file_selector")]
         let picker = crate::packages::file_selector::prompt_paths_nonblocking(options);
         #[cfg(feature = "file_selector")]
-        self.foreground_executor()
+        // Keep the bridge alive independently of the main run loop while UIKit
+        // owns the modal picker; delivery still wakes the foreground task.
+        self.background_executor()
             .spawn(async move {
                 let picker = match futures::future::select(picker, tx.cancellation()).await {
                     futures::future::Either::Left((result, cancellation)) => {
