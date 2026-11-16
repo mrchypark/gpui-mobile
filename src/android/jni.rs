@@ -1085,6 +1085,7 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
             // Resume platform views
             resume_platform_views();
+            rearm_deferred_system_chrome();
         }
 
         // Track active/focused state.
@@ -1487,7 +1488,7 @@ pub fn init_platform(app: &AndroidApp) -> PlatformSession {
 
 // ── system chrome (status bar / navigation bar) ───────────────────────────────
 
-/// Pending or last-applied system chrome style.
+/// Pending, deferred, or last-applied system chrome style.
 ///
 /// `set_system_chrome` is called on every frame render.  The JNI calls it
 /// makes (getWindow, setStatusBarColor, etc.) are View operations that must
@@ -1499,14 +1500,17 @@ type ChromeStyleKey = (Option<u32>, Option<u32>, crate::StatusBarContentStyle);
 struct ChromeStyleState {
     applied: Option<ChromeStyleKey>,
     pending: Option<ChromeStyleKey>,
+    // Suppress per-frame retries until a lifecycle resume re-arms this request.
+    retry_on_resume: Option<ChromeStyleKey>,
 }
 
 static CHROME_STYLE: std::sync::Mutex<ChromeStyleState> = std::sync::Mutex::new(ChromeStyleState {
     applied: None,
     pending: None,
+    retry_on_resume: None,
 });
 
-// One initial UI-thread attempt and two delayed retries.
+// One initial UI-thread attempt and two delayed retries per claim or resume.
 const MAX_CHROME_ATTEMPTS: u8 = 3;
 const CHROME_RETRY_DELAY_MS: u64 = 16;
 
@@ -1524,29 +1528,48 @@ fn claim_chrome_style(
 ) -> Option<ChromeStyleKey> {
     let merged = state
         .pending
+        .or(state.retry_on_resume)
         .map_or(next, |previous| merge_chrome_style(previous, next));
-    if state.pending == Some(merged) || (state.pending.is_none() && state.applied == Some(merged)) {
+    if state.pending == Some(merged) || state.retry_on_resume == Some(merged) {
+        return None;
+    }
+    if state.pending.is_none() && state.applied == Some(merged) {
+        state.retry_on_resume = None;
         return None;
     }
     state.pending = Some(merged);
+    state.retry_on_resume = None;
     Some(merged)
-}
-
-fn cancel_chrome_style(state: &mut ChromeStyleState, key: ChromeStyleKey) {
-    if state.pending == Some(key) {
-        state.pending = None;
-    }
 }
 
 fn complete_chrome_style(state: &mut ChromeStyleState, key: ChromeStyleKey) {
     if state.pending == Some(key) {
         state.pending = None;
         state.applied = Some(key);
+        state.retry_on_resume = None;
     }
 }
 
 fn should_retry_chrome(state: &ChromeStyleState, key: ChromeStyleKey, attempt: u8) -> bool {
     state.pending == Some(key) && attempt.saturating_add(1) < MAX_CHROME_ATTEMPTS
+}
+
+fn defer_chrome_style(state: &mut ChromeStyleState, key: ChromeStyleKey) -> bool {
+    if state.pending != Some(key) {
+        return false;
+    }
+    state.pending = None;
+    state.retry_on_resume = Some(key);
+    true
+}
+
+fn take_deferred_chrome_style(state: &mut ChromeStyleState) -> Option<ChromeStyleKey> {
+    if state.pending.is_some() {
+        return None;
+    }
+    let key = state.retry_on_resume.take()?;
+    state.pending = Some(key);
+    Some(key)
 }
 
 /// Apply system chrome styling on Android.
@@ -1573,8 +1596,9 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
     };
 
     let Some(app) = android_app() else {
-        cancel_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key);
-        log::warn!("set_system_chrome: Activity not available");
+        if defer_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key) {
+            log::warn!("set_system_chrome: Activity not available; waiting for resume");
+        }
         return;
     };
 
@@ -1620,12 +1644,35 @@ fn post_system_chrome(
                             }
                         })
                     {
-                        log::warn!("set_system_chrome retry scheduling failed: {error}");
+                        if defer_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key) {
+                            log::warn!(
+                                "set_system_chrome retry scheduling failed: {error}; waiting for resume"
+                            );
+                        }
                     }
+                } else if defer_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key) {
+                    log::warn!("set_system_chrome retries exhausted; waiting for resume");
                 }
             }
         }
     }));
+}
+
+fn rearm_deferred_system_chrome() {
+    let Some(key) = take_deferred_chrome_style(&mut CHROME_STYLE.lock().unwrap()) else {
+        return;
+    };
+    let Some(app) = android_app() else {
+        defer_chrome_style(&mut CHROME_STYLE.lock().unwrap(), key);
+        return;
+    };
+    let style = crate::SystemChromeStyle {
+        status_bar_color: key.0,
+        navigation_bar_color: key.1,
+        status_bar_style: key.2,
+    };
+    log::info!("set_system_chrome: re-arming deferred retry on resume");
+    post_system_chrome(app, style, key, 0);
 }
 
 fn apply_system_chrome(style: crate::SystemChromeStyle) -> Result<(), String> {
@@ -2504,7 +2551,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_chrome_style_remains_pending_for_bounded_retry() {
+    fn exhausted_chrome_retry_waits_for_resume_without_spinning() {
         let mut state = ChromeStyleState::default();
         let key = (None, None, crate::StatusBarContentStyle::Dark);
 
@@ -2514,6 +2561,67 @@ mod tests {
         assert!(should_retry_chrome(&state, key, 0));
         assert!(should_retry_chrome(&state, key, 1));
         assert!(!should_retry_chrome(&state, key, 2));
+
+        assert!(defer_chrome_style(&mut state, key));
+        assert_eq!(state.pending, None);
+        assert_eq!(state.retry_on_resume, Some(key));
+        assert_eq!(claim_chrome_style(&mut state, key), None);
+
+        assert_eq!(take_deferred_chrome_style(&mut state), Some(key));
+        assert_eq!(state.pending, Some(key));
+        assert_eq!(state.retry_on_resume, None);
+        assert_eq!(take_deferred_chrome_style(&mut state), None);
+        complete_chrome_style(&mut state, key);
+        assert_eq!(state.applied, Some(key));
+        assert_eq!(claim_chrome_style(&mut state, key), None);
+    }
+
+    #[test]
+    fn retry_scheduling_failure_uses_the_same_resume_rearm() {
+        let mut state = ChromeStyleState::default();
+        let key = (Some(0x112233), None, crate::StatusBarContentStyle::Light);
+
+        assert_eq!(claim_chrome_style(&mut state, key), Some(key));
+        assert!(defer_chrome_style(&mut state, key));
+        assert_eq!(state.pending, None);
+        assert_eq!(claim_chrome_style(&mut state, key), None);
+        assert_eq!(take_deferred_chrome_style(&mut state), Some(key));
+    }
+
+    #[test]
+    fn appearance_only_request_while_deferred_preserves_colors_and_suppression() {
+        let mut state = ChromeStyleState::default();
+        let applied = (
+            Some(0x010203),
+            Some(0x040506),
+            crate::StatusBarContentStyle::Light,
+        );
+        let deferred = (
+            Some(0x112233),
+            Some(0x445566),
+            crate::StatusBarContentStyle::Dark,
+        );
+
+        assert_eq!(claim_chrome_style(&mut state, applied), Some(applied));
+        complete_chrome_style(&mut state, applied);
+        assert_eq!(claim_chrome_style(&mut state, deferred), Some(deferred));
+        assert!(defer_chrome_style(&mut state, deferred));
+
+        let unchanged_appearance = (None, None, crate::StatusBarContentStyle::Dark);
+        assert_eq!(claim_chrome_style(&mut state, unchanged_appearance), None);
+        assert_eq!(state.pending, None);
+        assert_eq!(state.retry_on_resume, Some(deferred));
+        assert_eq!(state.applied, Some(applied));
+
+        let changed = (deferred.0, deferred.1, crate::StatusBarContentStyle::Light);
+        let changed_appearance = (None, None, crate::StatusBarContentStyle::Light);
+        assert_eq!(
+            claim_chrome_style(&mut state, changed_appearance),
+            Some(changed)
+        );
+        assert_eq!(state.pending, Some(changed));
+        assert_eq!(state.retry_on_resume, None);
+        assert_eq!(state.applied, Some(applied));
     }
 
     #[test]
@@ -2568,7 +2676,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_merged_chrome_update_preserves_colors_for_bounded_retry() {
+    fn exhausted_merged_chrome_update_preserves_colors_for_resume() {
         let mut state = ChromeStyleState::default();
         let status_bar = Some(0x112233);
         let navigation_bar = Some(0x445566);
@@ -2594,6 +2702,9 @@ mod tests {
         assert!(should_retry_chrome(&state, merged, 0));
         assert!(should_retry_chrome(&state, merged, 1));
         assert!(!should_retry_chrome(&state, merged, 2));
+        assert!(defer_chrome_style(&mut state, merged));
+        assert_eq!(take_deferred_chrome_style(&mut state), Some(merged));
+        assert_eq!(state.pending, Some(merged));
         assert_eq!(claim_chrome_style(&mut state, appearance_only), None);
     }
 
