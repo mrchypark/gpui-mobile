@@ -75,6 +75,14 @@ fn set_result_channel() -> Result<request::Request<'static>, String> {
     REQUEST.begin()
 }
 
+fn set_export_result_channel() -> Result<request::Request<'static>, String> {
+    let main: objc2::runtime::Bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+    if !main.as_bool() {
+        return Err("Call the iOS document picker on the main thread".into());
+    }
+    REQUEST.begin_export()
+}
+
 // ── ObjC delegate class ─────────────────────────────────────────────────────
 
 static REGISTER_DELEGATE: Once = Once::new();
@@ -432,7 +440,7 @@ pub fn export_file(
     options: &SaveFileOptions,
     contents: &[u8],
 ) -> Result<Option<SelectedFile>, String> {
-    let rx = set_result_channel()?;
+    let rx = set_export_result_channel()?;
     let source = TempExport::new(options.suggested_name.as_deref(), contents)?;
     unsafe {
         let ns_path = crate::ios::util::nsstring(&source.path().to_string_lossy());

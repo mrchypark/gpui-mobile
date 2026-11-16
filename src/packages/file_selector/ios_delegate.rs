@@ -120,11 +120,7 @@ pub unsafe fn dismiss(
     impl Drop for Delivery {
         fn drop(&mut self) {
             if let Some(result) = self.result.take() {
-                if let Ok(paths) = result {
-                    request::discard(&paths);
-                }
-                self.token
-                    .finish(Err("Picker dismissal ended without completion".into()));
+                self.token.finish_incomplete_dismissal(result);
             }
         }
     }

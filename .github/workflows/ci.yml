@@ -45,6 +45,9 @@ jobs:
       - name: cargo test (unit tests)
         run: cargo test --lib --features ble
 
+      - name: iOS picker request tests
+        run: rustc --edition=2021 --test src/packages/file_selector/request.rs -o "$RUNNER_TEMP/picker-request-tests" && "$RUNNER_TEMP/picker-request-tests"
+
       - name: cargo fmt --check
         run: cargo fmt -- --check
 
