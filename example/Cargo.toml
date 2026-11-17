@@ -33,6 +33,7 @@ android_logger = "0.15"
 android-activity = { version = "0.6", features = ["native-activity"] }
 
 [patch.crates-io]
+gpui-base = { path = "../vendor/gpui-base" }
 gpui-fast = { path = "../vendor/gpui-fast" }
 gpui-fast-wgpu = { path = "../vendor/gpui-fast-wgpu" }
 

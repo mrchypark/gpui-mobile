@@ -32,6 +32,7 @@ naga = { version = "=30.0.1", features = ["wgsl-in"] }
 
 # Cargo only honors patches at the invoking workspace root.
 [patch.crates-io]
+gpui-base = { path = "../../vendor/gpui-base" }
 gpui-fast = { path = "../../vendor/gpui-fast" }
 gpui-fast-wgpu = { path = "../../vendor/gpui-fast-wgpu" }
 gpui-pre = { path = "../../vendor/gpui-pre" }
