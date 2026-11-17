@@ -5,8 +5,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
 use std::cell::RefCell;
-use std::sync::Once;
 use std::sync::mpsc;
+use std::sync::Once;
 
 #[path = "../permission_handler/ios_completion.rs"]
 mod completion;

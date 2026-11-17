@@ -1653,10 +1653,10 @@ impl Platform for AndroidPlatform {
             .map(|d| Rc::new(d.clone()) as Rc<dyn PlatformDisplay>);
 
         window.set_gpui_handle(handle);
-        Ok(Box::new(super::window::AndroidPlatformWindow::new(
-            window, display,
-        )
-        .with_dispatcher(self.background_executor())))
+        Ok(Box::new(
+            super::window::AndroidPlatformWindow::new(window, display)
+                .with_dispatcher(self.background_executor()),
+        ))
     }
 
     fn window_appearance(&self) -> WindowAppearance {

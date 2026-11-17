@@ -54,12 +54,12 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 
 use super::{
-    AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size, TouchPoint,
-    dispatcher::AndroidDispatcher,
+    dispatcher::AndroidDispatcher, AndroidKeyEvent, Bounds, DevicePixels, Pixels, Point, Size,
+    TouchPoint,
 };
 use crate::mobile_events::{self, AppLifecycle, MobileEvent, MobileEventState, SurfaceLifecycle};
 use crate::momentum::{MomentumScroller, VelocityTracker};
@@ -212,8 +212,7 @@ fn deliver_pending_long_press(
     {
         let mut state = state.lock();
         if let LegacyTouchState::Pending {
-            long_press_offered,
-            ..
+            long_press_offered, ..
         } = &mut *state
         {
             *long_press_offered = true;
@@ -2599,18 +2598,20 @@ impl PlatformWindow for AndroidPlatformWindow {
                         }
                         if let LegacyTouchState::LongPressing { start_x, start_y } = *ts {
                             drop(ts);
-                            let _ = cb.lock()(gpui::PlatformInput::LongPress(
-                                legacy_long_press_event(
+                            let _ =
+                                cb.lock()(gpui::PlatformInput::LongPress(legacy_long_press_event(
                                     gpui::TouchPhase::Moved,
                                     start_x,
                                     start_y,
                                     logical_x,
                                     logical_y,
-                                ),
-                            ));
+                                )));
                             return;
                         }
-                        if let LegacyTouchState::Pending { start_x, start_y, .. } = *ts {
+                        if let LegacyTouchState::Pending {
+                            start_x, start_y, ..
+                        } = *ts
+                        {
                             if (logical_x - start_x).hypot(logical_y - start_y) > SCROLL_SLOP {
                                 let start = gpui::point(gpui::px(start_x), gpui::px(start_y));
                                 if drag(gpui::TouchPhase::Started, start) {
@@ -2732,15 +2733,14 @@ impl PlatformWindow for AndroidPlatformWindow {
                         }
                         if let LegacyTouchState::LongPressing { start_x, start_y } = *ts {
                             *ts = LegacyTouchState::Idle;
-                            let _ = cb.lock()(gpui::PlatformInput::LongPress(
-                                legacy_long_press_event(
+                            let _ =
+                                cb.lock()(gpui::PlatformInput::LongPress(legacy_long_press_event(
                                     gpui::TouchPhase::Cancelled,
                                     start_x,
                                     start_y,
                                     logical_x,
                                     logical_y,
-                                ),
-                            ));
+                                )));
                             return;
                         }
                         if let LegacyTouchState::Dragging { start } = *ts {
@@ -2805,7 +2805,9 @@ impl PlatformWindow for AndroidPlatformWindow {
                                 ));
                                 return;
                             }
-                            LegacyTouchState::Pending { start_x, start_y, .. } => {
+                            LegacyTouchState::Pending {
+                                start_x, start_y, ..
+                            } => {
                                 // Finger lifted without exceeding slop →
                                 // this is a tap.  Emit MouseDown + MouseUp
                                 // together at the original down position so
@@ -3544,10 +3546,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            phases,
-            [gpui::TouchPhase::Started, gpui::TouchPhase::Ended]
-        );
+        assert_eq!(phases, [gpui::TouchPhase::Started, gpui::TouchPhase::Ended]);
         assert!(!received.lock().iter().any(|event| matches!(
             event,
             gpui::PlatformInput::MouseDown(_) | gpui::PlatformInput::MouseUp(_)
