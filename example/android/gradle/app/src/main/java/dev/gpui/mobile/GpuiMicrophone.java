@@ -1,12 +1,17 @@
 package dev.gpui.mobile;
 
 import android.app.Activity;
+import android.content.ContentUris;
+import android.database.Cursor;
 import android.media.MediaRecorder;
+import android.net.Uri;
 import android.os.Build;
+import android.provider.MediaStore;
 import android.util.Log;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.UUID;
 
 public class GpuiMicrophone {
@@ -25,6 +30,78 @@ public class GpuiMicrophone {
 
     public static synchronized boolean isAvailable(Activity activity) {
         return activity != null && activity.getPackageManager().hasSystemFeature("android.hardware.microphone");
+    }
+
+    private static native void nativeOnPcmFrames(float[] frames);
+
+    static void emitPcmFrames(float[] frames) {
+        if (frames == null || frames.length == 0) return;
+        try {
+            nativeOnPcmFrames(frames);
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
+    public static synchronized String startRecordingStream(Activity activity, int sampleRate, int channels) {
+        if (sIsRecording || activity == null) return null;
+        if (activity.isFinishing() || activity.isDestroyed()) return null;
+        if (sampleRate <= 0 || (channels != 1 && channels != 2)) return null;
+        try {
+            sFailure = null;
+            sOutputPath = new File(activity.getCacheDir(), "recording_" + UUID.randomUUID() + ".wav").getAbsolutePath();
+            sWav = new GpuiWavRecorder(sOutputPath, sampleRate, channels, true);
+            sIsRecording = true;
+            sIsPaused = false;
+            observeOwner(activity);
+            return sOutputPath;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start streaming recording", e);
+            cleanup();
+            return null;
+        }
+    }
+
+    public static String[] queryAudioEntries(Activity activity, long sinceMs) {
+        if (activity == null) throw new IllegalStateException("Activity is unavailable");
+        Uri collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+        String[] projection = new String[] {
+            MediaStore.Audio.Media._ID,
+            MediaStore.Audio.Media.DISPLAY_NAME,
+            MediaStore.Audio.Media.DURATION,
+            MediaStore.Audio.Media.DATE_ADDED,
+            MediaStore.Audio.Media.SIZE,
+            MediaStore.Audio.Media.MIME_TYPE,
+        };
+        String selection = sinceMs > 0 ? MediaStore.Audio.Media.DATE_ADDED + " >= ?" : null;
+        String[] selectionArgs = sinceMs > 0 ? new String[] { Long.toString(sinceMs / 1000L) } : null;
+        String sortOrder = MediaStore.Audio.Media.DATE_ADDED + " DESC";
+        ArrayList<String> out = new ArrayList<>();
+        try (Cursor cursor = activity.getContentResolver().query(collection, projection, selection, selectionArgs, sortOrder)) {
+            if (cursor == null) return new String[0];
+            int idCol = cursor.getColumnIndex(MediaStore.Audio.Media._ID);
+            int nameCol = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME);
+            int durCol = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION);
+            int addedCol = cursor.getColumnIndex(MediaStore.Audio.Media.DATE_ADDED);
+            int sizeCol = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE);
+            int mimeCol = cursor.getColumnIndex(MediaStore.Audio.Media.MIME_TYPE);
+            while (cursor.moveToNext()) {
+                if (idCol < 0) continue;
+                long id = cursor.getLong(idCol);
+                Uri itemUri = ContentUris.withAppendedId(collection, id);
+                String name = (nameCol >= 0 && !cursor.isNull(nameCol)) ? cursor.getString(nameCol) : "";
+                String dur = (durCol >= 0 && !cursor.isNull(durCol)) ? Long.toString(cursor.getLong(durCol)) : "";
+                String added = (addedCol >= 0 && !cursor.isNull(addedCol)) ? Long.toString(cursor.getLong(addedCol) * 1000L) : "";
+                String size = (sizeCol >= 0 && !cursor.isNull(sizeCol)) ? Long.toString(cursor.getLong(sizeCol)) : "";
+                String mime = (mimeCol >= 0 && !cursor.isNull(mimeCol)) ? cursor.getString(mimeCol) : "";
+                out.add(itemUri.toString());
+                out.add(name != null ? name : "");
+                out.add(dur);
+                out.add(added);
+                out.add(size);
+                out.add(mime != null ? mime : "");
+            }
+        }
+        return out.toArray(new String[0]);
     }
 
     public static synchronized String startRecording(Activity activity, int format, int sampleRate, int channels, int bitRate) {

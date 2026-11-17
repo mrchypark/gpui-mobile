@@ -14,6 +14,7 @@ final class GpuiWavRecorder {
     private final Object writeLock = new Object();
     private final Thread writer;
     private final java.util.concurrent.CountDownLatch finished = new java.util.concurrent.CountDownLatch(1);
+    private final boolean streamPcm;
     private volatile boolean running = true;
     private volatile boolean paused;
     private volatile long generation;
@@ -22,8 +23,13 @@ final class GpuiWavRecorder {
     private long bytes;
 
     GpuiWavRecorder(String path, int rate, int channelCount) throws IOException {
+        this(path, rate, channelCount, false);
+    }
+
+    GpuiWavRecorder(String path, int rate, int channelCount, boolean stream) throws IOException {
         sampleRate = rate;
         channels = channelCount;
+        streamPcm = stream;
         int mask = channels == 1 ? AudioFormat.CHANNEL_IN_MONO : AudioFormat.CHANNEL_IN_STEREO;
         int minimum = AudioRecord.getMinBufferSize(rate, mask, AudioFormat.ENCODING_PCM_16BIT);
         if (minimum <= 0) throw new IOException("Unsupported PCM recording configuration");
@@ -63,11 +69,16 @@ final class GpuiWavRecorder {
                     continue;
                 }
                 int peak = 0;
+                float[] pcm = streamPcm ? new float[count] : null;
                 for (int i = 0; i < count; i++) {
                     int value = samples[i];
                     peak = Math.max(peak, Math.abs(value));
                     encoded[2 * i] = (byte)value;
                     encoded[2 * i + 1] = (byte)(value >> 8);
+                    if (pcm != null) pcm[i] = value / 32768.0f;
+                }
+                if (pcm != null) {
+                    GpuiMicrophone.emitPcmFrames(pcm);
                 }
                 synchronized (writeLock) {
                     if (!paused && beforeRead == generation) {

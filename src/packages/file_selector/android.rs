@@ -1,4 +1,4 @@
-use super::{OpenFileOptions, SaveFileOptions, SelectedFile};
+use super::{DirectoryDocument, OpenFileOptions, SaveFileOptions, SelectedFile};
 use crate::android::jni::{self as jni_helpers, JniExt};
 use jni::objects::{JClass, JObject, JValue};
 
@@ -231,6 +231,98 @@ pub fn get_directory_path(_initial_directory: Option<&str>) -> Result<Option<Str
 
         let path = jni_helpers::get_string(env, &result);
         Ok(Some(path))
+    })
+}
+
+pub fn list_directory(tree_uri: &str) -> Result<Vec<DirectoryDocument>, String> {
+    if tree_uri.trim().is_empty() {
+        return Err("Directory tree URI cannot be empty".into());
+    }
+    jni_helpers::with_env(|env| {
+        let activity = jni_helpers::activity(env)?;
+        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
+        let j_uri = env.new_string(tree_uri).e()?;
+        let result = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("listDirectory"),
+                jni::jni_sig!("(Landroid/app/Activity;Ljava/lang/String;)[Ljava/lang/String;"),
+                &[JValue::Object(&activity), JValue::Object(&j_uri)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+        let arr = unsafe { jni::objects::JObjectArray::<JObject>::from_raw(env, result.as_raw()) };
+        let len = arr.len(env).e()?;
+        let mut docs = Vec::with_capacity(len / 5);
+        for base in (0..len).step_by(5) {
+            if base + 4 >= len {
+                break;
+            }
+            let mut get = |idx| -> Result<String, String> {
+                let obj: JObject = arr.get_element(env, idx).e()?;
+                Ok(jni_helpers::get_string(env, &obj))
+            };
+            let uri = get(base)?;
+            let name = get(base + 1)?;
+            let mime = get(base + 2)?;
+            let size = get(base + 3)?;
+            let modified = get(base + 4)?;
+            docs.push(DirectoryDocument {
+                uri,
+                name,
+                mime_type: (!mime.is_empty()).then_some(mime),
+                size_bytes: (!size.is_empty())
+                    .then(|| size.parse::<u64>().ok())
+                    .flatten(),
+                modified_ms: (!modified.is_empty())
+                    .then(|| modified.parse::<u64>().ok())
+                    .flatten(),
+            });
+        }
+        Ok(docs)
+    })
+}
+
+pub fn import_document(document_uri: &str) -> Result<SelectedFile, String> {
+    if document_uri.trim().is_empty() {
+        return Err("Document URI cannot be empty".into());
+    }
+    jni_helpers::with_env(|env| {
+        let activity = jni_helpers::activity(env)?;
+        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
+        let j_uri = env.new_string(document_uri).e()?;
+        let result = env
+            .call_static_method(
+                &cls,
+                jni::jni_str!("importDocument"),
+                jni::jni_sig!("(Landroid/app/Activity;Ljava/lang/String;)[Ljava/lang/String;"),
+                &[JValue::Object(&activity), JValue::Object(&j_uri)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if result.is_null() {
+            return Err("Failed to import document".into());
+        }
+        let arr = unsafe { jni::objects::JObjectArray::<JObject>::from_raw(env, result.as_raw()) };
+        let len = arr.len(env).e()?;
+        if len < 2 {
+            return Err("Invalid imported document result".into());
+        }
+        let path_obj: JObject = arr.get_element(env, 0).e()?;
+        let name_obj: JObject = arr.get_element(env, 1).e()?;
+        Ok(SelectedFile {
+            path: jni_helpers::get_string(env, &path_obj),
+            name: jni_helpers::get_string(env, &name_obj),
+        })
     })
 }
 

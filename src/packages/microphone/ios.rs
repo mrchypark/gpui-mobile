@@ -1,7 +1,10 @@
-use super::{AudioFormat, Recording, RecordingConfig};
+use super::{AudioFormat, AudioLibraryEntry, Recording, RecordingConfig};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 #[link(name = "AVFoundation", kind = "framework")]
 extern "C" {}
@@ -9,6 +12,7 @@ extern "C" {}
 struct RecorderState {
     recorder: *mut AnyObject, // AVAudioRecorder
     path: String,
+    stream_stop: Option<Arc<AtomicBool>>,
 }
 
 unsafe impl Send for RecorderState {}
@@ -145,15 +149,122 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
         *guard = Some(RecorderState {
             recorder,
             path: path_str.clone(),
+            stream_stop: None,
         });
 
         Ok(path_str)
     }
 }
 
+pub fn start_recording_stream(
+    config: &RecordingConfig,
+    on_pcm: Box<dyn Fn(&[f32]) + Send + 'static>,
+) -> Result<String, String> {
+    let path = start_recording(config)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Ok(mut guard) = STATE.lock() {
+        if let Some(state) = guard.as_mut() {
+            state.stream_stop = Some(stop.clone());
+        }
+    }
+    let tail_path = path.clone();
+    std::thread::spawn(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut offset = 44u64;
+        let mut buf = [0u8; 4096];
+        while !stop.load(Ordering::Acquire) {
+            if let Ok(mut file) = std::fs::File::open(&tail_path) {
+                if let Ok(len) = file.metadata().map(|m| m.len()) {
+                    if len > offset + 1 && file.seek(SeekFrom::Start(offset)).is_ok() {
+                        let mut available = ((len - offset) & !1) as usize;
+                        while available > 0 {
+                            let want = available.min(buf.len()) & !1;
+                            if want == 0 {
+                                break;
+                            }
+                            match file.read(&mut buf[..want]) {
+                                Ok(n) if n >= 2 => {
+                                    let even = n & !1;
+                                    offset += even as u64;
+                                    available = available.saturating_sub(even);
+                                    let samples = super::pcm16_le_to_f32(&buf[..even]);
+                                    if !samples.is_empty() {
+                                        on_pcm(&samples);
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    });
+    Ok(path)
+}
+
+pub fn query_audio_entries(since_ms: u64) -> Result<Vec<AudioLibraryEntry>, String> {
+    let mut dirs = vec![std::env::temp_dir()];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(std::path::PathBuf::from(home).join("Documents"));
+    }
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+            else {
+                continue;
+            };
+            let mime = match ext.as_str() {
+                "m4a" | "mp4" => "audio/mp4",
+                "wav" => "audio/wav",
+                "mp3" => "audio/mpeg",
+                "aac" => "audio/aac",
+                "caf" => "audio/x-caf",
+                _ => continue,
+            };
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let added_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            if since_ms > 0 && added_ms.unwrap_or(0) < since_ms {
+                continue;
+            }
+            let display_name = entry.file_name().to_string_lossy().into_owned();
+            out.push(AudioLibraryEntry {
+                uri: path.to_string_lossy().into_owned(),
+                display_name,
+                duration_ms: None,
+                added_ms,
+                size_bytes: Some(meta.len()),
+                mime_type: Some(mime.to_string()),
+            });
+        }
+    }
+    Ok(out)
+}
+
 pub fn stop_recording() -> Result<Recording, String> {
     let mut guard = STATE.lock().unwrap();
     let state = guard.take().ok_or("Not recording")?;
+    if let Some(stop) = state.stream_stop {
+        stop.store(true, Ordering::Release);
+    }
 
     unsafe {
         let duration: f64 = msg_send![state.recorder, currentTime];

@@ -11,6 +11,52 @@ mod android;
 #[cfg(target_os = "ios")]
 mod ios;
 
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
+};
+
+/// Events emitted by [`AudioPlayer::on_event`] and [`AudioPlayer::prepare_async`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayerEvent {
+    Ready { duration_ms: u64 },
+    Position(u64),
+    Completed,
+    Error(String),
+}
+
+type EventCallback = Arc<dyn Fn(PlayerEvent) + Send + Sync + 'static>;
+
+struct PlayerObserver {
+    callback: EventCallback,
+    stop: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+}
+
+fn observers() -> &'static Mutex<HashMap<u32, PlayerObserver>> {
+    static MAP: OnceLock<Mutex<HashMap<u32, PlayerObserver>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn emit_event(id: u32, event: PlayerEvent) {
+    let cb = observers()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&id).map(|obs| obs.callback.clone()));
+    if let Some(cb) = cb {
+        cb(event);
+    }
+}
+
+fn stop_observer(id: u32) {
+    if let Ok(mut map) = observers().lock() {
+        if let Some(obs) = map.remove(&id) {
+            obs.stop.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Audio player state.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlayerState {
@@ -89,6 +135,154 @@ impl AudioPlayer {
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
             let _ = path;
+            Err("Audio not supported on this platform".into())
+        }
+    }
+
+    /// Register a callback for [`PlayerEvent`] updates (ready, position, completed, error).
+    pub fn on_event(
+        &self,
+        callback: impl Fn(PlayerEvent) + Send + Sync + 'static,
+    ) -> Result<(), String> {
+        let id = self.id;
+        stop_observer(id);
+        let stop = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(1));
+        let cb: EventCallback = Arc::new(callback);
+        if let Ok(mut map) = observers().lock() {
+            map.insert(
+                id,
+                PlayerObserver {
+                    callback: cb,
+                    stop: stop.clone(),
+                    generation,
+                },
+            );
+        }
+        std::thread::spawn(move || {
+            let mut last_pos: Option<u64> = None;
+            let mut last_state: Option<PlayerState> = None;
+            while !stop.load(Ordering::Acquire) {
+                if let Ok(state) = Self::state_for_id(id) {
+                    if state == PlayerState::Playing {
+                        if let Ok(pos) = Self::position_for_id(id) {
+                            if last_pos != Some(pos) {
+                                last_pos = Some(pos);
+                                emit_event(id, PlayerEvent::Position(pos));
+                            }
+                        }
+                    }
+                    if state == PlayerState::Completed && last_state != Some(PlayerState::Completed)
+                    {
+                        emit_event(id, PlayerEvent::Completed);
+                    }
+                    last_state = Some(state);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        Ok(())
+    }
+
+    /// Non-blocking preparation of a file path or URL; emits [`PlayerEvent::Ready`]
+    /// or [`PlayerEvent::Error`] to the registered [`Self::on_event`] listener.
+    pub fn prepare_async(&self, source: &str) {
+        let id = self.id;
+        let source = source.to_string();
+        let gen = observers()
+            .lock()
+            .ok()
+            .and_then(|map| {
+                map.get(&id)
+                    .map(|obs| obs.generation.fetch_add(1, Ordering::AcqRel) + 1)
+            })
+            .unwrap_or(0);
+        std::thread::spawn(move || {
+            let is_url = source.contains("://");
+            let res = if is_url {
+                Self::set_url_for_id(id, &source)
+            } else {
+                Self::set_file_path_for_id(id, &source)
+            };
+            let current_gen = observers().lock().ok().and_then(|map| {
+                map.get(&id)
+                    .map(|obs| obs.generation.load(Ordering::Acquire))
+            });
+            if gen != 0 && current_gen != Some(gen) {
+                return;
+            }
+            match res {
+                Ok(duration_ms) => emit_event(
+                    id,
+                    PlayerEvent::Ready {
+                        duration_ms: duration_ms.unwrap_or(0),
+                    },
+                ),
+                Err(err) => emit_event(id, PlayerEvent::Error(err)),
+            }
+        });
+    }
+
+    fn set_url_for_id(id: u32, url: &str) -> Result<Option<u64>, String> {
+        #[cfg(target_os = "android")]
+        {
+            android::set_url(id, url)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            ios::set_url(id, url)
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let _ = (id, url);
+            Err("Audio not supported on this platform".into())
+        }
+    }
+
+    fn set_file_path_for_id(id: u32, path: &str) -> Result<Option<u64>, String> {
+        #[cfg(target_os = "android")]
+        {
+            android::set_url(id, path)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            ios::set_file_path(id, path)
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let _ = (id, path);
+            Err("Audio not supported on this platform".into())
+        }
+    }
+
+    fn position_for_id(id: u32) -> Result<u64, String> {
+        #[cfg(target_os = "android")]
+        {
+            android::get_position(id)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            ios::get_position(id)
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let _ = id;
+            Err("Audio not supported on this platform".into())
+        }
+    }
+
+    fn state_for_id(id: u32) -> Result<PlayerState, String> {
+        #[cfg(target_os = "android")]
+        {
+            android::get_state(id)
+        }
+        #[cfg(target_os = "ios")]
+        {
+            ios::get_state(id)
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            let _ = id;
             Err("Audio not supported on this platform".into())
         }
     }
@@ -300,6 +494,40 @@ impl AudioPlayer {
 
 impl Drop for AudioPlayer {
     fn drop(&mut self) {
+        stop_observer(self.id);
         let _ = self.dispose();
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn event_registry_dispatches_and_stops_cleanly() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        observers().lock().unwrap().insert(
+            9999,
+            PlayerObserver {
+                callback: Arc::new(move |ev| seen_clone.lock().unwrap().push(ev)),
+                stop,
+                generation: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        emit_event(9999, PlayerEvent::Ready { duration_ms: 1200 });
+        emit_event(9999, PlayerEvent::Position(450));
+        emit_event(9999, PlayerEvent::Completed);
+        stop_observer(9999);
+        emit_event(9999, PlayerEvent::Error("ignored".into()));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                PlayerEvent::Ready { duration_ms: 1200 },
+                PlayerEvent::Position(450),
+                PlayerEvent::Completed,
+            ]
+        );
     }
 }

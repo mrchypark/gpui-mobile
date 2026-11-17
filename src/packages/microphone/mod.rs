@@ -51,6 +51,23 @@ pub struct Recording {
     pub duration_ms: u64,
 }
 
+/// Metadata for an audio item in the device's media library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioLibraryEntry {
+    /// Platform URI (Android MediaStore content URI) or filesystem path (iOS).
+    pub uri: String,
+    /// Display name of the audio item.
+    pub display_name: String,
+    /// Duration in milliseconds if known.
+    pub duration_ms: Option<u64>,
+    /// Creation/addition timestamp in milliseconds since Unix epoch if known.
+    pub added_ms: Option<u64>,
+    /// File size in bytes if known.
+    pub size_bytes: Option<u64>,
+    /// MIME type if known.
+    pub mime_type: Option<String>,
+}
+
 /// Check if audio recording is available.
 pub fn is_available() -> bool {
     #[cfg(target_os = "ios")]
@@ -84,6 +101,55 @@ pub fn start_recording(config: &RecordingConfig) -> Result<String, String> {
         let _ = config;
         Err("microphone is only available on iOS and Android".into())
     }
+}
+
+/// Start recording audio with the given configuration while streaming normalized
+/// `[-1.0, 1.0]` `f32` PCM frames to `on_pcm`.
+pub fn start_recording_stream(
+    config: &RecordingConfig,
+    on_pcm: impl Fn(&[f32]) + Send + 'static,
+) -> Result<String, String> {
+    let mut pcm_config = config.clone();
+    pcm_config.format = AudioFormat::Wav;
+    validate_config(&pcm_config)?;
+    #[cfg(target_os = "ios")]
+    {
+        ios::start_recording_stream(&pcm_config, Box::new(on_pcm))
+    }
+    #[cfg(target_os = "android")]
+    {
+        android::start_recording_stream(&pcm_config, Box::new(on_pcm))
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        let _ = (pcm_config, on_pcm);
+        Err("microphone is only available on iOS and Android".into())
+    }
+}
+
+/// Query audio entries added on or after `since_ms` (Unix epoch milliseconds; `0` returns all).
+pub fn query_audio_entries(since_ms: u64) -> Result<Vec<AudioLibraryEntry>, String> {
+    #[cfg(target_os = "ios")]
+    {
+        ios::query_audio_entries(since_ms)
+    }
+    #[cfg(target_os = "android")]
+    {
+        android::query_audio_entries(since_ms)
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        let _ = since_ms;
+        Err("microphone is only available on iOS and Android".into())
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn pcm16_le_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0)
+        .collect()
 }
 
 fn validate_config(config: &RecordingConfig) -> Result<(), String> {
@@ -134,6 +200,16 @@ mod tests {
         config.channels = 2;
         config.bit_rate = u32::MAX;
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn pcm16_le_converts_to_normalized_f32_samples() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&16384i16.to_le_bytes());
+        bytes.extend_from_slice(&(-32768i16).to_le_bytes());
+        let samples = pcm16_le_to_f32(&bytes);
+        assert_eq!(samples, vec![0.0, 0.5, -1.0]);
     }
 }
 

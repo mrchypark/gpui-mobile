@@ -4,8 +4,10 @@ import android.app.Activity;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -151,6 +153,72 @@ public final class GpuiFilePicker {
             return result.get(0);
         }
         return null;
+    }
+
+    /**
+     * List child documents inside a SAF tree URI.
+     *
+     * @return Flat array in 5-element groups: [uri, name, mime, size, modifiedMs].
+     */
+    public static String[] listDirectory(final Activity activity, final String treeUriString) {
+        if (activity == null) throw new IllegalStateException("Activity is unavailable");
+        if (treeUriString == null || treeUriString.isEmpty()) {
+            throw new IllegalArgumentException("Tree URI is empty");
+        }
+        Uri treeUri = Uri.parse(treeUriString);
+        String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
+        Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId);
+        String[] projection = new String[] {
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        };
+        ArrayList<String> out = new ArrayList<>();
+        try (Cursor cursor = activity.getContentResolver().query(childrenUri, projection, null, null, null)) {
+            if (cursor == null) {
+                throw new IllegalStateException("Directory query returned null cursor");
+            }
+            int idCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
+            int nameCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+            int mimeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE);
+            int sizeCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE);
+            int modCol = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
+            while (cursor.moveToNext()) {
+                if (idCol < 0) continue;
+                String docId = cursor.getString(idCol);
+                if (docId == null || docId.isEmpty()) continue;
+                Uri childUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
+                String name = (nameCol >= 0 && !cursor.isNull(nameCol)) ? cursor.getString(nameCol) : "";
+                String mime = (mimeCol >= 0 && !cursor.isNull(mimeCol)) ? cursor.getString(mimeCol) : "";
+                String size = (sizeCol >= 0 && !cursor.isNull(sizeCol)) ? Long.toString(cursor.getLong(sizeCol)) : "";
+                String modified = (modCol >= 0 && !cursor.isNull(modCol)) ? Long.toString(cursor.getLong(modCol)) : "";
+                out.add(childUri.toString());
+                out.add(name != null ? name : "");
+                out.add(mime != null ? mime : "");
+                out.add(size);
+                out.add(modified);
+            }
+        }
+        return out.toArray(new String[0]);
+    }
+
+    /**
+     * Import a SAF document URI into app-private storage and return [path, displayName].
+     */
+    public static String[] importDocument(final Activity activity, final String documentUriString) {
+        if (activity == null) throw new IllegalStateException("Activity is unavailable");
+        if (documentUriString == null || documentUriString.isEmpty()) {
+            throw new IllegalArgumentException("Document URI is empty");
+        }
+        Uri uri = Uri.parse(documentUriString);
+        File imported = GpuiPickerFiles.importUri(activity, uri);
+        String name = displayName(activity, documentUriString);
+        if (name == null || name.isEmpty()) {
+            name = imported.getName();
+        }
+        return new String[] { imported.getAbsolutePath(), name };
     }
 
     // ── Internal ─────────────────────────────────────────────────────────

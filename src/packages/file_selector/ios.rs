@@ -764,6 +764,100 @@ pub fn get_directory_path(_initial_directory: Option<&str>) -> Result<Option<Str
     Err("iOS directory access requires a security-scoped lifetime which this path-only API cannot represent".into())
 }
 
+pub fn export_bookmark(url: &AnyObject) -> Result<Vec<u8>, String> {
+    unsafe {
+        // NSURLBookmarkCreationMinimalBookmark (1 << 9) produces a portable iOS security-scoped bookmark.
+        const MINIMAL_BOOKMARK: usize = 1 << 9;
+        let nil: *mut AnyObject = std::ptr::null_mut();
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        let data: *mut AnyObject = msg_send![
+            url,
+            bookmarkDataWithOptions: MINIMAL_BOOKMARK,
+            includingResourceValuesForKeys: nil,
+            relativeToURL: nil,
+            error: &mut error
+        ];
+        if data.is_null() {
+            let msg = if error.is_null() {
+                "Failed to create security-scoped bookmark".into()
+            } else {
+                let desc: *mut AnyObject = msg_send![error, localizedDescription];
+                nsstring_to_string(desc)
+            };
+            return Err(msg);
+        }
+        let len: usize = msg_send![data, length];
+        let ptr: *const u8 = msg_send![data, bytes];
+        if len == 0 || ptr.is_null() {
+            return Err("Bookmark data was empty".into());
+        }
+        Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+    }
+}
+
+pub fn resolve_bookmark(bytes: &[u8]) -> Result<SecurityScopedDirectory, String> {
+    if bytes.is_empty() {
+        return Err("Bookmark data cannot be empty".into());
+    }
+    unsafe {
+        let data: *mut AnyObject = msg_send![
+            class!(NSData),
+            dataWithBytes: bytes.as_ptr(),
+            length: bytes.len()
+        ];
+        if data.is_null() {
+            return Err("Failed to allocate NSData for bookmark".into());
+        }
+        let nil: *mut AnyObject = std::ptr::null_mut();
+        let mut stale = Bool::NO;
+        let mut error: *mut AnyObject = std::ptr::null_mut();
+        let url: *mut AnyObject = msg_send![
+            class!(NSURL),
+            URLByResolvingBookmarkData: data,
+            options: 0usize,
+            relativeToURL: nil,
+            bookmarkDataIsStale: &mut stale,
+            error: &mut error
+        ];
+        if url.is_null() {
+            let msg = if error.is_null() {
+                "Failed to resolve security-scoped bookmark".into()
+            } else {
+                let desc: *mut AnyObject = msg_send![error, localizedDescription];
+                nsstring_to_string(desc)
+            };
+            return Err(msg);
+        }
+        let started: Bool = msg_send![url, startAccessingSecurityScopedResource];
+        if !started.as_bool() {
+            return Err("Could not start security-scoped access for resolved bookmark".into());
+        }
+        let path_str: *mut AnyObject = msg_send![url, path];
+        let path = std::path::PathBuf::from(nsstring_to_string(path_str));
+        if let Err(err) = super::validate_directory_path(&path) {
+            let _: () = msg_send![url, stopAccessingSecurityScopedResource];
+            return Err(err);
+        }
+        let retained = Retained::retain(url)
+            .ok_or_else(|| "Failed to retain resolved security-scoped URL".to_string())?;
+        Ok(SecurityScopedDirectory::new(path, retained))
+    }
+}
+
+unsafe fn nsstring_to_string(ns: *mut AnyObject) -> String {
+    if ns.is_null() {
+        return String::new();
+    }
+    let utf8: *const std::ffi::c_char = unsafe { msg_send![ns, UTF8String] };
+    if utf8.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(utf8) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

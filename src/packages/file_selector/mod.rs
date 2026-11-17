@@ -137,6 +137,21 @@ pub struct SelectedFile {
     pub name: String,
 }
 
+/// Metadata for a child document inside a user-selected directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryDocument {
+    /// Child document URI (Android SAF) or filesystem path (iOS).
+    pub uri: String,
+    /// Display name of the child entry.
+    pub name: String,
+    /// MIME type if reported by the provider.
+    pub mime_type: Option<String>,
+    /// File size in bytes if known.
+    pub size_bytes: Option<u64>,
+    /// Last-modified timestamp in milliseconds since Unix epoch if known.
+    pub modified_ms: Option<u64>,
+}
+
 /// A directory selected through the iOS document picker.
 ///
 /// The picker returns a security-scoped URL. This handle starts access before
@@ -161,6 +176,16 @@ impl SecurityScopedDirectory {
     /// The selected directory while this handle keeps security scope open.
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Exports a security-scoped bookmark blob that can be persisted across app restarts.
+    pub fn export_bookmark(&self) -> Result<Vec<u8>, String> {
+        ios::export_bookmark(&self.url)
+    }
+
+    /// Resolves a previously exported bookmark blob and resumes security-scoped access.
+    pub fn resolve_bookmark(data: &[u8]) -> Result<Self, String> {
+        ios::resolve_bookmark(data)
     }
 }
 
@@ -289,6 +314,103 @@ pub fn get_directory_path(initial_directory: Option<&str>) -> Result<Option<Stri
 #[cfg(target_os = "ios")]
 pub fn open_directory() -> Result<Option<SecurityScopedDirectory>, String> {
     ios::open_directory()
+}
+
+/// Lists child documents inside a directory selected via `get_directory_path` (Android SAF)
+/// or an active `SecurityScopedDirectory::path()` (iOS).
+pub fn list_directory(tree_uri: &str) -> Result<Vec<DirectoryDocument>, String> {
+    #[cfg(target_os = "android")]
+    {
+        android::list_directory(tree_uri)
+    }
+    #[cfg(target_os = "ios")]
+    {
+        list_local_directory(std::path::Path::new(tree_uri))
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        let _ = tree_uri;
+        Err("file_selector is only available on iOS and Android".into())
+    }
+}
+
+/// Copies a document returned by `list_directory` into app-local storage so it can be
+/// opened with standard `std::fs` APIs without holding SAF streams.
+pub fn import_document(document_uri: &str) -> Result<SelectedFile, String> {
+    #[cfg(target_os = "android")]
+    {
+        android::import_document(document_uri)
+    }
+    #[cfg(target_os = "ios")]
+    {
+        import_local_document(std::path::Path::new(document_uri))
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        let _ = document_uri;
+        Err("file_selector is only available on iOS and Android".into())
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn list_local_directory(
+    dir: &std::path::Path,
+) -> Result<Vec<DirectoryDocument>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("Read directory {dir:?}: {e}"))?;
+    let mut docs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Read directory entry: {e}"))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let meta = entry.metadata().ok();
+        let size_bytes = meta.as_ref().and_then(|m| m.is_file().then(|| m.len()));
+        let modified_ms = meta.as_ref().and_then(|m| {
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        });
+        let mime_type = if meta.as_ref().is_some_and(|m| m.is_dir()) {
+            Some("inode/directory".to_string())
+        } else {
+            None
+        };
+        docs.push(DirectoryDocument {
+            uri: path.to_string_lossy().into_owned(),
+            name,
+            mime_type,
+            size_bytes,
+            modified_ms,
+        });
+    }
+    Ok(docs)
+}
+
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn import_local_document(src: &std::path::Path) -> Result<SelectedFile, String> {
+    if !src.is_file() {
+        return Err(format!("Document is not a readable file: {src:?}"));
+    }
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "document".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("gpui-import-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Create import dir: {e}"))?;
+    let dest = dir.join(safe_export_name(Some(&name)));
+    if let Err(err) = std::fs::copy(src, &dest) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("Copy document: {err}"));
+    }
+    Ok(SelectedFile {
+        path: dest.to_string_lossy().into_owned(),
+        name,
+    })
 }
 
 /// Reject paths that cannot be the selected directory. Call this after starting
@@ -606,5 +728,36 @@ mod tests {
             Some(vec![file])
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_directory_listing_and_import_copy_work() {
+        let root = std::env::temp_dir().join(format!(
+            "gpui-dir-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let sub = root.join("calls");
+        std::fs::create_dir(&sub).unwrap();
+        let file = root.join("note.m4a");
+        std::fs::write(&file, b"audio-bytes").unwrap();
+
+        let entries = list_local_directory(&root).unwrap();
+        assert_eq!(entries.len(), 2);
+        let note = entries.iter().find(|d| d.name == "note.m4a").unwrap();
+        assert_eq!(note.size_bytes, Some(11));
+        assert!(note.modified_ms.is_some());
+
+        let imported = import_local_document(&file).unwrap();
+        assert_eq!(imported.name, "note.m4a");
+        assert_eq!(std::fs::read(&imported.path).unwrap(), b"audio-bytes");
+
+        let _ = std::fs::remove_file(&imported.path);
+        let _ = std::fs::remove_dir(std::path::Path::new(&imported.path).parent().unwrap());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
