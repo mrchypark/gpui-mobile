@@ -541,7 +541,7 @@ impl PromptSession {
     }
 
     pub(super) fn wait_cancellable(self, cancelled: impl Fn() -> bool) -> PromptWaitResult {
-        let result = completion::wait_cancellable(&self.request.receiver, || !cancelled());
+        let result = wait_for_picker(&self.request.receiver, &cancelled);
         match result {
             Ok(result) => PromptWaitResult::Complete(
                 result.and_then(|paths| picker_paths(self.multiple, paths)),
@@ -553,6 +553,13 @@ impl PromptSession {
             Err(error) => PromptWaitResult::Complete(Err(error)),
         }
     }
+}
+
+fn wait_for_picker(
+    receiver: &std::sync::mpsc::Receiver<request::PickerResult>,
+    cancelled: impl Fn() -> bool,
+) -> Result<request::PickerResult, String> {
+    completion::wait_cancellable(receiver, || !cancelled())
 }
 
 pub(super) enum PromptWaitResult {
@@ -755,4 +762,53 @@ pub fn open_directory() -> Result<Option<SecurityScopedDirectory>, String> {
 
 pub fn get_directory_path(_initial_directory: Option<&str>) -> Result<Option<String>, String> {
     Err("iOS directory access requires a security-scoped lifetime which this path-only API cannot represent".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn live_receiver_keeps_picker_wait_open() {
+        let (sender, receiver) = mpsc::channel();
+        let provider = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            sender.send(Ok(vec![])).unwrap();
+        });
+
+        let result = wait_for_picker(&receiver, || false);
+        provider.join().unwrap();
+
+        assert_eq!(result, Ok(Ok(vec![])));
+    }
+
+    #[test]
+    fn cancellation_ends_picker_wait() {
+        let (_sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter_cancelled = cancelled.clone();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            result_sender
+                .send(wait_for_picker(&receiver, || {
+                    waiter_cancelled.load(Ordering::Acquire)
+                }))
+                .unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(30));
+        cancelled.store(true, Ordering::Release);
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancellation must end the picker wait");
+        waiter.join().unwrap();
+
+        assert_eq!(
+            result,
+            Err("Native operation closed during completion".into())
+        );
+    }
 }
