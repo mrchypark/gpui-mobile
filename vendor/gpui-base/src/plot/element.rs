@@ -4,7 +4,7 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, GlobalElementId, Hitbox, HitboxBehavior,
-    InspectorElementId, IntoElement, LayoutId, LongPressEvent, MouseMoveEvent, Pixels, Point, Size,
+    InspectorElementId, LayoutId, LongPressEvent, MouseMoveEvent, Pixels, Point, Size,
     Style, TouchPhase, Window,
 };
 

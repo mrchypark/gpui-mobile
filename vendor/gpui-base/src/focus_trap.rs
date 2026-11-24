@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, FocusHandle, Global, GlobalElementId,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, ParentElement, Pixels,
+    InteractiveElement, Interactivity, LayoutId, ParentElement, Pixels,
     StatefulInteractiveElement, StyleRefinement, Styled, WeakFocusHandle, Window,
 };
 use std::collections::HashMap;

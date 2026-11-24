@@ -75,7 +75,7 @@ fn on_main(f: impl FnOnce() + Send + 'static) {
         fn dispatch_async_f(
             queue: *mut std::ffi::c_void,
             context: *mut std::ffi::c_void,
-            work: unsafe extern "C" fn(*mut std::ffi::c_void),
+            work: Option<unsafe extern "C" fn(*mut std::ffi::c_void)>,
         );
     }
     unsafe extern "C" fn run<F: FnOnce()>(context: *mut std::ffi::c_void) {
@@ -86,7 +86,7 @@ fn on_main(f: impl FnOnce() + Send + 'static) {
         dispatch_async_f(
             crate::ios::dispatch_get_main_queue(),
             Box::into_raw(Box::new(f)).cast(),
-            run::<F>,
+            Some(run::<F>),
         );
     }
     unsafe {

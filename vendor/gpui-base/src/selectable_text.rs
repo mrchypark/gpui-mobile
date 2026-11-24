@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use gpui::{
     App, BorderStyle, Bounds, Corners, Edges, Element, ElementId, GlobalElementId, Hitbox,
-    HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, PaintQuad, Pixels, Point,
+    HitboxBehavior, Hsla, InspectorElementId, LayoutId, PaintQuad, Pixels, Point,
     SharedString, StyledText, TextStyleRefinement, Window, transparent_black,
 };
 

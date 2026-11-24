@@ -2,6 +2,7 @@ use super::*;
 use futures::StreamExt;
 use std::collections::BTreeMap;
 
+#[allow(dead_code)]
 pub(super) fn absent_scan_errors() -> BoxStream<'static, i32> {
     // A missing optional channel must never win select with an immediate EOF.
     Box::pin(futures::stream::pending())

@@ -1,4 +1,5 @@
 //! UI-thread ownership and reentrant callback delivery shared by the mobile backends.
+#![allow(dead_code, unused_imports)]
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},

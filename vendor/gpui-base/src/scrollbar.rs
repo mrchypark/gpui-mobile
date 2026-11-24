@@ -10,7 +10,7 @@ use crate::{
 use gpui::{
     Anchor, App, Axis, Background, BorderStyle, Bounds, ContentMask, CursorStyle, Edges, Element,
     ElementId, EntityId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, IsZero, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    IsZero, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PaintQuad, Pixels, Point, Position, ScrollEvent, ScrollHandle, Size, Style, TouchDragEvent,
     TouchPhase, UniformListScrollHandle, Window, fill, point, prelude::FluentBuilder, px, relative,
     size,

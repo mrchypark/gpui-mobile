@@ -12,8 +12,16 @@ pub(super) async fn cleanup_with_context(
     errors
 }
 
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios", test)),
+    allow(dead_code)
+)]
 #[derive(Default)]
 pub(super) struct ScanErrors(std::sync::Mutex<Vec<futures::channel::mpsc::Sender<i32>>>);
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios", test)),
+    allow(dead_code)
+)]
 impl ScanErrors {
     pub fn subscribe(&self) -> futures::channel::mpsc::Receiver<i32> {
         let (sender, receiver) = futures::channel::mpsc::channel(1);

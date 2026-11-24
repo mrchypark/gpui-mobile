@@ -143,8 +143,6 @@ gpui = { package = "gpui-fast", version = "=0.1.17", default-features = false, f
 [patch.crates-io]
 gpui-fast = { path = "vendor/gpui-fast" }
 gpui-fast-wgpu = { path = "vendor/gpui-fast-wgpu" }
-gpui-pre = { path = "vendor/gpui-pre" }
-gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
 
 # ── profiles ─────────────────────────────────────────────────────────────────
 

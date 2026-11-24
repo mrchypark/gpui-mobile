@@ -8,7 +8,7 @@
 
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Size, Style, WeakEntity, Window, px,
+    InspectorElementId, LayoutId, Pixels, Point, Size, Style, WeakEntity, Window, px,
 };
 
 use crate::input::{EditorState, PrepaintCaretGeometry};

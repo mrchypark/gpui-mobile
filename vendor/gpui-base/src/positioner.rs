@@ -6,7 +6,7 @@
 
 use gpui::{
     Anchor, AnyElement, App, Bounds, Decorations, Display, Edges, Element, GlobalElementId,
-    Half as _, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels,
+    Half as _, HitboxBehavior, InspectorElementId, LayoutId, ParentElement, Pixels,
     Point, Position, Size, Style, Window, point, px,
 };
 

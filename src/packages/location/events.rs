@@ -1,4 +1,8 @@
 //! Bounded callback mailbox. Native callbacks never wait for a consumer.
+#![cfg_attr(
+    not(any(target_os = "android", target_os = "ios", test)),
+    allow(dead_code)
+)]
 use futures::{task::AtomicWaker, Stream};
 use std::{
     collections::{HashMap, VecDeque},

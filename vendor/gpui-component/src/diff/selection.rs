@@ -10,7 +10,7 @@ use std::{
 
 use gpui::{
     AnyElement, App, Bounds, Element, ElementId, GlobalElementId, HighlightStyle, Hitbox,
-    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ListState, MouseButton,
+    HitboxBehavior, InspectorElementId, LayoutId, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, StyledText,
     TextLayout, Window, px,
 };

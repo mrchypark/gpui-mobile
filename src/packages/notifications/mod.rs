@@ -133,7 +133,15 @@ pub fn cancel_all() -> Result<(), String> {
     }
 }
 
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, unused_imports)
+)]
 mod system;
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, unused_imports)
+)]
 pub(crate) use system::{
     dismiss_system_notification, poll_system_notification_responses, show_system_notification,
     take_system_notification_responses,

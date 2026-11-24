@@ -2238,7 +2238,7 @@ pub(crate) fn show_prompt(
             let array = env.new_object_array(labels.len() as i32, &string_class, JObject::null()).map_err(|e| e.to_string())?;
             for (index, label) in labels.iter().enumerate() {
                 let label = env.new_string(label).map_err(|e| e.to_string())?;
-                env.set_object_array_element(&array, index, &label).map_err(|e| e.to_string())?;
+                array.set_element(env, index, &label).map_err(|e| e.to_string())?;
             }
             env.call_static_method(&class, jni::jni_str!("show"),
                 jni::jni_sig!("(Landroid/app/Activity;JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)V"),
@@ -2464,6 +2464,7 @@ pub(crate) fn restore_keyboard() {
 }
 
 /// Restart the active input connection so Android drops stale composing spans.
+#[allow(dead_code)]
 pub(crate) fn reset_keyboard_composition() {
     if IME_ACTIVE.load(Ordering::Acquire) {
         IME_SHOWN_KEY.set(None);
@@ -2579,6 +2580,7 @@ fn explicit_input_state<R>(action: impl FnOnce(&mut ExplicitInputState) -> R) ->
     })
 }
 
+#[allow(dead_code)]
 fn explicit_secure_input() -> bool {
     explicit_input_state(|state| state.secure)
 }
@@ -2662,6 +2664,7 @@ pub extern "C" fn Java_dev_gpui_mobile_GpuiKeyboard_editorEpoch(
 ) -> i64 {
     IME_EDITOR.load(Ordering::Acquire)
 }
+#[allow(dead_code)]
 pub(crate) fn configured_keyboard_type() -> gpui::KeyboardType {
     explicit_input_state(|state| state.keyboard_type).unwrap_or_else(|| {
         IME_CONFIGURATION.with(|configuration| configuration.borrow().keyboard_type)

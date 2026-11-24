@@ -428,6 +428,10 @@ pub(crate) fn validate_directory_path(path: &std::path::Path) -> Result<(), Stri
 }
 
 /// Internal GPUI adapter: return usable filesystem paths, never SAF URIs.
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios", test)),
+    allow(dead_code)
+)]
 pub(crate) fn prompt_paths(
     options: gpui::PathPromptOptions,
 ) -> Result<Option<Vec<std::path::PathBuf>>, String> {
@@ -609,6 +613,7 @@ pub(crate) fn discard_paths(paths: &[std::path::PathBuf]) {
     discard_import_paths(paths);
 }
 
+#[allow(dead_code)]
 pub(crate) fn prompt_new_path(
     _directory: &std::path::Path,
     _suggested_name: Option<&str>,

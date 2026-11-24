@@ -14,7 +14,7 @@ extern "C" {
     fn nw_path_monitor_cancel(monitor: *mut AnyObject);
     fn nw_path_get_status(path: *mut c_void) -> i32;
     fn nw_path_uses_interface_type(path: *mut c_void, kind: i32) -> bool;
-    fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut c_void;
+    fn dispatch_get_global_queue(identifier: i64, flags: u64) -> *mut c_void;
 }
 
 pub fn check_connectivity() -> ConnectivityStatus {

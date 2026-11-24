@@ -9,7 +9,7 @@ use std::panic::Location;
 use std::rc::Rc;
 
 use gpui::{
-    App, Axis, Bounds, ContentMask, Element, ElementId, GlobalElementId, Hitbox, IntoElement,
+    App, Axis, Bounds, ContentMask, Element, ElementId, GlobalElementId, Hitbox,
     IsZero as _, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     OngoingScroll, Position, ScrollEvent, Style, TouchPhase, Window, relative,
 };

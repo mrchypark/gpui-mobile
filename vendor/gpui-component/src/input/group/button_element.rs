@@ -1,5 +1,5 @@
 use gpui::{
-    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+    AnyElement, App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
     LayoutId, Pixels, Window,
 };
 

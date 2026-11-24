@@ -1,5 +1,7 @@
 //! UI-thread IME events are queued, then applied on GPUI's native thread.
 
+#![allow(dead_code)]
+
 use gpui::{
     DispatchEventResult, KeyDownEvent, Keystroke, Modifiers, PlatformInput, PlatformInputHandler,
 };

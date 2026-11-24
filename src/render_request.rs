@@ -53,7 +53,7 @@ impl ForceRender {
         // compare-exchange zero against zero, succeed, and report that a
         // request was consumed when none was.
         self.pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 if count == 0 {
                     None
                 } else {
@@ -63,6 +63,7 @@ impl ForceRender {
             .is_ok()
     }
 
+    #[allow(dead_code)]
     fn drain(&self) -> usize {
         let mut count = 0;
         while self.take() {

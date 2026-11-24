@@ -1,5 +1,7 @@
 //! Android Storage Access Framework bridge returning readable local files.
 
+#![allow(dead_code)]
+
 use super::jni::{self as jni_helpers, JniExt};
 use anyhow::{anyhow, Result};
 use futures::channel::oneshot;

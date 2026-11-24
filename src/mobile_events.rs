@@ -3,6 +3,8 @@
 //! Feed these events on the window's UI thread, in OS delivery order. Coordinates are
 //! window-local logical pixels (UIKit points; Android physical pixels / density).
 
+#![allow(dead_code, unused_imports)]
+
 use gpui::{Bounds, Edges, Pixels, Point, TouchEvent, TouchId, TouchPhase};
 use std::{collections::BTreeMap, time::Duration};
 

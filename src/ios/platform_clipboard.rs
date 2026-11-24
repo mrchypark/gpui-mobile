@@ -246,12 +246,12 @@ async unsafe fn import_file(provider: &AnyObject, uti: &str) -> Result<ImportedF
             let source = PathBuf::from(string(path)?);
             unsafe extern "C" {
                 fn NSSearchPathForDirectoriesInDomains(
-                    directory: usize,
-                    domain: usize,
-                    expand: Bool,
+                    directory: u64,
+                    domain_mask: u64,
+                    expand_tilde: bool,
                 ) -> *mut AnyObject;
             }
-            let paths = NSSearchPathForDirectoriesInDomains(14, 1, Bool::YES);
+            let paths = NSSearchPathForDirectoriesInDomains(14, 1, true);
             let count: usize = msg_send![paths, count];
             if count == 0 {
                 bail!("Application Support unavailable");
