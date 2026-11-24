@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "gpui-fast-wgpu"
-version = "0.1.14"
+version = "0.1.17"
 authors = ["Longbridge"]
 build = false
 include = [
@@ -81,7 +81,7 @@ default-features = false
 package = "zed-font-kit"
 
 [dependencies.gpui]
-version = "^0.1.14"
+version = "^0.1.17"
 default-features = false
 package = "gpui-fast"
 

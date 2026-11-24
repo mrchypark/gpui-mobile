@@ -19,14 +19,14 @@ crate-type = ["rlib", "staticlib"]
 
 [dependencies]
 gpui-mobile = { path = "../.." }
-gpui = { package = "gpui-fast", version = "=0.1.14", default-features = false }
+gpui = { package = "gpui-fast", version = "=0.1.17", default-features = false }
 gpui-kit = { version = "=0.9.1", default-features = false, features = ["component", "gpui-fast"] }
 ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "7378fb6f66465cfd44bad3d71ce3d105a619faf3", default-features = false }
 # Devices cannot read Ely assets from the build machine's filesystem in debug builds.
 rust-embed = { version = "8.12", features = ["debug-embed"] }
 
 [dev-dependencies]
-gpui = { package = "gpui-fast", version = "=0.1.14", features = ["test-support"] }
+gpui = { package = "gpui-fast", version = "=0.1.17", features = ["test-support"] }
 ely-gpui-component = { git = "https://github.com/mrchypark/Ely-GPUI-Components", rev = "7378fb6f66465cfd44bad3d71ce3d105a619faf3", features = ["test-support"] }
 naga = { version = "=30.0.1", features = ["wgsl-in"] }
 
