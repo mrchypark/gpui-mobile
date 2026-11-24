@@ -1165,14 +1165,6 @@ impl Scrollbar {
     }
 }
 
-impl IntoElement for Scrollbar {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 #[doc(hidden)]
 pub struct PrepaintState {
     hitbox: Hitbox,

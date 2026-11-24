@@ -244,13 +244,6 @@ impl SharedHandleState {
     }
 }
 
-impl<T: 'static, E: 'static + Render> IntoElement for ResizeHandle<T, E> {
-    type Element = ResizeHandle<T, E>;
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
     type RequestLayoutState = AnyElement;
     /// The band's own hitbox, so the listeners in `paint` can ask whether the

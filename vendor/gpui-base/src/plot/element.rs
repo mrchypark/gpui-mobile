@@ -46,14 +46,6 @@ impl<P: Plot + 'static> PlotElement<P> {
     }
 }
 
-impl<P: Plot + 'static> IntoElement for PlotElement<P> {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl<P: Plot + 'static> Element for PlotElement<P> {
     type RequestLayoutState = ();
     // The occlusion-aware hitbox, the plot's prepainted children and the

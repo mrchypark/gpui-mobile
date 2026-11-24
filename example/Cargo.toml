@@ -34,6 +34,7 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 
 [patch.crates-io]
 gpui-base = { path = "../vendor/gpui-base" }
+gpui-component = { path = "../vendor/gpui-component" }
 gpui-fast = { path = "../vendor/gpui-fast" }
 gpui-fast-wgpu = { path = "../vendor/gpui-fast-wgpu" }
 

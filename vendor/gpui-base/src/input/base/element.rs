@@ -268,14 +268,6 @@ impl<M: InputModeKind> EditorScrollbar<M> {
     }
 }
 
-impl<M: InputModeKind> IntoElement for EditorScrollbar<M> {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl<M: InputModeKind> Element for EditorScrollbar<M> {
     type RequestLayoutState = ();
     type PrepaintState = (Vec<PaintQuad>, Option<AnyElement>);
@@ -2960,14 +2952,6 @@ fn snap_caret_to_device_pixels(bounds: Bounds<Pixels>, scale_factor: f32) -> Bou
     let x = (bounds.origin.x * scale_factor).round() / scale_factor;
     let width = (bounds.size.width * scale_factor).round().max(px(1.)) / scale_factor;
     Bounds::new(point(x, bounds.origin.y), size(width, bounds.size.height))
-}
-
-impl<M: InputModeKind> IntoElement for TextElement<M> {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 /// A debug function to print points as SVG path.

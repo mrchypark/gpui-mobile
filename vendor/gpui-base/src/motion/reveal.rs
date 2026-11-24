@@ -25,14 +25,6 @@ impl MotionReveal {
     }
 }
 
-impl IntoElement for MotionReveal {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for MotionReveal {
     type RequestLayoutState = ();
     type PrepaintState = ();
